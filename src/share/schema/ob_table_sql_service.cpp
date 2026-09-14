@@ -146,7 +146,7 @@ int ObTableSqlService::delete_table_part_info(const ObTableSchema &table_schema,
    * As compensation, schema module mock inner table's partition schema while refresh schema.
    * So far, we only support to define hash-like inner table.
    */
-  if (OB_FAIL(check_ddl_allowed(table_schema))) {
+  if (OB_FAIL(check_ddl_allowed(table_schema, &sql_client))) {
   } else if (!is_inner_table(table_schema.get_table_id())) {
     if (table_schema.get_part_level() > 0 &&
         !table_schema.is_vir_table() &&
@@ -699,7 +699,7 @@ int ObTableSqlService::drop_table(const ObTableSchema &table_schema,
   ObSqlString sql;
   
   const uint64_t table_id = table_schema.get_table_id();
-  if (OB_FAIL(check_ddl_allowed(table_schema))) {
+  if (OB_FAIL(check_ddl_allowed(table_schema, &sql_client))) {
   } else {
     // delete from __all_table_history
     if (OB_FAIL(delete_from_all_table_history(
@@ -1390,7 +1390,7 @@ int ObTableSqlService::delete_constraint(common::ObISQLClient &sql_client,
   ObSqlString constraint_column_history_sql;
   ObTableSchema::const_constraint_iterator cst_iter = table_schema.constraint_begin();
 
-  if (OB_FAIL(check_ddl_allowed(table_schema))) {
+  if (OB_FAIL(check_ddl_allowed(table_schema, &sql_client))) {
   }
   for (; OB_SUCC(ret) && cst_iter != table_schema.constraint_end(); ++cst_iter) {
     // generate sql of 'insert into __all_constraint_history' and 'delete from __all_constraint'
@@ -2938,7 +2938,7 @@ int ObTableSqlService::delete_from_all_table_history(ObISQLClient &sql_client,
 
   // insert into __all_table_history
   const char *table_name = NULL;
-  if (OB_FAIL(check_ddl_allowed(table_schema))) {
+  if (OB_FAIL(check_ddl_allowed(table_schema, &sql_client))) {
   } else if (OB_FAIL(ObSchemaUtils::get_all_table_history_name(table_name))) {
   } else if (OB_FAIL(dml.add_pk_column("table_id",
           ObSchemaUtils::get_extract_schema_id(table_id)))
@@ -2974,7 +2974,7 @@ int ObTableSqlService::delete_from_all_column_history(ObISQLClient &sql_client,
   ObSqlString sql;
   
   
-  if (OB_FAIL(check_ddl_allowed(table_schema))) {
+  if (OB_FAIL(check_ddl_allowed(table_schema, &sql_client))) {
   } else if (OB_FAIL(sql.append_fmt("INSERT /*+use_plan_cache(none)*/ INTO %s "
       "(TABLE_ID, COLUMN_ID, SCHEMA_VERSION, IS_DELETED) VALUES ",
       OB_ALL_COLUMN_HISTORY_TNAME))) {
@@ -3882,7 +3882,7 @@ int ObTableSqlService::delete_foreign_key(
   int ret = OB_SUCCESS;
   const ObIArray<ObForeignKeyInfo> &foreign_key_infos = table_schema.get_foreign_key_infos();
   
-  if (OB_FAIL(check_ddl_allowed(table_schema))) {
+  if (OB_FAIL(check_ddl_allowed(table_schema, &sql_client))) {
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < foreign_key_infos.count(); i++) {
     const ObForeignKeyInfo &foreign_key_info = foreign_key_infos.at(i);
@@ -4322,10 +4322,10 @@ int ObTableSqlService::update_table_schema_version(ObISQLClient &sql_client,
   return ret;
 }
 
-int ObTableSqlService::check_ddl_allowed(const ObSimpleTableSchemaV2 &table_schema)
+int ObTableSqlService::check_ddl_allowed(const ObSimpleTableSchemaV2 &table_schema, const ObISQLClient *trans)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(storage::NamespaceForkKernelPrototype::check_ddl(table_schema))) {
+  if (OB_FAIL(storage::NamespaceForkKernelPrototype::check_ddl(table_schema, trans))) {
   } else if (!table_schema.check_can_do_ddl()) {
     ret = OB_OP_NOT_ALLOW;
     LOG_WARN("table_sql_service", K(table_schema.get_table_mode_struct()),

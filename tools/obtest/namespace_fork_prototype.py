@@ -23,7 +23,7 @@ class Experiment:
     def __init__(self, binary, label, prototype=True):
         self.binary = str(Path(binary).resolve(strict=True))
         self.base = Path(tempfile.mkdtemp(prefix="namespace_fork_PROTOTYPE_" + label + "_",
-                                         dir="/data/1/nijia.nj/test"))
+                                         dir=os.environ.get("SEEKDB_FORK_PROTOTYPE_TEST_ROOT", "/data/1/nijia.nj/test")))
         (self.base / "PROTOTYPE.txt").write_text("Disposable experiment. Do not reopen as a persistent namespace.\n")
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -78,7 +78,7 @@ class Experiment:
         # Remove a separate conservative active-tx watermark (initially zero),
         # so the acquired snapshot must be the effective historical-version guard.
         self.sql("ALTER SYSTEM SET _mvcc_gc_using_min_txn_snapshot=false")
-        if self.prototype not in (2, 3):
+        if self.prototype not in (2, 3, 4):
             self.sql("SET ob_global_debug_sync='FORK_TABLE_WAIT_FREEZE_END wait_for prototype_hold execute 10000'")
 
     def close(self):

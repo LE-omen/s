@@ -28,6 +28,7 @@
 #include "rootserver/fork_table/namespace_fork_prototype.h"
 #include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "share/ob_snapshot_table_proxy.h"
+#include "share/ob_debug_sync.h"
 #include "storage/compaction/ob_freeze_info_mgr.h"
 #include "rootserver/ddl_task/ob_ddl_task_util.h"
 
@@ -37,6 +38,45 @@ using namespace share;
 using namespace obcall;
 using namespace storage;
 namespace rootserver {
+
+int ObDDLService::drop_namespace_prototype_(const ObString &name)
+{
+  bool done = false;
+  int ret = NamespaceForkKernelPrototype::begin_namespace_drop(name, done);
+  if (ret != OB_SUCCESS || done) { return ret; }
+  ObSchemaGetterGuard guard; int64_t version = 0;
+  ObArray<const ObDatabaseSchema *> databases;
+  ObDDLSQLTransaction trans(schema_service_);
+  ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
+  if (OB_FAIL(get_runtime_schema_guard_with_version_in_inner_table(guard))) {
+  } else if (OB_FAIL(guard.get_schema_version(version))) {
+  } else if (OB_FAIL(guard.get_database_schemas_in_runtime(databases))) {
+  } else if (OB_FAIL(trans.start(sql_proxy_, version))) {
+  } else if (OB_FAIL(NamespaceForkKernelPrototype::lock_namespace_drop(trans))) {
+  } else {
+    // Close is durable first; ordinary DDL X locks drain existing write transactions.
+    // All native schema deletions, tablet DELETE MDS and namespace root removal commit together.
+    NamespaceSourceDropGuard capability(trans);
+    if (!capability.is_valid()) { ret = OB_EAGAIN; }
+    for (int64_t i = 0; OB_SUCC(ret) && i < databases.count(); ++i) {
+      const auto &db = *databases.at(i);
+      if (is_inner_db(db.get_database_id()) || db.get_database_name_str().prefix_match("__fork_proto_meta")) { continue; }
+      if (OB_FAIL(lock_tables_of_database_for_drop(db, trans))) {
+      } else if (OB_FAIL(lock_tables_in_recyclebin(db, trans))) {
+      } else { ret = ddl_operator.drop_database(db, trans); }
+    }
+    if (OB_SUCC(ret)) { ret = NamespaceForkKernelPrototype::finish_namespace_drop(trans); }
+    if (OB_SUCC(ret)) {
+      DEBUG_SYNC(AFTER_UPDATE_TABLET_TO_LS);
+      ret = THIS_WORKER.check_status();
+    }
+  }
+  if (trans.is_started()) { const int end = trans.end(ret == OB_SUCCESS); if (ret == OB_SUCCESS) { ret = end; } }
+  if (OB_SUCC(ret)) { ret = publish_schema(); }
+  // A failed attempt leaves DELETING persisted. Reissuing the same operation resumes it.
+  LOG_INFO("PROTOTYPE_V6_NAMESPACE_DROP", K(ret), K(name));
+  return ret;
+}
 
 int ObDDLService::fork_database_prototype_(const ObForkDatabaseArg &arg, ObDDLRes &res)
 {
@@ -113,6 +153,9 @@ int ObDDLService::fork_database(
   } else if (!fork_database_arg.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arg", K(ret), K(fork_database_arg));
+  } else if (NamespaceForkKernelPrototype::lifetime_mode()
+      && fork_database_arg.dst_database_name_ == "__drop__") {
+    ret = drop_namespace_prototype_(fork_database_arg.src_database_name_);
   } else if (NamespaceForkKernelPrototype::namespace_mode()) {
     // Disposable control transport: these names identify namespaces, not databases.
     ret = NamespaceForkKernelPrototype::control_namespace(fork_database_arg.src_database_name_,

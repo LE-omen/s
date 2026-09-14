@@ -482,7 +482,8 @@ private:
                                 const ObColumnSchemaV2 &column);
   bool is_user_partition_table(const ObTableSchema &table_schema);
   bool is_user_subpartition_table(const ObTableSchema &table);
-  static int check_ddl_allowed(const ObSimpleTableSchemaV2 &table_schema);
+  static int check_ddl_allowed(const ObSimpleTableSchemaV2 &table_schema,
+                               const common::ObISQLClient *trans = nullptr);
 
 // MockFKParentTable begin
 public:

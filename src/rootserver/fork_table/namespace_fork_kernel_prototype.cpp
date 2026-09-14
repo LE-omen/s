@@ -1,5 +1,5 @@
 // PROTOTYPE: real immutable B+ tree pages stored in engine tables, one-engine transactions.
-// Source retained, fixed two-integer-column schemas, no online page reclamation or source DROP.
+// Fixed two-integer-column schemas; V6 snapshot roots protect deleted sources, no page reclamation.
 #define USING_LOG_PREFIX STORAGE
 #include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "rootserver/ob_tablet_creator.h"
@@ -18,6 +18,7 @@
 #include "storage/tablet/ob_tablet_create_delete_helper.h"
 #include "lib/checksum/ob_crc64.h"
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -39,6 +40,9 @@ constexpr size_t FANOUT = 8;
 const char *ROOTS = "__fork_proto_meta.roots";
 const char *PAGES = "__fork_proto_meta.pages";
 const char *NAMESPACES = "__fork_proto_meta.namespaces";
+const char *SNAPSHOTS = "__fork_proto_meta.snapshots";
+// ponytail: only native namespace 1 can be deleted in this disposable prototype.
+std::atomic<const ObISQLClient *> source_drop_trans{nullptr};
 struct Ref { uint64_t page = 0; int64_t cap = 0; };
 struct Value { std::string data; int64_t cap = 0; };
 struct Node {
@@ -51,6 +55,8 @@ struct Roots {
   uint64_t source = 0;
   Ref catalog, directory;
   int64_t snapshot = 0, schema_version = 0;
+  uint64_t snapshot_ref = 0;
+  int64_t state = 0; // 0 LIVE, 1 DELETING, 2 DELETED; names/ids are not reused.
 };
 struct SchemaHolder {
   ObArenaAllocator allocator;
@@ -234,12 +240,14 @@ int put(ObISQLClient &sql, Ref root, const std::string &key, Value value, Ref &n
   Node node; node.leaf = false; node.keys.push_back(split.separator);
   node.children = {split.left, split.right}; return save_node(sql, node, next);
 }
-int roots(ObISQLClient &sql, uint64_t db, Roots &root, bool lock = false) {
+int roots(ObISQLClient &sql, uint64_t db, Roots &root, bool lock = false, bool inactive = false) {
   int ret = OB_SUCCESS; ObSqlString q; ObMySQLProxy::MySQLResult res;
   sqlclient::ObMySQLResult *r = nullptr;
   const bool ns = NamespaceForkKernelPrototype::namespace_mode();
-  if (OB_FAIL(q.assign_fmt("SELECT source_id,catalog_page,catalog_cap,directory_page,directory_cap,snapshot,schema_version FROM %s WHERE %s=%lu%s",
-      ns ? NAMESPACES : ROOTS, ns ? "namespace_id" : "database_id", db, lock ? " FOR UPDATE" : ""))) {
+  const bool life = NamespaceForkKernelPrototype::lifetime_mode();
+  if (OB_FAIL(q.assign_fmt("SELECT source_id,catalog_page,catalog_cap,directory_page,directory_cap,snapshot,schema_version%s FROM %s WHERE %s=%lu%s%s",
+      life ? ",snapshot_ref,state" : "", ns ? NAMESPACES : ROOTS, ns ? "namespace_id" : "database_id", db,
+      life && !inactive ? " AND state=0" : "", lock ? " FOR UPDATE" : ""))) {
   } else if (OB_FAIL(sql.read(res, q.ptr()))) {
   } else if (OB_ISNULL(r = res.get_result())) { ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(r->next())) {
@@ -247,7 +255,21 @@ int roots(ObISQLClient &sql, uint64_t db, Roots &root, bool lock = false) {
       || OB_FAIL(r->get_int(2L, root.catalog.cap)) || OB_FAIL(r->get_uint(3L, root.directory.page))
       || OB_FAIL(r->get_int(4L, root.directory.cap)) || OB_FAIL(r->get_int(5L, root.snapshot))
       || OB_FAIL(r->get_int(6L, root.schema_version))) {
+  } else if (life && (OB_FAIL(r->get_uint(7L, root.snapshot_ref)) || OB_FAIL(r->get_int(8L, root.state)))) {
   }
+  return ret;
+}
+int snapshot_roots(ObISQLClient &sql, uint64_t id, Roots &root) {
+  ObSqlString q; ObMySQLProxy::MySQLResult res; sqlclient::ObMySQLResult *r = nullptr;
+  int ret = q.assign_fmt("SELECT catalog_page,directory_page,snapshot,schema_version FROM %s WHERE snapshot_id=%lu", SNAPSHOTS, id);
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(sql.read(res, q.ptr()))) {
+  } else if (OB_ISNULL(r = res.get_result())) { ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(r->next())) {
+  } else if (OB_FAIL(r->get_uint(0L, root.catalog.page)) || OB_FAIL(r->get_uint(1L, root.directory.page))
+      || OB_FAIL(r->get_int(2L, root.snapshot)) || OB_FAIL(r->get_int(3L, root.schema_version))) {
+  } else if (root.snapshot <= 0 || uint64_t(root.snapshot) != id) { ret = OB_CHECKSUM_ERROR;
+  } else { root.catalog.cap = root.directory.cap = root.snapshot; root.snapshot_ref = id; }
   return ret;
 }
 int save_roots(ObISQLClient &sql, uint64_t db, const Roots &root) {
@@ -311,6 +333,10 @@ int namespace_registry_ready(bool &ready) {
   if (ret == OB_SUCCESS && db != OB_INVALID_ID) {
     ret = guard.get_simple_table_schema(db, ObString("namespaces"), false, schema);
     ready = ret == OB_SUCCESS && schema != nullptr;
+    if (ready && NamespaceForkKernelPrototype::lifetime_mode()) {
+      ret = guard.get_simple_table_schema(db, ObString("snapshots"), false, schema);
+      ready = ret == OB_SUCCESS && schema != nullptr;
+    }
   }
   return ret;
 }
@@ -340,12 +366,120 @@ int database_from_value(uint64_t ns, const Value &value, const ObDatabaseSchema 
 
 bool NamespaceForkKernelPrototype::enabled() {
   static bool on = [] { const char *s = std::getenv("SEEKDB_NAMESPACE_FORK_PROTOTYPE");
-    return s && (!std::strcmp(s, "2") || !std::strcmp(s, "3")); }();
+    return s && (!std::strcmp(s, "2") || !std::strcmp(s, "3") || !std::strcmp(s, "4")); }();
   return on;
 }
 bool NamespaceForkKernelPrototype::namespace_mode() {
-  static bool on = [] { const char *s = std::getenv("SEEKDB_NAMESPACE_FORK_PROTOTYPE"); return s && !std::strcmp(s, "3"); }();
+  static bool on = [] { const char *s = std::getenv("SEEKDB_NAMESPACE_FORK_PROTOTYPE");
+    return s && (!std::strcmp(s, "3") || !std::strcmp(s, "4")); }();
   return on;
+}
+bool NamespaceForkKernelPrototype::lifetime_mode() {
+  static bool on = [] { const char *s = std::getenv("SEEKDB_NAMESPACE_FORK_PROTOTYPE"); return s && !std::strcmp(s, "4"); }();
+  return on;
+}
+NamespaceSourceDropGuard::NamespaceSourceDropGuard(ObISQLClient &trans) : valid_(false) {
+  const ObISQLClient *expected = nullptr;
+  valid_ = NamespaceForkKernelPrototype::lifetime_mode()
+      && source_drop_trans.compare_exchange_strong(expected, &trans);
+}
+NamespaceSourceDropGuard::~NamespaceSourceDropGuard() {
+  if (valid_) { source_drop_trans.store(nullptr); }
+}
+int NamespaceForkKernelPrototype::begin_namespace_drop(const ObString &name, bool &done) {
+  done = false;
+  if (!lifetime_mode() || !GCTX.sql_proxy_) { return OB_NOT_SUPPORTED; }
+  ObMySQLTransaction trans; Roots root; uint64_t id = 0; ObSqlString q;
+  int ret = trans.start(GCTX.sql_proxy_);
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(namespace_named(trans, name, id))) {
+  } else if (id != 1) { ret = OB_NOT_SUPPORTED;
+  } else if (OB_FAIL(roots(trans, id, root, true, true))) {
+  } else if (root.state == 2) { done = true;
+  } else if (root.state != 0 && root.state != 1) { ret = OB_STATE_NOT_MATCH;
+  } else if (OB_FAIL(q.assign_fmt("UPDATE %s SET state=1 WHERE namespace_id=1", NAMESPACES))) {
+  } else { ret = write_sql(trans, q); }
+  if (trans.is_started()) { const int end = trans.end(ret == OB_SUCCESS); if (ret == OB_SUCCESS) { ret = end; } }
+  LOG_INFO("PROTOTYPE_V6_NAMESPACE_CLOSE", K(ret), K(id), K(done));
+  return ret;
+}
+int NamespaceForkKernelPrototype::lock_namespace_drop(ObISQLClient &trans) {
+  Roots root; int ret = roots(trans, 1, root, true, true);
+  return ret != OB_SUCCESS ? ret : root.state == 1 ? OB_SUCCESS : OB_STATE_NOT_MATCH;
+}
+int NamespaceForkKernelPrototype::finish_namespace_drop(ObISQLClient &trans) {
+  ObSqlString q;
+  int ret = q.assign_fmt("UPDATE %s SET state=2,source_id=0,snapshot_ref=0,catalog_page=0,catalog_cap=0,directory_page=0,directory_cap=0,snapshot=0,schema_version=0 WHERE namespace_id=1 AND state=1", NAMESPACES);
+  return ret == OB_SUCCESS ? write_sql(trans, q) : ret;
+}
+int NamespaceForkKernelPrototype::check_table_access(uint64_t table_id, const ObTabletID &tablet_id) {
+  // Internal index/LOB scans are identified by their actual owning tablet.
+  if (!lifetime_mode() || tablet_id.is_inner_tablet() || is_encoded_id(table_id) || is_inner_table(table_id)
+      || table_id == OB_INVALID_ID) { return OB_SUCCESS; }
+  ObSchemaGetterGuard guard; const ObTableSchema *table = nullptr; const ObDatabaseSchema *db = nullptr;
+  int ret = GSCHEMASERVICE.get_runtime_schema_guard(guard);
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(guard.get_table_schema(table_id, table))) {
+  } else if (!table) { ret = OB_TABLE_NOT_EXIST;
+  } else if (is_inner_db(table->get_database_id())) { return OB_SUCCESS;
+  } else if (OB_FAIL(guard.get_database_schema(table->get_database_id(), db))) {
+  } else if (!db) { ret = OB_ERR_BAD_DATABASE;
+  } else if (db->get_database_name_str().prefix_match("__fork_proto_meta")) { return OB_SUCCESS;
+  } else {
+    bool ready = false; Roots root;
+    if (OB_FAIL(namespace_registry_ready(ready))) {
+    } else if (!ready) { return OB_SUCCESS;
+    } else if ((ret = roots(*GCTX.sql_proxy_, 1, root, false, true)) == OB_ITER_END) { ret = OB_SUCCESS;
+    } else if (OB_SUCC(ret) && root.state != 0) {
+      ret = OB_OP_NOT_ALLOW;
+      LOG_USER_ERROR(OB_OP_NOT_ALLOW, "access a closing or deleted prototype namespace");
+    }
+  }
+  return ret;
+}
+int NamespaceForkKernelPrototype::protect_snapshot_tablets(ObIArray<ObTabletID> &candidates, bool &need_retry) {
+  if (!lifetime_mode() || candidates.empty()) { return OB_SUCCESS; }
+  bool ready = false; int ret = namespace_registry_ready(ready);
+  if (ret != OB_SUCCESS || !ready) { return ret == OB_SUCCESS ? OB_EAGAIN : ret; }
+  // Candidates are committed deletions, collected BEFORE reading snapshot roots.
+  // A closing source cannot publish another snapshot. Failed reads stop this GC pass.
+  std::vector<Ref> directories;
+  {
+    ObSqlString q; ObMySQLProxy::MySQLResult res; sqlclient::ObMySQLResult *r = nullptr;
+    if (OB_FAIL(q.assign_fmt("SELECT s.directory_page,s.snapshot FROM %s s WHERE EXISTS(SELECT 1 FROM %s n WHERE n.snapshot_ref=s.snapshot_id)", SNAPSHOTS, NAMESPACES))) {
+    } else if (OB_FAIL(GCTX.sql_proxy_->read(res, q.ptr()))) {
+    } else if (OB_ISNULL(r = res.get_result())) { ret = OB_ERR_UNEXPECTED;
+    } else {
+      while (OB_SUCC(ret) && OB_SUCC(ret = r->next())) {
+        Ref ref;
+        if (OB_FAIL(r->get_uint(0L, ref.page)) || OB_FAIL(r->get_int(1L, ref.cap))) {
+        } else { directories.push_back(ref); }
+      }
+      if (ret == OB_ITER_END) { ret = OB_SUCCESS; }
+    }
+  }
+  ObArray<ObTabletID> unreferenced;
+  for (int64_t i = 0; OB_SUCC(ret) && i < candidates.count(); ++i) {
+    bool retained = false;
+    for (const auto &ref : directories) {
+      Value value;
+      ret = find(*GCTX.sql_proxy_, ref, key_of(candidates.at(i).id()), value);
+      if (ret == OB_ENTRY_NOT_EXIST) { ret = OB_SUCCESS; continue; }
+      if (ret != OB_SUCCESS) { break; }
+      uint64_t object = 0, table = 0, source = 0, bound = 0;
+      if (!entry(value.data, object, table, source, bound) || source != candidates.at(i).id() || bound) {
+        ret = OB_CHECKSUM_ERROR;
+      } else { retained = true; }
+      break;
+    }
+    if (OB_FAIL(ret)) {
+    } else if (retained) {
+      need_retry = true;
+      LOG_INFO("PROTOTYPE_V6_RETAIN_SNAPSHOT_TABLET", "tablet_id", candidates.at(i));
+    } else { ret = unreferenced.push_back(candidates.at(i)); }
+  }
+  if (OB_SUCC(ret)) { ret = candidates.assign(unreferenced); }
+  return ret;
 }
 bool NamespaceForkKernelPrototype::is_encoded_id(uint64_t id) {
   return enabled() && id != OB_INVALID_ID && (id & (3ULL << 62)) == ID_MARK;
@@ -400,7 +534,13 @@ int NamespaceForkKernelPrototype::observe_database(ObISQLClient &trans, const Ob
   bool ready = false; int ret = namespace_registry_ready(ready);
   if (ret != OB_SUCCESS || !ready) { return ret; }
   Roots root; ret = roots(trans, 1, root, true);
-  if (ret == OB_ITER_END) { return OB_SUCCESS; }
+  if (ret == OB_ITER_END) {
+    if (lifetime_mode()) {
+      ret = roots(trans, 1, root, false, true);
+      if (ret == OB_SUCCESS) { return OB_OP_NOT_ALLOW; }
+    }
+    return ret == OB_ITER_END ? OB_SUCCESS : ret;
+  }
   if (ret != OB_SUCCESS) { return ret; }
   std::string data(schema.get_serialize_size(), '\0'); int64_t pos = 0; uint64_t object = 0; Value value;
   if (OB_FAIL(schema.serialize(data.data(), data.size(), pos))) {
@@ -416,7 +556,8 @@ int NamespaceForkKernelPrototype::observe_database(ObISQLClient &trans, const Ob
   }
   return ret;
 }
-int NamespaceForkKernelPrototype::check_database_ddl(const ObDatabaseSchema &schema) {
+int NamespaceForkKernelPrototype::check_database_ddl(const ObDatabaseSchema &schema, const ObISQLClient *trans) {
+  if (lifetime_mode() && trans && source_drop_trans.load() == trans) { return OB_SUCCESS; }
   return namespace_mode() && !is_inner_db(schema.get_database_id())
       && !schema.get_database_name_str().prefix_match("__fork_proto_meta") ? OB_NOT_SUPPORTED : OB_SUCCESS;
 }
@@ -435,7 +576,7 @@ int NamespaceForkKernelPrototype::control_namespace(const ObString &source, cons
   if (OB_SUCC(ret)) { ret = guard.get_schema_version(root.schema_version); }
   if (OB_SUCC(ret)) {
     if (bootstrap) {
-      ret = q.assign_fmt("INSERT INTO %s VALUES(1,UNHEX('%s'),0,0,0,0,0,0,%ld)", NAMESPACES,
+      ret = q.assign_fmt("INSERT INTO %s(namespace_id,name,source_id,catalog_page,catalog_cap,directory_page,directory_cap,snapshot,schema_version) VALUES(1,UNHEX('%s'),0,0,0,0,0,0,%ld)", NAMESPACES,
           hex(std::string(target.ptr(), target.length())).c_str(), root.schema_version);
     } else {
       ret = q.assign_fmt("INSERT INTO %s(name,source_id,catalog_page,catalog_cap,directory_page,directory_cap,snapshot,schema_version) VALUES(UNHEX('%s'),0,0,0,0,0,0,0)",
@@ -471,8 +612,16 @@ int NamespaceForkKernelPrototype::control_namespace(const ObString &source, cons
       pin.schema_version_ = root.schema_version; pin.comment_ = "PROTOTYPE namespace root; source retained";
       if (OB_FAIL(pins.add_snapshot(trans, pin))) {
       } else {
-        root.source = source_id; root.catalog.cap = root.directory.cap = root.snapshot;
-        ret = save_roots(trans, id, root);
+        root.catalog.cap = root.directory.cap = root.snapshot;
+        if (lifetime_mode()) {
+          if (OB_FAIL(q.assign_fmt("INSERT INTO %s VALUES(%ld,%lu,%lu,%ld,%ld)", SNAPSHOTS,
+              root.snapshot, root.catalog.page, root.directory.page, root.snapshot, root.schema_version))) {
+          } else if (OB_FAIL(write_sql(trans, q))) {
+          } else if (OB_FAIL(q.assign_fmt("UPDATE %s SET snapshot_ref=%ld WHERE namespace_id=%lu", NAMESPACES, root.snapshot, id))) {
+          } else { ret = write_sql(trans, q); }
+        }
+        root.source = lifetime_mode() ? 0 : source_id;
+        if (OB_SUCC(ret)) { ret = save_roots(trans, id, root); }
       }
     }
   }
@@ -511,6 +660,11 @@ int NamespaceForkKernelPrototype::observe_schema(ObISQLClient &trans, const ObTa
   const uint64_t owner = namespace_mode() ? 1 : schema.get_database_id();
   ret = roots(trans, owner, root, true);
   if (namespace_mode() && (ret == OB_ITER_END || ret == OB_TABLE_NOT_EXIST || ret == OB_ERR_BAD_DATABASE)) {
+    if (lifetime_mode() && ret == OB_ITER_END) {
+      ret = roots(trans, 1, root, false, true);
+      if (ret == OB_SUCCESS) { return OB_OP_NOT_ALLOW; }
+      if (ret != OB_ITER_END) { return ret; }
+    }
     return OB_SUCCESS; // Native bootstrap is enrolled once when namespace 1 is registered.
   }
   if (ret == OB_ITER_END) { ret = OB_SUCCESS; }
@@ -607,7 +761,8 @@ int NamespaceForkKernelPrototype::list_schemas(uint64_t db, ObIArray<const ObTab
   }
   return ret;
 }
-int NamespaceForkKernelPrototype::check_ddl(const ObSimpleTableSchemaV2 &schema) {
+int NamespaceForkKernelPrototype::check_ddl(const ObSimpleTableSchemaV2 &schema, const ObISQLClient *trans) {
+  if (lifetime_mode() && trans && source_drop_trans.load() == trans) { return OB_SUCCESS; }
   if (!enabled() || !schema.is_user_table()) { return OB_SUCCESS; }
   if (is_encoded_id(schema.get_table_id())) { return OB_NOT_SUPPORTED; }
   ObSchemaGetterGuard guard; const ObDatabaseSchema *db = nullptr;
@@ -677,6 +832,13 @@ int NamespaceForkKernelPrototype::ensure_tablet(const ObTabletID &tablet_id) {
   // The row lock joins concurrent requests before physical creation. The business transaction is untouched.
   if (OB_FAIL(trans.start(GCTX.sql_proxy_))) {
   } else if (OB_FAIL(roots(trans, db, root, true))) {
+  } else if (lifetime_mode() && OB_FAIL([&]() -> int {
+      Roots snapshot;
+      int result = snapshot_roots(trans, root.snapshot_ref, snapshot);
+      if (result == OB_SUCCESS && (snapshot.snapshot != root.snapshot || snapshot.schema_version != root.schema_version
+          || snapshot.catalog.page != root.catalog.page)) { result = OB_STATE_NOT_MATCH; }
+      return result;
+    }())) {
   } else if (OB_FAIL(find(trans, root.directory, key_of(local), value))) {
   } else {
     uint64_t object = 0, table = 0, source_tablet = 0, bound = 0;

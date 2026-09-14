@@ -2,6 +2,8 @@
 
 日期：2026-09-14。分支：`codex/namespace-identity-v5`，基于 V4 `8a7848bce`。
 
+后续的独立快照持有与来源删除见 [V6](namespace_snapshot_lifetime_v6.md)。本文保留 V5 的原始边界和验收结果。
+
 ## 要验证的问题
 
 V2–V4 的目录根属于一个 database，尚不能表示包含多个 database 的 namespace。V5 将根的所有者改为持久化的 namespace，并检查同名数据库、同名表、相同 local ID 在不同 namespace 中能否独立读写、加锁和恢复。

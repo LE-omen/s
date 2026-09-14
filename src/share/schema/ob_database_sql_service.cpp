@@ -185,7 +185,7 @@ int ObDatabaseSqlService::delete_database(const ObDatabaseSchema &db_schema,
                                           common::ObISQLClient &sql_client,
                                           const ObString *ddl_stmt_str/*=NULL*/)
 {
-  if (storage::NamespaceForkKernelPrototype::check_database_ddl(db_schema) != OB_SUCCESS) {
+  if (storage::NamespaceForkKernelPrototype::check_database_ddl(db_schema, &sql_client) != OB_SUCCESS) {
     return OB_NOT_SUPPORTED;
   }
   int ret = OB_SUCCESS;

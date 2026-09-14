@@ -7,6 +7,18 @@ namespace common { class ObISQLClient; }
 namespace share { namespace schema { class ObSimpleDatabaseSchema; } }
 namespace storage {
 class ObTablet;
+// A capability for one internal DROP transaction, never a current namespace.
+class NamespaceSourceDropGuard final
+{
+public:
+  explicit NamespaceSourceDropGuard(common::ObISQLClient &trans);
+  ~NamespaceSourceDropGuard();
+  bool is_valid() const { return valid_; }
+private:
+  bool valid_;
+  NamespaceSourceDropGuard(const NamespaceSourceDropGuard &) = delete;
+  NamespaceSourceDropGuard &operator=(const NamespaceSourceDropGuard &) = delete;
+};
 // Bounded adapter for the prototype's existing 64-bit storage/cache/lock keys.
 // Namespace 1 owns the original engine objects; other namespaces keep the same local ids.
 struct NamespaceObjectKey
@@ -23,11 +35,18 @@ class NamespaceForkKernelPrototype final
 public:
   static bool enabled();
   static bool namespace_mode();
+  static bool lifetime_mode();
+  static int begin_namespace_drop(const common::ObString &name, bool &done);
+  static int lock_namespace_drop(common::ObISQLClient &trans);
+  static int finish_namespace_drop(common::ObISQLClient &trans);
+  static int check_table_access(uint64_t table_id, const common::ObTabletID &tablet_id);
+  static int protect_snapshot_tablets(common::ObIArray<common::ObTabletID> &candidates, bool &need_retry);
   static bool is_namespace_address(const common::ObString &name);
   static int control_namespace(const common::ObString &source, const common::ObString &target,
                                 uint64_t &namespace_id);
   static int observe_database(common::ObISQLClient &trans, const share::schema::ObDatabaseSchema &schema);
-  static int check_database_ddl(const share::schema::ObDatabaseSchema &schema);
+  static int check_database_ddl(const share::schema::ObDatabaseSchema &schema,
+                                const common::ObISQLClient *trans = nullptr);
   static int database_in_namespace(uint64_t namespace_id, const common::ObString &name,
                                    const share::schema::ObDatabaseSchema *&schema);
   static int database_by_address(const common::ObString &address,
@@ -44,7 +63,8 @@ public:
   static int table_id_for_tablet(const common::ObTabletID &tablet, int64_t schema_version,
                                  uint64_t &table_id);
   static int list_schemas(uint64_t database, common::ObIArray<const share::schema::ObTableSchema *> &schemas);
-  static int check_ddl(const share::schema::ObSimpleTableSchemaV2 &schema);
+  static int check_ddl(const share::schema::ObSimpleTableSchemaV2 &schema,
+                       const common::ObISQLClient *trans = nullptr);
   static int ensure_tablet(const common::ObTabletID &tablet_id);
   static int schedule_baseline(const ObTablet &tablet);
 };

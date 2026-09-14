@@ -21,6 +21,7 @@
 #include "storage/tx_storage/ob_ls_service.h" // ObLSService
 #include "storage/tablet/ob_tablet_iterator.h"
 #include "storage/meta_store/ob_server_storage_meta_service.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 
 namespace oceanbase
 {
@@ -68,6 +69,9 @@ void ObEmptyShellTask::runTimerTask()
           STORAGE_LOG(WARN, "[emptytablet] tablet_empty_shell_handler get empty shell tablet ids failed", K(ret));
         } else if (empty_shell_tablet_ids.empty()) {
           // do nothing
+        } else if (OB_FAIL(NamespaceForkKernelPrototype::protect_snapshot_tablets(empty_shell_tablet_ids, need_retry))) {
+          need_retry = true;
+          STORAGE_LOG(WARN, "prototype snapshot protection unavailable; defer GC", KR(ret));
         } else if (OB_FAIL(tablet_empty_shell_handler->update_tablets_to_empty_shell(ls, empty_shell_tablet_ids))) {
           need_retry = true;
           STORAGE_LOG(WARN, "update tablet to empty shell failed", KR(ret));
