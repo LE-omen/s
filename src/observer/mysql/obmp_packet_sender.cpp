@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SERVER
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "query/protocol/ob_mysql_packet_sender.h"
 #include "nio.h"
 #include "observer/mysql/ob_mysql_result_set.h"
@@ -743,6 +744,9 @@ int ObMPPacketSender::revert_session(ObSQLSessionInfo *sess_info)
         KP(::oceanbase::share::server_service<::oceanbase::sql::ObSQLSessionMgr>()),
         K(sess_info),
         K(ret));
+  } else if (conn_ && conn_->namespace_worker_binding_
+             && namespace_worker_prototype::bound_session(conn_->namespace_worker_binding_) == sess_info) {
+    // Borrowed from the connection-owned pin; no per-request hash lookup/ref.
   } else {
     ::oceanbase::share::server_service<::oceanbase::sql::ObSQLSessionMgr>()->revert_session(sess_info);
   }
@@ -755,6 +759,9 @@ int ObMPPacketSender::get_session(ObSQLSessionInfo *&sess_info)
   if (OB_ISNULL(conn_) || OB_ISNULL(::oceanbase::share::server_service<::oceanbase::sql::ObSQLSessionMgr>())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("conn or session mgr is NULL", K(ret), KP(conn_), K(::oceanbase::share::server_service<::oceanbase::sql::ObSQLSessionMgr>()));
+  } else if (conn_->namespace_worker_binding_) {
+    sess_info = namespace_worker_prototype::bound_session(conn_->namespace_worker_binding_);
+    if (!sess_info) { ret = OB_ERR_SESSION_INTERRUPTED; }
   } else if (OB_FAIL(::oceanbase::share::server_service<::oceanbase::sql::ObSQLSessionMgr>()->get_session(conn_->sessid_, sess_info))) {
   } else {
     NG_TRACE_EXT(session, OB_ID(sid), sess_info->get_server_sid());

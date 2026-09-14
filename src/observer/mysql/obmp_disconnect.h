@@ -27,6 +27,7 @@ class ObFreeSessionCtx;
 }
 namespace observer
 {
+namespace namespace_worker_prototype { struct SessionBinding; }
 
 // Before coming into this class, all information about this
 // connection maybe invalid.
@@ -34,7 +35,8 @@ class ObMPDisconnect
     : public rpc::frame::ObReqProcessor
 {
 public:
-  explicit ObMPDisconnect(const sql::ObFreeSessionCtx &ctx);
+  explicit ObMPDisconnect(const sql::ObFreeSessionCtx &ctx,
+      namespace_worker_prototype::SessionBinding *binding = nullptr);
   virtual ~ObMPDisconnect();
 
 protected:
@@ -45,6 +47,7 @@ private:
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMPDisconnect);
   sql::ObFreeSessionCtx ctx_;
+  namespace_worker_prototype::SessionBinding *worker_binding_;
 }; // end of class ObMPDisconnect
 
 } // end of namespace observer

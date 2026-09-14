@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SERVER
 
 #include "obmp_base.h"
+#include "observer/namespace_worker_protocol_prototype.h"
 
 #include "sql/ob_mysql_end_trans_cb.h"
 #include "rpc/obmysql/packet/ompk_row.h"
@@ -94,7 +95,8 @@ int ObMPBase::before_process()
   int ret = OB_SUCCESS;
   if (get_conn() && get_conn()->namespace_worker_id_ != 0) {
     const auto cmd = static_cast<const obmysql::ObMySQLRawPacket &>(req_->get_packet()).get_cmd();
-    if (cmd != obmysql::COM_QUERY && cmd != obmysql::COM_QUIT && cmd != obmysql::COM_PING) {
+    if (cmd != obmysql::COM_QUERY && cmd != obmysql::COM_QUIT && cmd != obmysql::COM_PING
+        && cmd != obmysql::COM_INIT_DB) {
       send_error_packet(OB_NOT_SUPPORTED, "SQL worker prototype accepts text queries only");
       return OB_NOT_SUPPORTED;
     }
@@ -294,6 +296,9 @@ int ObMPBase::free_session()
     ret = OB_CONNECT_ERROR;
     LOG_WARN("connection already disconnected", K(ret));
   } else {
+    auto *binding = conn->namespace_worker_binding_;
+    conn->namespace_worker_binding_ = nullptr;
+    namespace_worker_prototype::close_session(binding);
     ObFreeSessionCtx ctx;
     
     ctx.sessid_ = conn->sessid_;

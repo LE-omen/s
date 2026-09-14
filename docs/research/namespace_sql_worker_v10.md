@@ -2,6 +2,8 @@
 
 日期：2026-09-14。实验分支：`codex/namespace-sql-worker-v10`。
 
+后续连接级 session、SET/USE 和槽位回收见 [V11 原型](namespace_sql_session_v11.md)。本文保留 V10 当时的实现与测量记录；当前分支的流程脚本已扩展到 V11。
+
 本轮跑通一个真实 seekdb 引擎、一个公共 MySQL 端口、两个固定 namespace 的 SQL-only worker。worker 使用原有 parser、resolver、optimizer 和执行器；读取真实 fork 表时，经 IPC 请求共享引擎扫描 tablet。杀掉一个正在查询的 worker 后，另一分支继续查询；重新连接会拉起新 worker，读取原来的持久 namespace。
 
 这是[架构草案](namespace_sql_worker_v10_plan.md)的功能切片。IPC 暂用标准库子进程管道，尚未实现草案中的 Mio 双通道、会话复用、取消和额度调度，也没有高并发或跨平台运行结论。

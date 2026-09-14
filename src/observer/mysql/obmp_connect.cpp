@@ -237,9 +237,9 @@ int ObMPConnect::process()
       ret = OB_NOT_SUPPORTED;
     } else if (namespace_worker_prototype::enabled()
                && storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id())
-               && OB_FAIL(namespace_worker_prototype::attach(
+               && OB_FAIL(namespace_worker_prototype::open_session(
                    (session->get_database_id() & ~(1ULL << 62)) >> 32,
-                   conn->namespace_worker_generation_))) {
+                   *session, conn->namespace_worker_binding_))) {
     } else {
       if (namespace_worker_prototype::enabled()
           && storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id())) {
@@ -303,7 +303,8 @@ int ObMPConnect::process()
 
     if (NULL != session) {
       //Action!!:must revert it after no use it
-      revert_session(session);
+      // create_session returned an owned reference, even after worker binding.
+      share::server_service<sql::ObSQLSessionMgr>()->revert_session(session);
     }
     if (OB_SUCCESS != proc_ret) {
       if (NULL != session) {

@@ -35,6 +35,7 @@ class ObServerRuntime;
 }
 namespace observer
 {
+namespace namespace_worker_prototype { struct SessionBinding; }
 
 struct ObSMConnection
 {
@@ -103,7 +104,7 @@ public:
   uint32_t version_;
   // Throwaway V10 binding. Zero keeps the existing in-process SQL path.
   uint64_t namespace_worker_id_ = 0;
-  uint64_t namespace_worker_generation_ = 0;
+  namespace_worker_prototype::SessionBinding *namespace_worker_binding_ = nullptr;
   int64_t sess_create_time_; // client connection creation time
 
   // Errors may occur during the ObSMHandler::on_connect stage, and these error messages need to be returned to the client;

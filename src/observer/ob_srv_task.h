@@ -34,8 +34,9 @@ class ObDisconnectTask
     : public rpc::ObSrvTask
 {
 public:
-  ObDisconnectTask(const sql::ObFreeSessionCtx &ctx)
-       : proc_(ctx)
+  ObDisconnectTask(const sql::ObFreeSessionCtx &ctx,
+      namespace_worker_prototype::SessionBinding *binding = nullptr)
+       : proc_(ctx, binding)
   {
   }
 

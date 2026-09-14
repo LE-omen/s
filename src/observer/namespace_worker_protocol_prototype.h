@@ -8,6 +8,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+namespace oceanbase { namespace sql { class ObSQLSessionInfo; } }
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 constexpr size_t MAX_FRAME = 256 * 1024;
 struct Frame {
@@ -51,9 +52,13 @@ using CatalogFetch = int (*)(char, uint64_t, const common::ObString &, Frame &);
 inline CatalogFetch worker_catalog_fetch = nullptr;
 inline uint64_t worker_namespace = 0;
 bool enabled();
-int attach(uint64_t namespace_id, uint64_t &generation);
-int query(uint64_t namespace_id, uint64_t generation, uint64_t database_id,
-          uint64_t snapshot, const common::ObString &sql,
+struct SessionBinding;
+int open_session(uint64_t namespace_id, sql::ObSQLSessionInfo &gateway, SessionBinding *&binding);
+sql::ObSQLSessionInfo *bound_session(SessionBinding *binding);
+int append_session_state(sql::ObSQLSessionInfo &session, Frame &frame);
+int apply_session_state(sql::ObSQLSessionInfo &session, Frame &frame);
+void close_session(SessionBinding *binding);
+int query(SessionBinding &binding, uint64_t snapshot, const common::ObString &sql, bool change_database,
           const std::function<int(Frame &)> &response);
 void stop_all();
 } } }

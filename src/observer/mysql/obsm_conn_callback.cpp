@@ -131,7 +131,7 @@ void ObSMConnectionCallback::destroy(ObSMConnection& conn)
       //free session in task
       ObSrvTask *task = OB_NEW(ObDisconnectTask,
                                 ObModIds::OB_SQL_REQUEST,
-                                ctx);
+                                ctx, conn.namespace_worker_binding_);
       if (OB_UNLIKELY(NULL == task)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else if (OB_UNLIKELY(NULL == conn.runtime_)) {
@@ -142,11 +142,12 @@ void ObSMConnectionCallback::destroy(ObSMConnection& conn)
       }
       // free session locally
       if (OB_FAIL(ret)) {
-        ObMPDisconnect disconnect_processor(ctx);
+        ObMPDisconnect disconnect_processor(ctx, conn.namespace_worker_binding_);
         rpc::frame::ObReqProcessor *processor = static_cast<rpc::frame::ObReqProcessor *>(&disconnect_processor);
         if (OB_FAIL(processor->run())) {
         }
       }
+      conn.namespace_worker_binding_ = nullptr;
    }
   } else {
     // sessid no longer needs to be recycled in seekdb
