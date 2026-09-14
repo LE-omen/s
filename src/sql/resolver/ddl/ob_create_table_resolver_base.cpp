@@ -1,0 +1,299 @@
+/*
+ * Copyright (c) 2025 OceanBase.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#define USING_LOG_PREFIX SQL_RESV
+#include "sql/resolver/ddl/ob_create_table_resolver_base.h"
+
+namespace oceanbase
+{
+using namespace common;
+using namespace obcall;
+using namespace share;
+using namespace share::schema;
+namespace sql
+{
+ObCreateTableResolverBase::ObCreateTableResolverBase(ObResolverParams &params)
+    : ObDDLResolver(params)
+{
+}
+
+ObCreateTableResolverBase::~ObCreateTableResolverBase()
+{
+}
+
+int ObCreateTableResolverBase::resolve_partition_option(
+    ParseNode *node, ObTableSchema &table_schema, const bool is_partition_option_node_with_opt)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(stmt_) || OB_ISNULL(allocator_) || OB_ISNULL(session_info_)) {
+    ret = OB_NOT_INIT;
+    SQL_RESV_LOG(WARN, "failed to build partition key info!", KR(ret), KP(session_info_));
+  } else {
+    if (NULL != node) {
+      ObCreateTableStmt *create_table_stmt = static_cast<ObCreateTableStmt *>(stmt_);
+      if (OB_FAIL(ret)) {
+      } else if (!is_partition_option_node_with_opt) {
+        if (OB_FAIL(resolve_partition_node(create_table_stmt, node, table_schema))) {
+        }
+      } else if (T_PARTITION_OPTION == node->type_) {
+        if (node->num_child_ < 1 || node->num_child_ > 2) {
+          ret = OB_INVALID_ARGUMENT;
+          SQL_RESV_LOG(WARN, "node number is invalid.", KR(ret), K(node->num_child_));
+        } else if (NULL == node->children_[0]) {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_RESV_LOG(WARN, "partition node is null.", KR(ret));
+        } else {
+          ParseNode *partition_node = node->children_[0]; // ordinary partition node
+          if (OB_FAIL(resolve_partition_node(create_table_stmt, partition_node, table_schema))) {
+          }
+        }
+      } else {
+        ret = OB_INVALID_ARGUMENT;
+        SQL_RESV_LOG(WARN, "node type is invalid.", KR(ret), K(node->type_));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObCreateTableResolverBase::set_table_option_to_schema(ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(session_info_)) {
+    ret = OB_NOT_INIT;
+    SQL_RESV_LOG(WARN, "session_info is null.", K(ret));
+  } else {
+    
+    table_schema.set_block_size(block_size_);
+    int64_t progressive_merge_round = 0;
+    int64_t tablet_size = tablet_size_;
+    if (-1 == tablet_size) {
+      tablet_size = common::ObServerConfig::get_instance().tablet_size;
+    }
+    table_schema.set_tablet_size(tablet_size);
+    table_schema.set_pctfree(pctfree_);
+    table_schema.set_collation_type(collation_type_);
+    table_schema.set_charset_type(charset_type_);
+    table_schema.set_auto_increment(auto_increment_);
+    table_schema.set_read_only(read_only_);
+    table_schema.set_enable_row_movement(enable_row_movement_);
+    table_schema.set_table_mode_struct(table_mode_);
+    table_schema.set_dop(table_dop_);
+    if (0 == progressive_merge_num_) {
+      table_schema.set_progressive_merge_num(GCONF.default_progressive_merge_num);
+    } else {
+      table_schema.set_progressive_merge_num(progressive_merge_num_);
+    }
+    // set store format
+    if (store_format_ == OB_STORE_FORMAT_INVALID) {
+      ObString default_format;
+      if (NULL == GCONF.default_row_format.get_value()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("default row format is not set in server config", K(ret));
+      } else {
+        default_format = ObString::make_string(GCONF.default_row_format.str());
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL((ObStoreFormat::find_store_format_type(default_format, store_format_)))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("default compress not found!", K(ret), K_(store_format), K(default_format));
+        } else if (!ObStoreFormat::is_store_format_valid(store_format_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("Unexpected store format type", K_(store_format), K(ret));
+        } else if (OB_FAIL(ObDDLResolver::get_row_store_type(store_format_, row_store_type_))) {
+        }
+      }
+    } else if (OB_FAIL(ObDDLResolver::get_row_store_type(store_format_, row_store_type_))) {
+    }
+
+    if (OB_SUCC(ret)) {
+      if (0 == progressive_merge_round) {
+        progressive_merge_round = 1;
+      }
+    }
+
+    // set compress method
+    if (OB_SUCC(ret)) {
+      if (compress_method_.empty()) {
+        char compress_func_str[OB_MAX_HEADER_COMPRESSOR_NAME_LENGTH] = "";
+        if (NULL == GCONF.default_compress_func.get_value()) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("default compress func name is not set in server config", K(ret));
+        } else if (OB_FAIL(GCONF.default_compress_func.copy(compress_func_str, sizeof(compress_func_str)))) {
+        } else {
+          bool found = false;
+          for (int i = 0; i < ARRAYSIZEOF(common::compress_funcs) && !found; ++i) {
+            //find again in case of case sensitive in server init parameters
+            //all change to
+            if (0 == ObString::make_string(common::compress_funcs[i]).case_compare(compress_func_str)) {
+              found = true;
+              compress_method_ = ObString::make_string(common::compress_funcs[i]);
+            }
+          }
+          if (!found) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("compress method not found!", K(ret), K_(compress_method),
+                "default_compress_func", compress_func_str);
+          }
+        }
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      table_schema.set_row_store_type(row_store_type_);
+      table_schema.set_store_format(store_format_);
+      table_schema.set_progressive_merge_round(progressive_merge_round);
+      if (OB_FAIL(table_schema.set_compress_func_name(compress_method_)) ||
+          OB_FAIL(table_schema.set_comment(comment_))) {
+        SQL_RESV_LOG(WARN, "set table_options failed", K(ret));
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      // if lob_inrow_threshold not set, used config default_lob_inrow_threshold
+      if (is_set_lob_inrow_threshold_) {
+        table_schema.set_lob_inrow_threshold(lob_inrow_threshold_);
+      } else if (OB_ISNULL(session_info_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("session if NULL", K(ret));
+      } else if (OB_FALSE_IT((lob_inrow_threshold_ = session_info_->get_default_lob_inrow_threshold()))) {
+      } else if (lob_inrow_threshold_ < OB_MIN_LOB_INROW_THRESHOLD || lob_inrow_threshold_ > OB_MAX_LOB_INROW_THRESHOLD) {
+        ret = OB_INVALID_ARGUMENT;
+        SQL_RESV_LOG(ERROR, "invalid inrow threshold", K(ret), K(lob_inrow_threshold_));
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid inrow threshold"); 
+      } else {
+        table_schema.set_lob_inrow_threshold(lob_inrow_threshold_);
+      }
+    }
+    if (OB_SUCC(ret) && auto_increment_cache_size_ != 0) {
+      table_schema.set_auto_increment_cache_size(auto_increment_cache_size_);
+    }
+    if (OB_SUCC(ret)) {
+      if (semistruct_encoding_type_.is_enable_semistruct_encoding()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("semistruct encoding is not supported", K(ret), K(semistruct_encoding_type_));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "semistruct encoding is not supported");
+      } else {
+        table_schema.set_semistruct_encoding_type(semistruct_encoding_type_);
+      }
+    }
+  }
+  return ret;
+}
+
+int ObCreateTableResolverBase::add_primary_key_part(const ObString &column_name,
+                                                    ObTableSchema &table_schema,
+                                                    const int64_t cur_rowkey_size,
+                                                    int64_t &pk_data_length,
+                                                    ObColumnSchemaV2 *&col)
+{
+  int ret = OB_SUCCESS;
+  col = NULL;
+  int64_t length = 0;
+  if (OB_ISNULL(session_info_)) {
+    ret = OB_NOT_INIT;
+    SQL_RESV_LOG(WARN, "session is null", KP(session_info_), K(ret));
+  } else if (OB_ISNULL(col = table_schema.get_column_schema(column_name))) {
+    ret = OB_ERR_KEY_COLUMN_DOES_NOT_EXITS;
+    LOG_USER_ERROR(OB_ERR_KEY_COLUMN_DOES_NOT_EXITS, column_name.length(), column_name.ptr());
+    SQL_RESV_LOG(WARN, "column does not exists", K(ret), K(column_name));
+  } else if (OB_FAIL(check_add_column_as_pk_allowed(*col))) {
+  } else if (col->get_rowkey_position() > 0) {
+    ret = OB_ERR_COLUMN_DUPLICATE;
+    LOG_USER_ERROR(OB_ERR_COLUMN_DUPLICATE, column_name.length(), column_name.ptr());
+  } else if (OB_USER_MAX_ROWKEY_COLUMN_NUMBER == cur_rowkey_size) {
+    ret = OB_ERR_TOO_MANY_ROWKEY_COLUMNS;
+    LOG_USER_ERROR(OB_ERR_TOO_MANY_ROWKEY_COLUMNS, OB_USER_MAX_ROWKEY_COLUMN_NUMBER);
+  } else if (OB_FALSE_IT(col->set_nullable(false))
+             || OB_FALSE_IT(col->set_rowkey_position(cur_rowkey_size + 1))) {
+  } else if (OB_FAIL(table_schema.set_rowkey_info(*col))) {
+  } else if (!col->is_string_type()) {
+    /* do nothing */
+  } else if (OB_FAIL(col->get_byte_length(length, false))) {
+  } else if (length <= 0) {
+    ret = OB_ERR_WRONG_KEY_COLUMN;
+    LOG_USER_ERROR(OB_ERR_WRONG_KEY_COLUMN, column_name.length(), column_name.ptr());
+  } else {
+    if (col->is_string_lob()) {
+      length = 0;
+    }
+    if ((pk_data_length += length) > OB_MAX_USER_ROW_KEY_LENGTH) {
+      ret = OB_ERR_TOO_LONG_KEY_LENGTH;
+      LOG_USER_ERROR(OB_ERR_TOO_LONG_KEY_LENGTH, OB_MAX_USER_ROW_KEY_LENGTH);
+    }
+  }
+  return ret;
+}
+
+
+int ObCreateTableResolverBase::resolve_table_organization(common::ObServerConfig *runtime_config, ParseNode *node)
+{
+  int ret = OB_SUCCESS;
+  // Get the table organization from the server runtime configuration.
+  {
+    const char *ptr = NULL;
+    if (OB_ISNULL(ptr = runtime_config->default_table_organization.get_value())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("default organization ptr is null", K(ret));
+    } else {
+      table_organization_ =
+        (0 == ObString::make_string("HEAP").case_compare(ptr)) ?
+          ObTableOrganizationType::OB_HEAP_ORGANIZATION : ObTableOrganizationType::OB_INDEX_ORGANIZATION;
+    }
+  }
+
+  // get the table organization from the table options
+  if (OB_FAIL(ret)) {
+  } else if (NULL != node) {
+    ParseNode *option_node = NULL;
+    int32_t num = 0;
+    if (T_TABLE_OPTION_LIST != node->type_) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_RESV_LOG(WARN, "invalid parse node", KR(ret), K(node->type_), K(node->num_child_));
+    } else {
+      num = node->num_child_;
+    }
+
+    for (int64_t i = 0; OB_SUCC(ret) && i < num; ++i) {
+      if (OB_ISNULL(option_node = node->children_[i])) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "node is null", K(ret));
+      } else if (T_ORGANIZATION == option_node->type_) {
+        if (stmt_->get_stmt_type() == stmt::T_CREATE_TABLE) {
+          if (OB_ISNULL(option_node->children_[0])) {
+            ret = OB_ERR_UNEXPECTED;
+            SQL_RESV_LOG(WARN, "option_node child is null", K(option_node->children_[0]), K(ret));
+          } else {
+            if (T_ORGANIZATION_HEAP == option_node->children_[0]->type_) {
+              table_organization_ = ObTableOrganizationType::OB_HEAP_ORGANIZATION;
+            } else if (T_ORGANIZATION_INDEX == option_node->children_[0]->type_) {
+              table_organization_ = ObTableOrganizationType::OB_INDEX_ORGANIZATION;
+            }
+          }
+        } else if (stmt_->get_stmt_type() == stmt::T_ALTER_TABLE) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("alter table statement should not specify organization type", K(ret));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "specify organization type in alter table query");
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+        }
+      }
+    }
+  }
+  return ret;
+}
+}//end namespace sql
+}//end namespace oceanbase
