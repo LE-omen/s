@@ -213,10 +213,11 @@ class LineageExperiment(ReclaimExperiment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
+    parser.add_argument("--mode", type=int, choices=(5,6), default=5)
     parser.add_argument("--case", choices=("lineage","crash","all"), default="all")
     args = parser.parse_args()
     for case in (("lineage","crash") if args.case == "all" else (args.case,)):
-        exp = LineageExperiment(args.binary, "lineage_v8_"+case, prototype=5)
+        exp = LineageExperiment(args.binary, "lineage_v8_"+case, prototype=args.mode)
         try:
             exp.start()
             exp.run_lineage() if case == "lineage" else exp.run_crash()
