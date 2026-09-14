@@ -34,6 +34,8 @@ enum class ObTabletMdsUserDataType : int64_t
   CREATE_TABLET = 1,
   //for drop tablet
   REMOVE_TABLET = 2,
+  // Prototype: physical creation of an already-visible logical object.
+  PROTOTYPE_MATERIALIZE_TABLET = 3,
   MAX_TYPE,
 };
 

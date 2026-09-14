@@ -50,7 +50,7 @@ class Experiment:
 
     def start(self):
         env = os.environ.copy()
-        env["SEEKDB_NAMESPACE_FORK_PROTOTYPE"] = "1" if self.prototype else "0"
+        env["SEEKDB_NAMESPACE_FORK_PROTOTYPE"] = str(int(self.prototype))
         command = [self.binary, "--nodaemon", "--base-dir=" + str(self.base), "-P" + str(self.port),
                    "--log-level=INFO", "--parameter", "memory_budget=2G",
                    "--parameter", "datafile_size=256M", "--parameter", "datafile_maxsize=512M",
@@ -76,7 +76,8 @@ class Experiment:
         # Remove a separate conservative active-tx watermark (initially zero),
         # so the acquired snapshot must be the effective historical-version guard.
         self.sql("ALTER SYSTEM SET _mvcc_gc_using_min_txn_snapshot=false")
-        self.sql("SET ob_global_debug_sync='FORK_TABLE_WAIT_FREEZE_END wait_for prototype_hold execute 10000'")
+        if self.prototype != 2:
+            self.sql("SET ob_global_debug_sync='FORK_TABLE_WAIT_FREEZE_END wait_for prototype_hold execute 10000'")
 
     def close(self):
         if self.connection is not None:
@@ -93,7 +94,7 @@ class Experiment:
         # Keep the complete disposable data as an archive; this host has little free disk.
         entries = [p for p in self.base.iterdir()
                    if p.name not in {"log", "process.out", "experiment.jsonl", "PROTOTYPE.txt",
-                                     "vector_loading.log"}]
+                                     "vector_loading.log", "directory_snapshot.json"}]
         if entries:
             archive = self.base / "data.tar.gz"
             with tarfile.open(archive, "w:gz", compresslevel=1) as out:
@@ -188,6 +189,15 @@ class Experiment:
         self.sql("UPDATE " + source + ".t2 SET v=11 WHERE id=1")
         self.sql("DELETE FROM " + source + ".t2 WHERE id=2")
         self.sql("INSERT INTO " + source + ".t2 VALUES(4,40)")
+
+        # Renewal is demand-driven. Flush one unrelated tablet to request it without
+        # flushing either fork branch or relying on the timing of startup catchup.
+        self.sql("CREATE DATABASE __fork_proto_gc")
+        self.sql("CREATE TABLE __fork_proto_gc.probe(id INT PRIMARY KEY)")
+        self.sql("INSERT INTO __fork_proto_gc.probe VALUES(1)")
+        probe_tablet = self.user_tables("__fork_proto_gc")[0][2]
+        self.sql("ALTER SYSTEM MINOR FREEZE TABLET_ID=" + str(probe_tablet))
+        self.record("unrelated_table_flush_requested_gc_renewal", tablet_id=probe_tablet)
 
         deadline = time.monotonic() + 150
         last_report = 0

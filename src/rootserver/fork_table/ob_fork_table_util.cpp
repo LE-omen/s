@@ -65,7 +65,7 @@ bool NamespaceForkPrototype::enabled()
 {
   static const bool enabled = [] {
     const char *value = std::getenv("SEEKDB_NAMESPACE_FORK_PROTOTYPE");
-    return value != nullptr && std::strcmp(value, "1") == 0;
+    return value != nullptr && (std::strcmp(value, "1") == 0 || std::strcmp(value, "2") == 0);
   }();
   return enabled;
 }

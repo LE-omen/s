@@ -15,6 +15,7 @@
  */
 
 #include "sql/resolver/ddl/ob_drop_table_resolver.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 namespace oceanbase
 {
 using namespace common;
@@ -109,6 +110,11 @@ int ObDropTableResolver::resolve(const ParseNode &parse_tree)
           if (OB_FAIL(resolve_table_relation_node(table_node,
                                                   table_name,
                                                   db_name))) {
+          } else if (storage::NamespaceForkKernelPrototype::enabled()
+                     && db_name.prefix_match("__fork_proto_b")) {
+            // The prototype has a read-only inherited catalog, including for IF EXISTS.
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "DROP TABLE in namespace fork prototype");
           } else {
             table_item.reset();
             if (OB_FAIL(session_info_->get_name_case_mode(table_item.mode_))) {

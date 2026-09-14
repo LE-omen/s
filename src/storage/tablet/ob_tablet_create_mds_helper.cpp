@@ -1016,6 +1016,12 @@ int ObTabletCreateMdsHelper::set_tablet_status(
   if (OB_ISNULL(tablet)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet is null", K(ret), K(tablet_handle));
+  } else if (data_type == ObTabletMdsUserDataType::PROTOTYPE_MATERIALIZE_TABLET
+      && (!tablet->get_tablet_meta().fork_info_.is_valid()
+          || create_commit_version <= 0
+          || create_commit_version != tablet->get_tablet_meta().fork_info_.get_fork_snapshot_version())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid prototype logical creation version", K(ret), K(create_commit_version), K(tablet_handle));
   } else if (OB_UNLIKELY(for_replay && !scn.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("scn is invalid", K(ret),

@@ -29,6 +29,7 @@
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tx_storage/ob_memstore_freezer.h"
 #include "storage/ob_table_dml_param.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 namespace oceanbase
 {
 using namespace common;
@@ -569,7 +570,8 @@ int ObAccessService::check_read_allowed_(
   int ret = OB_SUCCESS;
   ObLS *ls = nullptr;
 
-  if (OB_FAIL(ls_svr_->get_ls(ls))) {
+  if (OB_FAIL(NamespaceForkKernelPrototype::ensure_tablet(tablet_id))) {
+  } else if (OB_FAIL(ls_svr_->get_ls(ls))) {
   } else if (OB_FAIL(ctx_guard.init(ls))) {
   } else {
     ObStoreCtx &ctx = ctx_guard.get_store_ctx();
@@ -673,7 +675,8 @@ int ObAccessService::check_write_allowed_(
     enable_table_lock = false;
     ret = OB_SUCCESS;
   }
-  if (OB_FAIL(check_memstore_limit_(is_out_of_mem))) {
+  if (OB_FAIL(NamespaceForkKernelPrototype::ensure_tablet(tablet_id))) {
+  } else if (OB_FAIL(check_memstore_limit_(is_out_of_mem))) {
   } else if (is_out_of_mem && !tablet_id.is_inner_tablet()) {
     ret = OB_SERVER_RUNTIME_OUT_OF_MEM;
     LOG_WARN("server runtime is already out of memstore memory", K(ret));

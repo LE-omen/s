@@ -2,6 +2,8 @@
 
 日期：2026-09-14。状态：最小原型已实现，普通表 2/20 表夹具、关闭开关的对照、独立向量夹具已通过。实测记录与复现命令见 [namespace_fork_prototype_results.md](namespace_fork_prototype_results.md)。原定首轮投入上限为 3 人日，不是完整功能的完工估计。
 
+本文描述 V1；后续实现与验收见 [内核 V2](namespace_fork_kernel_v2.md)。
+
 统一设计仍以 [namespace_fork_design.md](/home/nijia.nj/.codex/worktrees/af63/seekdb_for_codex/docs/research/namespace_fork_design.md) 为准。本文缩小实验范围，不改变已定架构，不替 D1 选择门禁/回滚策略。
 
 ## 1. 只回答一个核心问题

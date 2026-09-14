@@ -26,6 +26,7 @@
 #include "storage/ddl/ob_ddl_lock.h"
 #include "storage/tablelock/ob_lock_inner_connection_util.h"
 #include "rootserver/fork_table/namespace_fork_prototype.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "share/ob_snapshot_table_proxy.h"
 #include "storage/compaction/ob_freeze_info_mgr.h"
 #include "rootserver/ddl_task/ob_ddl_task_util.h"
@@ -80,6 +81,10 @@ int ObDDLService::fork_database_prototype_(const ObForkDatabaseArg &arg, ObDDLRe
     } else {
       target.set_database_id(OB_INVALID_ID);
       ret = ddl_operator.create_database(target, trans, &arg.ddl_stmt_str_);
+      if (OB_SUCC(ret) && NamespaceForkKernelPrototype::enabled()) {
+        ret = NamespaceForkKernelPrototype::capture(trans, source->get_database_id(),
+            target.get_database_id(), snapshot, schema_version);
+      }
     }
   }
   if (trans.is_started()) {
@@ -90,7 +95,7 @@ int ObDDLService::fork_database_prototype_(const ObForkDatabaseArg &arg, ObDDLRe
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(freeze_mgr->reload_for_test())) {
   } else if (OB_FAIL(publish_schema())) {
-  } else if (OB_FAIL(NamespaceForkPrototype::publish(source->get_database_id(),
+  } else if (!NamespaceForkKernelPrototype::enabled() && OB_FAIL(NamespaceForkPrototype::publish(source->get_database_id(),
                           target.get_database_id(), schema_version, snapshot))) {
   } else {
     res.schema_id_ = target.get_database_id();

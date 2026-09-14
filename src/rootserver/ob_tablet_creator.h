@@ -132,6 +132,7 @@ const static int64_t BATCH_ARG_SIZE = 1024 * 1024;  // 1M
   int init(const bool need_check_tablet_cnt);
   int execute();
   int add_create_tablet_arg(const ObTabletCreatorArg &arg);
+  void set_materialization_for_prototype();
   void reset();
 private:
   const share::SCN major_frozen_scn_;

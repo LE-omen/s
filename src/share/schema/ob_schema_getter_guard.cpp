@@ -18,6 +18,7 @@
 
 
 #include "ob_schema_getter_guard.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "ob_ai_model_schema_getter_guard.ipp"
 
 #include <string.h>
@@ -596,6 +597,33 @@ int ObSchemaGetterGuard::get_database_id(const ObString &database_name,
   return ret;
 }
 
+static int prototype_catalog_schema(ObSchemaGetterGuard &guard, uint64_t db,
+                                    const ObString &name, const ObTableSchema *&schema)
+{
+  schema = nullptr;
+  if (!storage::NamespaceForkKernelPrototype::enabled()) { return OB_SUCCESS; }
+  const ObDatabaseSchema *database = nullptr;
+  int ret = guard.get_database_schema(db, database);
+  if (ret == OB_SUCCESS && database != nullptr
+      && database->get_database_name_str().prefix_match("__fork_proto_b")) {
+    ret = storage::NamespaceForkKernelPrototype::schema_by_name(db, name, schema);
+  }
+  return ret;
+}
+
+static int prototype_catalog_schemas(ObSchemaGetterGuard &guard, uint64_t db,
+                                     ObIArray<const ObTableSchema *> &schemas)
+{
+  if (!storage::NamespaceForkKernelPrototype::enabled()) { return OB_SUCCESS; }
+  const ObDatabaseSchema *database = nullptr;
+  int ret = guard.get_database_schema(db, database);
+  if (ret == OB_SUCCESS && database != nullptr
+      && database->get_database_name_str().prefix_match("__fork_proto_b")) {
+    ret = storage::NamespaceForkKernelPrototype::list_schemas(db, schemas);
+  }
+  return ret;
+}
+
 int ObSchemaGetterGuard::get_table_id(uint64_t database_id,
                                       const ObString &table_name,
                                       const bool is_index,
@@ -645,6 +673,11 @@ int ObSchemaGetterGuard::get_table_id(uint64_t database_id,
         table_id = simple_table->get_table_id();
       }
     }
+  }
+  if (OB_SUCC(ret) && table_id == OB_INVALID_ID && !is_index && check_type != TEMP_TABLE_TYPE) {
+    const ObTableSchema *inherited = nullptr;
+    if (OB_FAIL(prototype_catalog_schema(*this, database_id, table_name, inherited))) {
+    } else if (inherited != nullptr) { table_id = inherited->get_table_id(); }
   }
   return ret;
 }
@@ -878,6 +911,9 @@ int ObSchemaGetterGuard::get_table_schema(
     const uint64_t table_id,
     const ObTableSchema *&table_schema)
 {
+  if (storage::NamespaceForkKernelPrototype::is_encoded_id(table_id)) {
+    return storage::NamespaceForkKernelPrototype::schema_by_id(table_id, table_schema);
+  }
   int ret = OB_SUCCESS;
   table_schema = NULL;
   if (!check_inner_stat()) {
@@ -1054,6 +1090,11 @@ int ObSchemaGetterGuard::get_simple_table_schema(
                                            with_hidden_flag,
                                            is_built_in_index))) {
   }
+  if (OB_SUCC(ret) && simple_table_schema == nullptr && !is_index) {
+    const ObTableSchema *inherited = nullptr;
+    if (OB_FAIL(prototype_catalog_schema(*this, database_id, table_name, inherited))) {
+    } else { simple_table_schema = inherited; }
+  }
   return ret;
 }
 
@@ -1078,6 +1119,8 @@ int ObSchemaGetterGuard::get_table_schema(
   } else if (NULL == simple_table) {
     LOG_INFO("table not exist",
              K(database_id), K(table_name), K(is_index));
+  } else if (storage::NamespaceForkKernelPrototype::is_encoded_id(simple_table->get_table_id())) {
+    ret = storage::NamespaceForkKernelPrototype::schema_by_id(simple_table->get_table_id(), table_schema);
   } else if (OB_FAIL(get_schema(TABLE_SCHEMA,
                                 simple_table->get_table_id(),
                                 table_schema,
@@ -2214,6 +2257,15 @@ int ObSchemaGetterGuard::get_schema_version(
     int64_t &schema_version,
     uint64_t *schema_belong_db_id)
 {
+  if (schema_type == TABLE_SCHEMA && storage::NamespaceForkKernelPrototype::is_encoded_id(schema_id)) {
+    const ObTableSchema *inherited = nullptr;
+    int ret = storage::NamespaceForkKernelPrototype::schema_by_id(schema_id, inherited);
+    if (ret == OB_SUCCESS && inherited != nullptr) {
+      schema_version = inherited->get_schema_version();
+      if (schema_belong_db_id != nullptr) { *schema_belong_db_id = inherited->get_database_id(); }
+    }
+    return ret;
+  }
   int ret = OB_SUCCESS;
   schema_version = OB_INVALID_VERSION;
 
@@ -2690,6 +2742,15 @@ int ObSchemaGetterGuard::get_trigger_infos_in_runtime(ObIArray<const ObTriggerIn
         }                                                                            \
       }                                                                              \
     }                                                                                \
+    if (OB_SUCC(ret)) { \
+      ObArray<const ObTableSchema *> inherited; \
+      if (OB_FAIL(prototype_catalog_schemas(*this, dst_schema_id, inherited))) { \
+      } else { \
+        for (int64_t i = 0; OB_SUCC(ret) && i < inherited.count(); ++i) { \
+          ret = table_ids.push_back(inherited.at(i)->get_table_id()); \
+        } \
+      } \
+    } \
     return ret;                                                                      \
   }
 
@@ -2766,6 +2827,9 @@ int ObSchemaGetterGuard::get_table_ids_in_runtime(ObIArray<uint64_t> &table_ids)
         }                                                                            \
       }                                                                              \
     }                                                                                \
+    if (OB_SUCC(ret)) { \
+      ret = prototype_catalog_schemas(*this, dst_schema_id, schema_array); \
+    } \
     return ret;                                                                      \
   }
 
@@ -2864,6 +2928,15 @@ int ObSchemaGetterGuard::get_table_schemas_in_##DST_SCHEMA( \
     LOG_WARN("get simple schema in lazy mode not supported", KR(ret)); \
   } else if (OB_FAIL(mgr->get_table_schemas_in_##DST_SCHEMA(dst_schema_id, table_schemas))) { \
     LOG_WARN("get table schemas in "#DST_SCHEMA" failed", KR(ret), K(dst_schema_id)); \
+  } \
+  if (OB_SUCC(ret)) { \
+    ObArray<const ObTableSchema *> inherited; \
+    if (OB_FAIL(prototype_catalog_schemas(*this, dst_schema_id, inherited))) { \
+    } else { \
+      for (int64_t i = 0; OB_SUCC(ret) && i < inherited.count(); ++i) { \
+        ret = table_schemas.push_back(inherited.at(i)); \
+      } \
+    } \
   } \
   return ret; \
 }
@@ -3766,6 +3839,11 @@ int ObSchemaGetterGuard::get_simple_table_schema(
     const uint64_t table_id,
     const ObSimpleTableSchemaV2 * &table_schema)
 {
+  if (storage::NamespaceForkKernelPrototype::is_encoded_id(table_id)) {
+    const ObTableSchema *inherited = nullptr;
+    int ret = storage::NamespaceForkKernelPrototype::schema_by_id(table_id, inherited);
+    table_schema = inherited; return ret;
+  }
   int ret = OB_SUCCESS;
   const ObSchemaMgr *mgr = NULL;
   table_schema = NULL;

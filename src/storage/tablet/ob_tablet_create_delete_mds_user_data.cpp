@@ -86,6 +86,7 @@ void ObTabletCreateDeleteMdsUserData::on_redo(const share::SCN &redo_scn)
   switch (data_type_) {
   case ObTabletMdsUserDataType::NONE :
   case ObTabletMdsUserDataType::CREATE_TABLET :
+  case ObTabletMdsUserDataType::PROTOTYPE_MATERIALIZE_TABLET :
   case ObTabletMdsUserDataType::REMOVE_TABLET :
     break;
   default: {
@@ -103,6 +104,13 @@ void ObTabletCreateDeleteMdsUserData::on_commit(const share::SCN &commit_version
     break;
   case ObTabletMdsUserDataType::CREATE_TABLET : {
     create_tablet_on_commit_(commit_version, commit_scn);
+    break;
+  }
+  case ObTabletMdsUserDataType::PROTOTYPE_MATERIALIZE_TABLET : {
+    // Keep the logical birth recorded in the same transaction as the directory binding.
+    // Readers retain their original snapshot; physical creation does not create a new SQL table.
+    create_commit_scn_ = commit_scn;
+    LOG_INFO("prototype tablet materialization commit", KPC(this), K(commit_version));
     break;
   }
   case ObTabletMdsUserDataType::REMOVE_TABLET : {

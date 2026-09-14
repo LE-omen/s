@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "ob_table_sql_service.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "lib/literals/ob_literals.h"
 #include "share/ob_global_stat_proxy.h"
 #include "share/schema/ob_constraint.h"
@@ -1743,6 +1744,9 @@ int ObTableSqlService::add_table(
     }
   }
 
+  if (OB_SUCC(ret) && !only_history) {
+    ret = storage::NamespaceForkKernelPrototype::observe_schema(sql_client, table);
+  }
   return ret;
 }
 
@@ -1786,6 +1790,9 @@ int ObTableSqlService::batch_add_table_for_create_table(common::ObISQLClient &sq
     } else if (OB_FAIL(exec_dml(sql_client, OB_ALL_TABLE_HISTORY_TNAME, dml, tables.count()))) {
     } else if (FALSE_IT(time_guard.click("insert_all_table_history"))) {
     }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < tables.count(); ++i) {
+    ret = storage::NamespaceForkKernelPrototype::observe_schema(sql_client, tables.at(i));
   }
   return ret;
 }
@@ -4318,7 +4325,8 @@ int ObTableSqlService::update_table_schema_version(ObISQLClient &sql_client,
 int ObTableSqlService::check_ddl_allowed(const ObSimpleTableSchemaV2 &table_schema)
 {
   int ret = OB_SUCCESS;
-  if (!table_schema.check_can_do_ddl()) {
+  if (OB_FAIL(storage::NamespaceForkKernelPrototype::check_ddl(table_schema))) {
+  } else if (!table_schema.check_can_do_ddl()) {
     ret = OB_OP_NOT_ALLOW;
     LOG_WARN("table_sql_service", K(table_schema.get_table_mode_struct()),
         K(table_schema.get_in_offline_ddl_white_list()));

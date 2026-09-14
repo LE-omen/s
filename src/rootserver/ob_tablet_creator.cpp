@@ -307,6 +307,13 @@ int ObTabletCreator::add_create_tablet_arg(const ObTabletCreatorArg &arg)
   return ret;
 }
 
+void ObTabletCreator::set_materialization_for_prototype()
+{
+  for (auto *batch = single_batch_arg_; batch != nullptr; batch = batch->next_) {
+    batch->batch_arg_.create_type_ = storage::ObTabletMdsUserDataType::PROTOTYPE_MATERIALIZE_TABLET;
+  }
+}
+
 int ObTabletCreator::execute()
 {
   int ret = OB_SUCCESS;

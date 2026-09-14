@@ -2,6 +2,8 @@
 
 2026-09-14，分支 `codex/namespace-fork-prototype`，基于 `dbe8fcdbb2ed1ea97a12d781ff0ffad8638e01b8`。
 
+本文保留 V1 的实现与原始验收记录。后续已完成 [内核 V2](namespace_fork_kernel_v2.md)：持久 COW B+ 树、继承 catalog、普通 SQL 在存储入口自动物化及崩溃重启验证。
+
 **核心假设通过有限夹具验证：捕获时可以省去逐表物化，稍后按同一个旧快照创建可写目标表。** 首次访问仍执行目标建表、事务提交、schema 发布和基线读取。独立向量实验也通过，但明确观察到了首次查询补增量、反序列化持久图；没有消除这部分成本，也没有测延迟。
 
 这是一次性、单进程、来源保留的真实引擎实验。完整范围与取舍见 [最小方案](namespace_fork_minimal_prototype.md)。
