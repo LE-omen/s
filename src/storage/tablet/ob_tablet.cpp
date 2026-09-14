@@ -5598,9 +5598,10 @@ int ObTablet::check_tablet_status_for_read_all_committed()
           LOG_WARN("tablet creation has no been committed, or has been roll backed", K(ret), K(tablet_id));
         }
       } else if (mds::TwoPhaseCommitState::ON_COMMIT != trans_stat) {
-        if (transaction::ObTransVersion::INVALID_TRANS_VERSION == user_data.create_commit_version_) {
+        if (user_data.data_type_ == ObTabletMdsUserDataType::PROTOTYPE_MATERIALIZE_TABLET
+            || transaction::ObTransVersion::INVALID_TRANS_VERSION == user_data.create_commit_version_) {
           ret = OB_TABLET_NOT_EXIST;
-          LOG_WARN("create commit version is invalid", K(ret), K(tablet_id), K(user_data));
+          LOG_WARN("tablet creation is not committed", K(ret), K(tablet_id), K(user_data));
         }
       }
     } else {

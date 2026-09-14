@@ -245,6 +245,11 @@ int ObTabletCreateDeleteHelper::check_read_snapshot_for_normal(
   if (OB_UNLIKELY(ObTabletStatus::NORMAL != tablet_status)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", K(ret), K(tablet_id), K(user_data));
+  } else if (user_data.data_type_ == ObTabletMdsUserDataType::PROTOTYPE_MATERIALIZE_TABLET
+      && trans_state != mds::TwoPhaseCommitState::ON_COMMIT) {
+    // The prototype records logical birth S before CREATE commits. Only the real
+    // MDS commit proves its same-transaction directory binding is also committed.
+    ret = OB_EAGAIN;
   } else if (user_data.create_commit_version_ == ObTransVersion::MAX_TRANS_VERSION) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("create commit version is max trans version",

@@ -2,6 +2,8 @@
 
 日期：2026-09-14。分支：`codex/namespace-fork-compaction-v3`，基于 V2 `f736de6fd`。状态：真实转储、minor/major 合并和崩溃恢复验收通过。
 
+后续进展：[V4 复用现有 tablet 状态跳过已物化表的目录事务](namespace_fork_fastpath_v4.md)，不新增物化绑定缓存。下文保留 V3 原始实现和验收记录。
+
 ## 本轮问题
 
 V2 的目标 tablet 尚未完成 fork 基线构建，会从来源 tablet 读取 A@S。本轮检查来源和目标正常转储、minor/major 合并后，已物化目标的修改及尚未访问表的旧快照是否仍然正确，并再次检查崩溃恢复。

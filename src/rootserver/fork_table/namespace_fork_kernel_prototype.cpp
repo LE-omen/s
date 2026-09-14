@@ -7,12 +7,14 @@
 #include "common/mysqlclient/ob_mysql_transaction.h"
 #include "share/ob_server_struct.h"
 #include "share/ob_snapshot_table_proxy.h"
+#include "share/ob_debug_sync.h"
 #include "share/tablet/ob_tablet_mapping_operator.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/rc/ob_server_runtime.h"
 #include "storage/compaction/ob_freeze_info_mgr.h"
 #include "storage/compaction/ob_schedule_dag_func.h"
 #include "storage/ddl/ob_tablet_fork_task.h"
+#include "storage/tablet/ob_tablet_create_delete_helper.h"
 #include "lib/checksum/ob_crc64.h"
 #include <algorithm>
 #include <cstdlib>
@@ -433,6 +435,17 @@ int NamespaceForkKernelPrototype::schedule_baseline(const ObTablet &tablet) {
 int NamespaceForkKernelPrototype::ensure_tablet(const ObTabletID &tablet_id) {
   if (!is_encoded_id(tablet_id.id())) { return OB_SUCCESS; }
   int ret = OB_SUCCESS; const uint64_t db = database_of(tablet_id.id()), local = local_of(tablet_id.id());
+  {
+    // Reuse the tablet manager and its existing committed-status cache. A valid
+    // logical birth S alone is not proof that physical creation has committed.
+    ObTabletHandle handle;
+    ret = ObTabletCreateDeleteHelper::check_and_get_tablet(ObTabletMapKey(tablet_id), handle,
+        0, ObMDSGetTabletMode::READ_READABLE_COMMITED, transaction::ObTransVersion::MAX_TRANS_VERSION);
+    if (ret == OB_SUCCESS) { return ret; }
+    if (ret != OB_TABLET_NOT_EXIST && ret != OB_EAGAIN) { return ret; }
+  } // Do not pin an uncommitted tablet while waiting for its creator's root lock.
+  LOG_INFO("PROTOTYPE_V4_DIRECTORY_SLOW_PATH", K(tablet_id), "lookup_ret", ret);
+  ret = OB_SUCCESS;
   if (!GCTX.sql_proxy_) { return OB_NOT_INIT; }
   ObMySQLTransaction trans; Roots root; Value value;
   // The row lock joins concurrent requests before physical creation. The business transaction is untouched.
@@ -481,8 +494,12 @@ int NamespaceForkKernelPrototype::ensure_tablet(const ObTabletID &tablet_id) {
           } else if (OB_FAIL(put(trans, root.directory, key_of(local), value, root.directory))) {
           } else if (OB_FAIL(save_roots(trans, db, root))) {
           } else {
+            // Reuse the existing mapping-update sync point in this isolated prototype.
+            // It exposes a physical tablet plus uncommitted directory for crash/abort checks.
+            DEBUG_SYNC(AFTER_UPDATE_TABLET_TO_LS);
+            ret = THIS_WORKER.check_status();
             LOG_INFO("PROTOTYPE_V2_STORAGE_MATERIALIZE", K(tablet_id), K(source_tablet), "snapshot", root.snapshot,
-                     K(previous_root), "next_root", root.directory.page, "entry_layer", "ObAccessService");
+                     K(previous_root), "next_root", root.directory.page, "entry_layer", "ObAccessService", K(ret));
           }
         }
       }
