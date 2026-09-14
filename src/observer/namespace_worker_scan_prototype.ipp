@@ -82,7 +82,7 @@ struct EngineScan {
       if (rows.ret) { ret = rows.ret; break; }
     }
     reply = Frame('s'); reply.number(ret); reply.number(end); reply.number(count);
-    if (!ret) { reply.data.insert(reply.data.end(), rows.data.begin() + 25, rows.data.end()); }
+    if (!ret) { reply.data.insert(reply.data.end(), rows.data.begin() + Frame::HEADER_SIZE + 24, rows.data.end()); }
     return OB_SUCCESS;
   }
 };

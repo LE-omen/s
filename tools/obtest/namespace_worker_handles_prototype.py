@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V11 IPC admission probe: slot reuse, stale generations, invalid handles.
+"""V12 IPC admission/concurrency probe: slot reuse, stale generations, invalid handles.
 
 python3 tools/obtest/namespace_worker_handles_prototype.py --binary build_release/src/observer/seekdb
 No engine/table reads: complements the real MySQL integration probe.
@@ -36,20 +36,39 @@ def run(binary):
 
         def read():
             magic, size = struct.unpack("<4sI", read_exact(8))
-            assert magic == b"NS10" and 0 < size <= 256*1024
+            assert magic == b"NS12" and 0 < size <= 256*1024
             return read_exact(size)
 
-        def command(payload, expected=0):
-            proc.stdin.write(b"NS10" + struct.pack("<I", len(payload)) + payload)
+        sequence = 0
+        def send(tag, payload):
+            frame = payload[:1] + numbers(*tag) + payload[1:]
+            proc.stdin.write(b"NS12" + struct.pack("<I", len(frame)) + frame)
             proc.stdin.flush()
+
+        def receive():
+            frame = read()
+            assert len(frame) >= 17
+            return struct.unpack("<QQ", frame[1:17]), frame[:1] + frame[17:]
+
+        def command(payload, expected=0):
+            nonlocal sequence
+            sequence += 1
+            tag = (0, sequence)
+            send(tag, payload)
             replies = []
             while True:
-                reply = read()
+                actual, reply = receive()
+                assert actual == tag, (actual, tag, base)
                 if reply[:1] == b"D":
                     assert len(reply) == 9 and struct.unpack("<q", reply[1:])[0] == expected, (reply, base)
                     return replies
                 assert reply[:1] in (b"a", b"S", b"H", b"R"), (reply, base)
+                send(tag, b"K")
                 replies.append(reply)
+
+        def query_payload(handle, sql):
+            text = sql.encode()
+            return b"Q" + numbers(*handle, 1, len(text)) + text
 
         def open_session(sid):
             # Invalid default DB avoids catalog requests. Seven protocol scalars:
@@ -59,11 +78,10 @@ def run(binary):
             return struct.unpack("<QQ", reply[1:])
 
         def query(handle, sql, expected=0):
-            text = sql.encode()
-            return command(b"Q" + numbers(*handle, 1, len(text)) + text, expected)
+            return command(query_payload(handle, sql), expected)
 
         try:
-            assert read() == b"Y" + numbers(2)
+            assert receive() == ((0, 0), b"Y" + numbers(2))
             first = open_session(100)
             query(first, "SET @x=17")
             baseline = query(first, "SELECT @x")[-1]
@@ -78,11 +96,56 @@ def run(binary):
                 query(invalid, "SELECT 1", -5066)
                 command(b"C" + numbers(*invalid), -5066)
             query(reused, "SELECT 1")
+            query(reused, "SET @x=17")
+            query(handles[0], "SET @x=29")
+            fast_row = query(handles[0], "SELECT @x")[-1]
+            send((1, 1), query_payload(reused, "SELECT SLEEP(2),@x"))
+            send((2, 1), query_payload(handles[0], "SELECT @x"))
+            send((3, 1), query_payload(reused, "SELECT 999"))
+            done, replies = [], {}
+            while len(done) < 3:
+                tag, reply = receive()
+                assert tag in ((1,1), (2,1), (3,1)), (tag, base)
+                if reply[:1] == b"D":
+                    expected = -4023 if tag == (3,1) else 0
+                    assert struct.unpack("<q", reply[1:])[0] == expected, (tag,reply,base)
+                    done.append(tag)
+                else:
+                    send(tag, b"K")
+                    replies.setdefault(tag, []).append(reply)
+            assert done.index((2,1)) < done.index((1,1)), done
+            assert replies[(2,1)][-1] == fast_row
+
+            # Hold all credits after the first frame. Control and a different
+            # session must still progress; an old request generation cannot
+            # accidentally grant credit to its replacement.
+            send((1,2), query_payload(reused, "SELECT @x"))
+            tag, reply = receive()
+            assert tag == (1,2) and reply[:1] == b"S", (tag,reply,base)
+            send((1,1), b"K")
+            assert query(handles[0], "SELECT @x")[-1] == fast_row
+            assert not select.select([proc.stdout], [], [], .2)[0], "stale credit released replacement request"
+            command(b"C" + numbers(*reused))
+            replacement = open_session(201)
+            assert replacement == (reused[0], reused[1]+1)
+            assert query(replacement, "SELECT @x")[-1] != baseline
+            send((1,2), b"K")
+            old_rows = []
+            while True:
+                tag, reply = receive()
+                assert tag == (1,2), tag
+                if reply[:1] == b"D":
+                    assert struct.unpack("<q", reply[1:])[0] == 0, (reply,base)
+                    break
+                old_rows.append(reply)
+                send(tag, b"K")
+            assert old_rows[-1] == baseline, "in-flight session was freed/rebound"
+            reused = replacement
             for handle in [reused] + handles:
                 command(b"C" + numbers(*handle))
             command(b"C" + numbers(*reused), -5066)
             assert "active=0 slots=17" in (base / "process.out").read_text()
-            print(f"PASS: growth, reuse, stale/invalid handles, duplicate close, active=0; {base}")
+            print(f"PASS: concurrent execution, bounded credits, control progress, in-flight close/reuse, stale handles, active=0; {base}")
         finally:
             proc.stdin.close()
             try:

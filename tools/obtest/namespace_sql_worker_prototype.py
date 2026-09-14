@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throwaway V11: connection sessions, two real SQL-only workers, one engine.
+"""Throwaway V12: connection sessions, two real SQL-only workers, one engine.
 
 SEEKDB_FORK_PROTOTYPE_TEST_ROOT=/tmp python3 tools/obtest/namespace_sql_worker_prototype.py --binary build_release/src/observer/seekdb
 Linux integration probe. No claim of Windows/macOS or high-concurrency validation.
@@ -13,6 +13,7 @@ import resource
 import signal
 import socket
 import struct
+import time
 
 import pymysql
 from namespace_lineage_prototype import LineageExperiment
@@ -147,6 +148,69 @@ class WorkerExperiment(LineageExperiment):
             interrupted.close()
         self.sql("SET ob_query_timeout=30000000", first)
 
+    def run_concurrency(self, first, second):
+        scan_log = self.base / "log" / "seekdb.log"
+        offset = scan_log.stat().st_size
+        def opened():
+            with scan_log.open("rb") as log:
+                log.seek(offset)
+                return f"PROTOTYPE_V10_SCAN_OPEN ns={self.b} ".encode() in log.read()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            slow = pool.submit(self.sql, "SELECT SLEEP(3),@x,v FROM t1 WHERE id=1", first)
+            self.wait_until(opened, "slow query never opened storage scan")
+            start = time.monotonic()
+            assert self.sql("SELECT @x,v FROM t1 WHERE id=1", second) == ((29,90),)
+            elapsed = time.monotonic()-start
+            assert elapsed < 2 and not slow.done(), elapsed
+            assert slow.result(timeout=10) == ((0,17,90),)
+            def scan_many(connection, variable, reverse):
+                for _ in range(8):
+                    rows = self.sql("SELECT id,v+@x,SLEEP(0.02) FROM t1 ORDER BY id " +
+                                    ("DESC" if reverse else "ASC"), connection, log=False)
+                    expected = ((1,90+variable,0),(2,20+variable,0))
+                    assert rows == (tuple(reversed(expected)) if reverse else expected), rows
+            a = pool.submit(scan_many, first, 17, False)
+            b = pool.submit(scan_many, second, 29, True)
+            a.result(timeout=20); b.result(timeout=20)
+        self.record("same_worker_concurrent_sql_and_scans", fast_seconds=elapsed, interleaved_queries=16)
+
+    def run_slow_client(self, healthy):
+        slow = self.worker_connect(self.b)
+        pid = self.worker_pid(self.b)
+        closed = len(self.session_events("CLOSE"))
+        sid = slow.thread_id()
+        directory = max((self.base / "run").glob(f"namespace-worker-{self.b}-*"),
+                        key=lambda path: int(path.name.rsplit("-", 1)[1]))
+        def worker_log():
+            return (directory / "process.out").read_text(errors="replace")
+        offset = len(worker_log())
+        def began():
+            return re.search(rf"PROTOTYPE_V12_EXECUTE_BEGIN .*session={sid}\n", worker_log()[offset:])
+        def ended():
+            return re.search(rf"PROTOTYPE_V12_EXECUTE_END .*session={sid} ret=", worker_log()[offset:])
+        try:
+            # Read no response bytes. The result exceeds the TCP buffers; the
+            # existing NIO writer blocks this request while IPC credits bound it.
+            slow._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            slow._execute_command(3, "SELECT id,REPEAT('x',65536) FROM t1 ORDER BY id")
+            self.wait_until(began, "slow reader query never started")
+            time.sleep(1)
+            assert not ended(), "probe did not stall the result stream"
+            start = time.monotonic()
+            assert self.sql("SELECT SUM(v) FROM t1", healthy) == ((48590,),)
+            elapsed = time.monotonic()-start
+            assert elapsed < 2 and not ended(), elapsed
+            slow._sock.shutdown(socket.SHUT_RDWR)
+            slow._force_close()
+            self.wait_until(lambda: len(self.session_events("CLOSE")) == closed+1,
+                            "slow disconnected session not reclaimed")
+            assert self.worker_pid(self.b) == pid and ended()
+            assert self.sql("SELECT 1", healthy) == ((1,),)
+            self.record("slow_tcp_reader_does_not_block_other_session", fast_seconds=elapsed,
+                        result_bytes_at_least=98*65536, worker_survived=True)
+        finally:
+            slow.close()
+
     def run_workers(self):
         self.setup_lineage()
         c, _ = self.capture("b", "c")
@@ -165,6 +229,7 @@ class WorkerExperiment(LineageExperiment):
             assert self.sql("SELECT SUM(v) FROM t1", bconn) == ((110,),)
             assert self.sql("SELECT id,v FROM t1 WHERE id=1", cconn) == ((1,10),)
             self.run_sessions(bconn, stale)
+            self.run_concurrency(bconn, stale)
             for query in ("UPDATE t1 SET v=1", "SELECT * FROM __fork_ns_3__db1.t1" if self.b != 3 else "SELECT * FROM __fork_ns_2__db1.t1"):
                 try:
                     self.sql(query, bconn)
@@ -182,23 +247,31 @@ class WorkerExperiment(LineageExperiment):
                 with scan_log.open("rb") as log:
                     log.seek(before)
                     return f"PROTOTYPE_V10_SCAN_OPEN ns={self.b} ".encode() in log.read()
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                pending = pool.submit(self.sql, "SELECT SLEEP(15)+v FROM t1 WHERE id=1", bconn)
-                self.wait_until(scan_opened, "remote storage scan did not open")
-                try:
-                    self.sql("SELECT 1", stale)
-                except pymysql.MySQLError as error:
-                    self.record("busy_worker_rejected_extra_execution", error=error.args)
-                else:
-                    raise AssertionError("worker admitted a concurrent execution")
-                os.kill(bp, signal.SIGKILL)
-                assert self.sql("SELECT id,v FROM t1 ORDER BY id", cconn) == ((1,10),(2,20))
-                try:
-                    pending.result(timeout=10)
-                except pymysql.MySQLError as error:
-                    self.record("worker_death_failed_own_query", namespace=self.b, pid=bp, error=error.args)
-                else:
-                    raise AssertionError("killed worker query succeeded")
+            victim = self.worker_connect(self.b)
+            try:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    pending = pool.submit(self.sql, "SELECT SLEEP(15)+v FROM t1 WHERE id=1", bconn)
+                    self.wait_until(scan_opened, "remote storage scan did not open")
+                    assert self.sql("SELECT 1", stale) == ((1,),)
+                    assert not pending.done()
+                    second = pool.submit(self.sql, "SELECT SLEEP(15)+v FROM t1 WHERE id=2", victim)
+                    def both_opened():
+                        with scan_log.open("rb") as log:
+                            log.seek(before)
+                            return log.read().count(f"PROTOTYPE_V10_SCAN_OPEN ns={self.b} ".encode()) >= 2
+                    self.wait_until(both_opened, "second remote scan did not open")
+                    os.kill(bp, signal.SIGKILL)
+                    assert self.sql("SELECT id,v FROM t1 ORDER BY id", cconn) == ((1,10),(2,20))
+                    for future in (pending, second):
+                        try:
+                            future.result(timeout=10)
+                        except pymysql.MySQLError as error:
+                            self.record("worker_death_failed_own_query", namespace=self.b, pid=bp, error=error.args)
+                        else:
+                            raise AssertionError("killed worker query succeeded")
+                    self.record("worker_death_wakes_all_inflight_requests", requests=2)
+            finally:
+                victim.close()
             reconnect = self.worker_connect(self.b)
             assert self.worker_pid(self.b) != bp
             assert self.sql("SELECT id,v FROM t1 ORDER BY id", reconnect) == ((1,90),(2,20))
@@ -219,6 +292,7 @@ class WorkerExperiment(LineageExperiment):
                 (i,v) for i,v in extra if v % 30 == 0)[2:6]
             assert self.sql("SELECT id FROM t1 WHERE v<0", reconnect) == ()
             self.record("bounded_scan_batches_and_worker_filter_sort", rows=len(extra), batch_limit=32)
+            self.run_slow_client(reconnect)
             assert self.root("b") and self.root("c")
             for pid in (self.worker_pid(self.b), cp):
                 status = Path(f"/proc/{pid}/status").read_text()
@@ -254,7 +328,7 @@ def main():
     args = parser.parse_args()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.environ["SEEKDB_NAMESPACE_SQL_WORKER_PROTOTYPE"] = "1"
-    experiment = WorkerExperiment(args.binary, "sql_session_v11", prototype=6)
+    experiment = WorkerExperiment(args.binary, "concurrency_v12", prototype=6)
     try:
         experiment.start()
         experiment.run_workers()

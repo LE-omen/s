@@ -1,10 +1,11 @@
-//! Throwaway V10 process transport. Bounded framed child pipes prove the real
+//! Throwaway V12 process transport. Bounded framed child pipes prove the real
 //! SQL/storage split first. This synchronous adapter is not the planned Mio IPC
 //! reactor and does not establish a high-concurrency performance claim.
 use std::ffi::c_void;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ fn read_frame(input: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut header = [0; 8];
     input.read_exact(&mut header)?;
     let len = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
-    if header[..4] != *b"NS10" || len == 0 || len > MAX_FRAME {
+    if header[..4] != *b"NS12" || len == 0 || len > MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid worker frame",
@@ -33,29 +34,62 @@ fn write_frame(output: &mut impl Write, payload: &[u8]) -> io::Result<()> {
         ));
     }
     let mut header = [0; 8];
-    header[..4].copy_from_slice(b"NS10");
+    header[..4].copy_from_slice(b"NS12");
     header[4..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
     output.write_all(&header)?;
     output.write_all(payload)?;
     output.flush()
 }
 
-struct Worker {
-    child: Child,
-    input: ChildStdin,
+struct Received {
     replies: Option<Receiver<io::Result<Vec<u8>>>>,
-    reader: Option<JoinHandle<()>>,
     last: Vec<u8>,
 }
+#[derive(Clone, Copy)]
+struct Dispatch {
+    callback: unsafe extern "C" fn(*mut c_void, *const u8, usize),
+    context: usize,
+}
+impl Dispatch {
+    fn deliver(self, frame: &io::Result<Vec<u8>>) {
+        let (data, len) = match frame {
+            Ok(bytes) => (bytes.as_ptr(), bytes.len()),
+            Err(_) => (std::ptr::null(), 0),
+        };
+        unsafe { (self.callback)(self.context as *mut c_void, data, len) };
+    }
+}
+struct Worker {
+    child: Mutex<Child>,
+    input: Mutex<ChildStdin>,
+    received: Mutex<Received>,
+    reader: Mutex<Option<JoinHandle<()>>>,
+    dispatch: Arc<Mutex<Option<Dispatch>>>,
+}
 
-impl Drop for Worker {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        self.replies.take();
-        if let Some(reader) = self.reader.take() {
+impl Worker {
+    fn interrupt(&self) {
+        // Kill before waiting for the receive lock: EOF wakes a blocked receive.
+        let mut child = self.child.lock().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(child);
+        // Dropping the receiver also wakes a reader blocked on the bounded queue.
+        self.received.lock().unwrap().replies.take();
+    }
+}
+impl Worker {
+    fn stop(&self) {
+        self.interrupt();
+        let reader = self.reader.lock().unwrap().take();
+        if let Some(reader) = reader {
             let _ = reader.join();
         }
+    }
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -108,12 +142,21 @@ fn spawn(namespace: u64, generation: u64) -> io::Result<Worker> {
     let input = child.stdin.take().unwrap();
     let mut output = child.stdout.take().unwrap();
     let (tx, rx) = mpsc::sync_channel(1);
+    let dispatch = Arc::new(Mutex::new(None::<Dispatch>));
+    let reader_dispatch = Arc::clone(&dispatch);
     let reader = match thread::Builder::new()
         .name("ns-proto-read".into())
         .spawn(move || loop {
             let frame = read_frame(&mut output);
             let failed = frame.is_err();
-            if tx.send(frame).is_err() || failed {
+            let target = reader_dispatch.lock().unwrap();
+            if let Some(callback) = *target {
+                drop(target);
+                callback.deliver(&frame);
+            } else if tx.send(frame).is_err() {
+                break;
+            }
+            if failed {
                 break;
             }
         }) {
@@ -125,11 +168,14 @@ fn spawn(namespace: u64, generation: u64) -> io::Result<Worker> {
         }
     };
     Ok(Worker {
-        child,
-        input,
-        replies: Some(rx),
-        reader: Some(reader),
-        last: Vec::new(),
+        child: Mutex::new(child),
+        input: Mutex::new(input),
+        received: Mutex::new(Received {
+            replies: Some(rx),
+            last: Vec::new(),
+        }),
+        reader: Mutex::new(Some(reader)),
+        dispatch,
     })
 }
 
@@ -145,7 +191,7 @@ pub unsafe extern "C" fn namespace_proto_spawn(
     }
     match spawn(namespace, generation) {
         Ok(worker) => {
-            *pid = worker.child.id();
+            *pid = worker.child.lock().unwrap().id();
             Box::into_raw(Box::new(worker)).cast()
         }
         Err(_) => std::ptr::null_mut(),
@@ -161,8 +207,11 @@ pub unsafe extern "C" fn namespace_proto_send(
     if worker.is_null() || data.is_null() || len == 0 || len > MAX_FRAME {
         return -1;
     }
-    let worker = &mut *worker.cast::<Worker>();
-    match write_frame(&mut worker.input, std::slice::from_raw_parts(data, len)) {
+    let worker = &*worker.cast::<Worker>();
+    match write_frame(
+        &mut *worker.input.lock().unwrap(),
+        std::slice::from_raw_parts(data, len),
+    ) {
         Ok(()) => 0,
         Err(_) => -1,
     }
@@ -178,26 +227,69 @@ pub unsafe extern "C" fn namespace_proto_receive(
     if worker.is_null() || data.is_null() || len.is_null() {
         return -1;
     }
-    let worker = &mut *worker.cast::<Worker>();
-    match worker
-        .replies
-        .as_ref()
-        .unwrap()
-        .recv_timeout(Duration::from_millis(timeout_ms))
-    {
+    let worker = &*worker.cast::<Worker>();
+    // Exactly one C++ dispatcher consumes this stream. Returned bytes survive
+    // until its next receive; send/interrupt never modify the returned buffer.
+    let mut received = worker.received.lock().unwrap();
+    let reply = match received.replies.as_ref() {
+        Some(rx) => rx.recv_timeout(Duration::from_millis(timeout_ms)),
+        None => return -1,
+    };
+    match reply {
         Ok(Ok(frame)) => {
-            worker.last = frame;
-            *data = worker.last.as_ptr();
-            *len = worker.last.len();
+            received.last = frame;
+            *data = received.last.as_ptr();
+            *len = received.last.len();
             0
         }
+        Err(mpsc::RecvTimeoutError::Timeout) => 1,
         _ => -1,
+    }
+}
+
+// After Ready, the existing pipe reader directly invokes the bounded C++
+// dispatcher. No second relay thread, and no per-connection transport thread.
+#[no_mangle]
+pub unsafe extern "C" fn namespace_proto_dispatch(
+    worker: *mut c_void,
+    callback: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize)>,
+    context: *mut c_void,
+) -> i32 {
+    let (Some(worker), Some(callback)) = (worker.cast::<Worker>().as_ref(), callback) else {
+        return -1;
+    };
+    let callback = Dispatch {
+        callback,
+        context: context as usize,
+    };
+    let queued = {
+        let mut target = worker.dispatch.lock().unwrap();
+        if target.is_some() {
+            return -1;
+        }
+        *target = Some(callback);
+        let received = worker.received.lock().unwrap();
+        received.replies.as_ref().and_then(|rx| rx.try_recv().ok())
+    };
+    if let Some(frame) = queued {
+        callback.deliver(&frame);
+    }
+    0
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn namespace_proto_interrupt(worker: *mut c_void) {
+    if !worker.is_null() {
+        (&*worker.cast::<Worker>()).interrupt();
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn namespace_proto_stop(worker: *mut c_void) {
     if !worker.is_null() {
+        // Join callbacks through a shared borrow before creating exclusive Box
+        // ownership. A callback may still be executing interrupt(&Worker).
+        (&*worker.cast::<Worker>()).stop();
         drop(Box::from_raw(worker.cast::<Worker>()));
     }
 }

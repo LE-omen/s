@@ -1,4 +1,4 @@
-// Throwaway V10 wire protocol. Values only; all frames have a hard size limit.
+// Throwaway V12 wire protocol. Request routes are values, never pointers.
 #ifndef SEEKDB_NAMESPACE_WORKER_PROTOCOL_PROTOTYPE_H_
 #define SEEKDB_NAMESPACE_WORKER_PROTOCOL_PROTOTYPE_H_
 #include "lib/ob_errno.h"
@@ -11,12 +11,25 @@
 namespace oceanbase { namespace sql { class ObSQLSessionInfo; } }
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 constexpr size_t MAX_FRAME = 256 * 1024;
+struct RequestTag { uint64_t slot = 0, generation = 0; };
 struct Frame {
+  static constexpr int64_t HEADER_SIZE = 17; // type + request slot + generation
   std::vector<char> data;
-  int64_t pos = 1;
+  int64_t pos = HEADER_SIZE;
   int ret = common::OB_SUCCESS;
-  explicit Frame(char type = '?') : data(1, type) {}
+  explicit Frame(char type = '?') : data(HEADER_SIZE, 0) { data[0] = type; }
   char type() const { return data.empty() ? '?' : data[0]; }
+  RequestTag tag() {
+    if (data.size() < HEADER_SIZE) { ret = common::OB_INVALID_ARGUMENT; return {}; }
+    const int64_t saved = pos; pos = 1;
+    RequestTag result{number(), number()}; pos = saved; return result;
+  }
+  void tag(RequestTag route) {
+    for (unsigned i = 0; i < 8; ++i) {
+      data[1 + i] = static_cast<char>(route.slot >> (8 * i));
+      data[9 + i] = static_cast<char>(route.generation >> (8 * i));
+    }
+  }
   void number(uint64_t n) {
     if (data.size() + 8 > MAX_FRAME) { ret = common::OB_SIZE_OVERFLOW; return; }
     for (unsigned i = 0; i < 8; ++i) { data.push_back(static_cast<char>(n >> (8 * i))); }

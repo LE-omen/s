@@ -8,9 +8,12 @@ void *namespace_proto_spawn(uint64_t, uint64_t, uint32_t *);
 int namespace_proto_send(void *, const char *, size_t);
 int namespace_proto_receive(void *, const char **, size_t *, uint64_t);
 void namespace_proto_stop(void *);
+void namespace_proto_interrupt(void *);
+int namespace_proto_dispatch(void *, void (*)(void *, const char *, size_t), void *);
 int namespace_proto_worker_read(char *, size_t, size_t *);
 int namespace_proto_worker_write(const char *, size_t);
 }
+#include "observer/namespace_worker_multiplex_prototype.ipp"
 #include "observer/namespace_worker_scan_prototype.ipp"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 using namespace common;
@@ -20,29 +23,49 @@ bool enabled() {
   const char *value = std::getenv("SEEKDB_NAMESPACE_SQL_WORKER_PROTOTYPE");
   return value && !std::strcmp(value, "1") && NamespaceForkKernelPrototype::metadata_gc_mode();
 }
-struct Child {
-  std::mutex mutex;
+struct Channel {
   void *handle = nullptr;
   uint64_t generation = 0;
   uint32_t pid = 0;
-  ~Child() { namespace_proto_stop(handle); }
-  void stop() { namespace_proto_stop(handle); handle = nullptr; }
-  int send(const Frame &frame) {
-    return frame.ret ? frame.ret : namespace_proto_send(handle, frame.data.data(), frame.data.size()) == 0
-        ? OB_SUCCESS : OB_CONNECT_ERROR;
+  std::atomic<bool> closed{false};
+  RequestRoutes routes;
+  ~Channel() { fail(); namespace_proto_stop(handle); }
+  void fail() {
+    if (!closed.exchange(true)) { routes.fail(); namespace_proto_interrupt(handle); }
   }
-  int receive(Frame &frame) {
+  int send(const Frame &frame) {
+    if (closed) { return OB_CONNECT_ERROR; }
+    const int ret = frame.ret ? frame.ret : namespace_proto_send(handle, frame.data.data(), frame.data.size()) == 0
+        ? OB_SUCCESS : OB_CONNECT_ERROR;
+    if (ret) { fail(); }
+    return ret;
+  }
+  int receive(Frame &frame, uint64_t timeout = 30000) {
     const char *data = nullptr; size_t n = 0;
-    if (namespace_proto_receive(handle, &data, &n, 30000)) { return OB_CONNECT_ERROR; }
+    const int result = namespace_proto_receive(handle, &data, &n, timeout);
+    if (result) { return result == 1 ? OB_TIMEOUT : OB_CONNECT_ERROR; }
+    if (n < Frame::HEADER_SIZE) { return OB_INVALID_ARGUMENT; }
     frame = Frame(); frame.data.assign(data, data + n); return OB_SUCCESS;
   }
+  static void receive_frame(void *context, const char *data, size_t size) {
+    auto &channel = *static_cast<Channel *>(context);
+    if (channel.closed) { return; }
+    if (!data || size < Frame::HEADER_SIZE) { channel.fail(); return; }
+    Frame frame; frame.data.assign(data, data + size);
+    auto request = channel.routes.find(frame.tag());
+    // The Rust pipe reader only dispatches. It never waits for a request's
+    // consumer, executes storage work, or calls a client's packet sender.
+    if (request && request->post(std::move(frame))) { channel.fail(); }
+  }
+
 };
+struct Child { std::mutex mutex; std::shared_ptr<Channel> current; };
 std::mutex children_mutex;
 std::map<uint64_t, std::shared_ptr<Child>> children;
 uint64_t next_generation = 0;
 struct SessionBinding {
-  std::shared_ptr<Child> child;
-  uint64_t ns = 0, generation = 0, slot = 0, slot_generation = 0;
+  std::shared_ptr<Channel> channel;
+  uint64_t ns = 0, slot = 0, slot_generation = 0;
   sql::ObSQLSessionInfo *gateway = nullptr;
   ~SessionBinding() {
     if (gateway) { share::server_service<sql::ObSQLSessionMgr>()->revert_session(gateway); }
@@ -57,8 +80,7 @@ int attach(uint64_t ns, std::shared_ptr<Child> &child) {
     if (children.size() >= 2) { return OB_SIZE_OVERFLOW; }
     it = children.emplace(ns, std::make_shared<Child>()).first;
   }
-  child = it->second;
-  return OB_SUCCESS;
+  child = it->second; return OB_SUCCESS;
 }
 // These scalar mirrors are needed by gateway protocol encoding. SQL variables
 // and their allocator remain in the worker; no complete session is serialized.
@@ -110,92 +132,100 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   if (!ret && table) { reply.append(*table); }
   return reply.ret;
 }
-int exchange(Child &child, uint64_t ns, Frame &request, ReadScans *scans,
+int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
              const std::function<int(Frame &)> &response) {
-  int ret = child.send(request);
+  auto pending = channel.routes.allocate(request.type() != 'Q' && request.type() != 'U');
+  if (!pending) { return channel.closed ? OB_CONNECT_ERROR : OB_EAGAIN; }
+  struct Release { RequestRoutes &routes; RequestTag tag; ~Release() { routes.release(tag, true); } } release{channel.routes, pending->tag};
+  request.tag(pending->tag);
+  int ret = channel.send(request);
   while (!ret) {
     Frame reply;
-    if ((ret = child.receive(reply))) { break; }
-    if (reply.type() == 'd' || reply.type() == 'b' || reply.type() == 't' || reply.type() == 'i') {
-      Frame result; ret = catalog(ns, reply, result);
-      if (!ret) { ret = child.send(result); }
-    } else if (scans && (reply.type() == 'O' || reply.type() == 'F' || reply.type() == 'X')) {
-      Frame result; ret = scans->process(reply, result);
-      if (!ret) { ret = child.send(result); }
-    } else if (reply.type() == 'D') {
+    if ((ret = pending->take(reply))) { break; }
+    if (reply.type() == 'D') {
       const int query_ret = static_cast<int>(reply.number());
       if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; break; }
       return query_ret;
+    }
+    // One buffered reply per request, independent of every other request. Give
+    // its credit back after taking ownership, before doing SQL/storage work.
+    Frame credit('K'); credit.tag(pending->tag);
+    if ((ret = channel.send(credit))) { break; }
+    if (reply.type() == 'd' || reply.type() == 'b' || reply.type() == 't' || reply.type() == 'i') {
+      Frame result; ret = catalog(ns, reply, result); result.tag(pending->tag);
+      if (!ret) { ret = channel.send(result); }
+    } else if (scans && (reply.type() == 'O' || reply.type() == 'F' || reply.type() == 'X')) {
+      Frame result; ret = scans->process(reply, result); result.tag(pending->tag);
+      if (!ret) { ret = channel.send(result); }
     } else { ret = response(reply); }
   }
-  child.stop(); return ret;
+  channel.fail(); return ret;
 }
 int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&binding) {
   binding = nullptr;
   std::unique_ptr<SessionBinding> owned(new SessionBinding());
-  int ret = attach(ns, owned->child);
+  std::shared_ptr<Child> child;
+  int ret = attach(ns, child);
   if (ret) { return ret; }
-  Child &child = *owned->child;
-  std::lock_guard<std::mutex> guard(child.mutex);
-  if (child.handle) {
-    Frame ping('P'), pong;
-    if (child.send(ping) || child.receive(pong) || pong.type() != 'P') { child.stop(); }
-  }
-  if (!child.handle) {
-    { std::lock_guard<std::mutex> lock(children_mutex); child.generation = ++next_generation; }
-    child.handle = namespace_proto_spawn(ns, child.generation, &child.pid);
-    Frame ready;
-    if (!child.handle || child.receive(ready) || ready.type() != 'Y' || ready.number() != ns || !ready.consumed()) {
-      child.stop(); return OB_CONNECT_ERROR;
+  {
+    // Only worker activation is serialized; existing queries continue running.
+    std::lock_guard<std::mutex> guard(child->mutex);
+    if (child->current && !child->current->closed) {
+      const int ping = exchange(*child->current, ns, Frame('P'), nullptr, [](Frame &) { return OB_INVALID_ARGUMENT; });
+      if (ping == OB_EAGAIN) { return ping; }
+      if (ping) { child->current->fail(); }
     }
-    fprintf(stderr, "PROTOTYPE_V10_WORKER_READY ns=%llu generation=%llu pid=%u\n",
-        (unsigned long long)ns, (unsigned long long)child.generation, child.pid);
+    if (!child->current || child->current->closed) {
+      auto channel = std::make_shared<Channel>();
+      { std::lock_guard<std::mutex> lock(children_mutex); channel->generation = ++next_generation; }
+      channel->handle = namespace_proto_spawn(ns, channel->generation, &channel->pid);
+      Frame ready;
+      if (!channel->handle || channel->receive(ready) || ready.type() != 'Y' || ready.number() != ns || !ready.consumed()) {
+        channel->fail(); return OB_CONNECT_ERROR;
+      }
+      if (namespace_proto_dispatch(channel->handle, Channel::receive_frame, channel.get())) {
+        channel->fail(); return OB_CONNECT_ERROR;
+      }
+      child->current = channel;
+      fprintf(stderr, "PROTOTYPE_V10_WORKER_READY ns=%llu generation=%llu pid=%u\n",
+          (unsigned long long)ns, (unsigned long long)channel->generation, channel->pid);
+    }
+    owned->channel = child->current;
   }
-  // One connection-owned reference. Rust's request gate drains users before
-  // transferring this binding to ObDisconnectTask; ordinary requests borrow it.
-  if ((ret = share::server_service<sql::ObSQLSessionMgr>()->get_session(gateway.get_server_sid(), owned->gateway))) {
-    return ret;
-  }
-  owned->ns = ns; owned->generation = child.generation;
+  if ((ret = share::server_service<sql::ObSQLSessionMgr>()->get_session(gateway.get_server_sid(), owned->gateway))) { return ret; }
+  owned->ns = ns;
   Frame request('A'); request.number(gateway.get_server_sid());
   if ((ret = append_session_state(gateway, request))) { return ret; }
   bool opened = false;
-  ret = exchange(child, ns, request, nullptr, [&](Frame &reply) {
+  ret = exchange(*owned->channel, ns, request, nullptr, [&](Frame &reply) {
     if (reply.type() != 'a' || opened) { return OB_INVALID_ARGUMENT; }
     owned->slot = reply.number(); owned->slot_generation = reply.number();
     opened = reply.consumed() && owned->slot_generation != 0;
     return opened ? OB_SUCCESS : OB_INVALID_ARGUMENT;
   });
-  if (!ret && !opened) { child.stop(); ret = OB_INVALID_ARGUMENT; }
+  if (!ret && !opened) { owned->channel->fail(); ret = OB_INVALID_ARGUMENT; }
   if (!ret) { binding = owned.release(); }
   return ret;
 }
 void close_session(SessionBinding *binding) {
   std::unique_ptr<SessionBinding> owned(binding);
-  if (!owned) { return; }
-  Child &child = *owned->child;
-  std::lock_guard<std::mutex> guard(child.mutex);
-  if (child.handle && child.generation == owned->generation) {
-    Frame request('C'); request.number(owned->slot); request.number(owned->slot_generation);
-    exchange(child, owned->ns, request, nullptr, [](Frame &) { return OB_INVALID_ARGUMENT; });
-  }
+  if (!owned || owned->channel->closed) { return; }
+  Frame request('C'); request.number(owned->slot); request.number(owned->slot_generation);
+  const int ret = exchange(*owned->channel, owned->ns, request, nullptr, [](Frame &) { return OB_INVALID_ARGUMENT; });
+  // If even reserved control admission cannot progress, retaining an unreachable
+  // remote session is unsafe. Fail this activation and wake all its callers.
+  if (ret) { owned->channel->fail(); }
 }
 int query(SessionBinding &binding, uint64_t snapshot, const ObString &sql, bool change_database,
           const std::function<int(Frame &)> &response) {
-  // Route pointer was bound at login; no namespace map lookup on this path.
-  Child &child = *binding.child;
-  std::unique_lock<std::mutex> guard(child.mutex, std::try_to_lock);
-  if (!guard.owns_lock()) { return OB_EAGAIN; }
-  if (!child.handle || child.generation != binding.generation) { return OB_CONNECT_ERROR; }
+  if (binding.channel->closed) { return OB_CONNECT_ERROR; }
   ReadScans scans(binding.ns, snapshot);
   Frame request(change_database ? 'U' : 'Q');
   request.number(binding.slot); request.number(binding.slot_generation);
   request.number(snapshot); request.string(sql);
   if (request.ret) { return request.ret; }
   int response_ret = OB_SUCCESS;
-  const int ret = exchange(child, binding.ns, request, &scans, [&](Frame &frame) {
-    // A lost client does not invalidate framing or other sessions. Drain this
-    // response through D before admitting the next command on the shared pipe.
+  const int ret = exchange(*binding.channel, binding.ns, request, &scans, [&](Frame &frame) {
     if (!response_ret) {
       response_ret = response(frame);
       if (response_ret) {
@@ -210,16 +240,29 @@ int query(SessionBinding &binding, uint64_t snapshot, const ObString &sql, bool 
 void stop_all() {
   std::map<uint64_t, std::shared_ptr<Child>> detached;
   { std::lock_guard<std::mutex> guard(children_mutex); detached.swap(children); }
-  for (auto &entry : detached) { std::lock_guard<std::mutex> guard(entry.second->mutex); entry.second->stop(); }
+  for (auto &entry : detached) {
+    std::lock_guard<std::mutex> guard(entry.second->mutex);
+    if (entry.second->current) { entry.second->current->fail(); }
+  }
 }
-int worker_send(const Frame &frame) {
+int worker_send_wire(Frame frame) {
   return frame.ret ? frame.ret : namespace_proto_worker_write(frame.data.data(), frame.data.size()) == 0
       ? OB_SUCCESS : OB_CONNECT_ERROR;
 }
-int worker_read(Frame &frame) {
+int worker_read_wire(Frame &frame) {
   frame = Frame(); frame.data.resize(MAX_FRAME); size_t size = 0;
   if (namespace_proto_worker_read(frame.data.data(), frame.data.size(), &size)) { return OB_CONNECT_ERROR; }
-  frame.data.resize(size); return OB_SUCCESS;
+  frame.data.resize(size); return size >= Frame::HEADER_SIZE ? OB_SUCCESS : OB_INVALID_ARGUMENT;
+}
+int worker_send(const Frame &frame) {
+  if (!worker_request) { return worker_send_wire(frame); }
+  const int ret = worker_request->take_credit();
+  if (ret) { return ret; }
+  Frame output = frame; output.tag(worker_request->tag);
+  return worker_send_wire(std::move(output));
+}
+int worker_read(Frame &frame) {
+  return worker_request ? worker_request->take(frame) : OB_ERR_UNEXPECTED;
 }
 int fetch_catalog(char type, uint64_t id, const ObString &name, Frame &reply) {
   Frame request(type); request.number(id); request.string(name);

@@ -1,4 +1,4 @@
-// Throwaway V10 SQL-only composition. Included by ob_server.cpp so the prototype
+// Throwaway V12 SQL-only composition. Included by ob_server.cpp so the prototype
 // can reuse the existing composition owner without a second server object graph.
 #include "sql/plan_cache/ob_plan_cache.h"
 #include "sql/plan_cache/ob_ps_cache.h"
@@ -22,6 +22,11 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   using namespace common;
   using namespace share;
   int ret = OB_SUCCESS;
+  int64_t concurrency = 2;
+  if (const char *value = std::getenv("SEEKDB_NAMESPACE_SQL_WORKER_THREADS")) {
+    char *end = nullptr; concurrency = std::strtol(value, &end, 10);
+    if (!*value || !end || *end || concurrency < 1 || concurrency > 8) { return OB_INVALID_ARGUMENT; }
+  }
   lib::Worker worker;
   lib::Worker::set_worker_to_thread_local(&worker);
   ObPLogWriterCfg log_cfg;
@@ -32,18 +37,18 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   const int64_t budget = 512L * 1024 * 1024;
   // reload_config derives cache sizing from memory_budget; memory_limit is ignored.
   config_.memory_budget.set_value("512M");
-  config_.cpu_count.set_value("1");
+  config_.cpu_count.set_value(std::to_string(concurrency).c_str());
   config_.enable_async_syslog.set_value("false");
   config_._pushdown_storage_level.set_value("0");
   config_._rowsets_max_rows.set_value("32");
   config_.enable_sql_operator_dump.set_value("false");
   self_addr_.set_ip_addr("127.0.0.1", 1);
-  lib::update_mini_mode(budget, 1);
+  lib::update_mini_mode(budget, concurrency);
   set_memory_budget(budget);
   g_bootstrap_server_runtime.init();
   g_bootstrap_server_runtime.set_memory_size(budget);
-  g_bootstrap_server_runtime.set_min_cpu(1);
-  g_bootstrap_server_runtime.set_max_cpu(1);
+  g_bootstrap_server_runtime.set_min_cpu(concurrency);
+  g_bootstrap_server_runtime.set_max_cpu(concurrency);
   g_bootstrap_server_runtime.set_role(ObServerRole::PRIMARY_ROLE);
   // Each step is reported outside the protocol while bootstrapping is proved.
 #define WORKER_STEP(expr) do { if (OB_SUCC(ret)) { ret = (expr); \
@@ -102,11 +107,13 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   struct SessionOwner {
     ObArenaAllocator allocator{ObMemAttr("NsSQLSession")};
     ObSQLSessionInfo session; // Destroyed before its allocator.
+    std::atomic<bool> running{false};
   };
   struct SessionSlot {
-    std::unique_ptr<SessionOwner> owner;
+    std::shared_ptr<SessionOwner> owner;
     uint64_t generation = 1;
   };
+  std::mutex sessions_mutex;
   std::vector<SessionSlot> slots;
   std::vector<uint64_t> free_slots;
   uint64_t active_sessions = 0;
@@ -242,7 +249,9 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     if (ret == OB_ITER_END) { ret = OB_SUCCESS; }
     const int close_ret = result->close(ret);
     if (!ret) { ret = close_ret; }
-    fprintf(stderr, "worker query finished: %d\n", ret);
+    fprintf(stderr, "PROTOTYPE_V12_EXECUTE_END request=%llu generation=%llu session=%u ret=%d\n",
+        (unsigned long long)(worker_request ? worker_request->tag.slot : 0),
+        (unsigned long long)(worker_request ? worker_request->tag.generation : 0), session->get_server_sid(), ret);
     return ret;
   };
   if (!serve) {
@@ -250,49 +259,60 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     ret = initialize(owner, 1, nullptr);
     return ret ? ret : execute(owner, ObString::make_string(query), 0);
   }
-  Frame ready('Y'); ready.number(worker_namespace); ret = worker_send(ready);
-  while (!ret) {
+  struct Job {
     Frame input;
-    if ((ret = worker_read(input))) { break; }
-    if (input.type() == 'P') { ret = worker_send(Frame('P')); continue; }
-    int command_ret = OB_SUCCESS;
-    if (input.type() == 'A') {
-      const uint64_t sid = input.number();
-      std::unique_ptr<SessionOwner> owner(new SessionOwner());
-      command_ret = input.ret || sid == 0 || sid > UINT32_MAX ? OB_INVALID_ARGUMENT : initialize(*owner, sid, &input);
-      if (!command_ret) {
-        uint64_t index;
-        if (free_slots.empty()) { index = slots.size(); slots.emplace_back(); }
-        else { index = free_slots.back(); free_slots.pop_back(); }
-        slots[index].owner = std::move(owner); ++active_sessions;
-        Frame opened('a'); opened.number(index); opened.number(slots[index].generation);
-        ret = worker_send(opened);
-        fprintf(stderr, "PROTOTYPE_V11_SESSION_OPEN ns=%llu slot=%llu generation=%llu active=%llu slots=%zu capacity=%zu\n",
-            (unsigned long long)worker_namespace, (unsigned long long)index,
-            (unsigned long long)slots[index].generation, (unsigned long long)active_sessions, slots.size(), slots.capacity());
+    std::shared_ptr<PendingRequest> request;
+    std::shared_ptr<SessionOwner> owner;
+  };
+  RequestRoutes requests;
+  std::mutex jobs_mutex;
+  std::condition_variable jobs_changed;
+  std::deque<Job> jobs;
+  bool stopping = false;
+  auto complete = [&](const std::shared_ptr<PendingRequest> &request, int result) {
+    // Release before publishing D: the peer may immediately reuse this slot.
+    requests.release(request->tag);
+    Frame done('D'); done.tag(request->tag); done.number(result);
+    if (worker_send_wire(std::move(done))) { std::_Exit(1); }
+  };
+  PrototypeThreads executors(concurrency, [&] {
+    lib::set_thread_name("NsSQLExecute");
+    for (;;) {
+      Job job;
+      {
+        std::unique_lock<std::mutex> lock(jobs_mutex);
+        jobs_changed.wait(lock, [&] { return stopping || !jobs.empty(); });
+        if (stopping) { break; }
+        job = std::move(jobs.front()); jobs.pop_front();
       }
-    } else if (input.type() == 'Q' || input.type() == 'U' || input.type() == 'C') {
-      const uint64_t index = input.number(), generation = input.number();
-      // One indexed lookup at IPC admission, then a stable session pointer.
-      if (input.ret || index >= slots.size() || generation != slots[index].generation || !slots[index].owner) {
-        command_ret = OB_ERR_SESSION_INTERRUPTED;
-      } else if (input.type() == 'C') {
-        if (!input.consumed()) { command_ret = OB_INVALID_ARGUMENT; }
-        else {
-          slots[index].owner.reset(); --active_sessions;
-          // A saturated generation retires the slot instead of aliasing an old handle.
-          if (slots[index].generation != UINT64_MAX) { ++slots[index].generation; free_slots.push_back(index); }
-          fprintf(stderr, "PROTOTYPE_V11_SESSION_CLOSE ns=%llu slot=%llu generation=%llu active=%llu slots=%zu\n",
-              (unsigned long long)worker_namespace, (unsigned long long)index,
-              (unsigned long long)generation, (unsigned long long)active_sessions, slots.size());
+      worker_request = job.request.get();
+      Frame &input = job.input;
+      int result = OB_SUCCESS;
+      if (input.type() == 'A') {
+        const uint64_t sid = input.number();
+        auto owner = std::make_shared<SessionOwner>();
+        result = input.ret || sid == 0 || sid > UINT32_MAX ? OB_INVALID_ARGUMENT : initialize(*owner, sid, &input);
+        if (!result) {
+          Frame opened('a');
+          {
+            std::lock_guard<std::mutex> guard(sessions_mutex);
+            uint64_t index;
+            if (free_slots.empty()) { index = slots.size(); slots.emplace_back(); }
+            else { index = free_slots.back(); free_slots.pop_back(); }
+            slots[index].owner = owner; ++active_sessions;
+            opened.number(index); opened.number(slots[index].generation);
+            fprintf(stderr, "PROTOTYPE_V11_SESSION_OPEN ns=%llu slot=%llu generation=%llu active=%llu slots=%zu capacity=%zu\n",
+                (unsigned long long)worker_namespace, (unsigned long long)index,
+                (unsigned long long)slots[index].generation, (unsigned long long)active_sessions, slots.size(), slots.capacity());
+          }
+          result = worker_send(opened);
         }
       } else {
         const uint64_t snapshot = input.number();
         ObString sql = input.string();
         std::string use_statement;
-        if (!input.consumed()) { command_ret = OB_INVALID_ARGUMENT; }
-        if (!command_ret && input.type() == 'U') {
-          // A database name is a protocol field, never executable SQL text.
+        if (!input.consumed()) { result = OB_INVALID_ARGUMENT; }
+        if (!result && input.type() == 'U') {
           use_statement = "USE `";
           for (int64_t i = 0; i < sql.length(); ++i) {
             if (sql[i] == '`') { use_statement.push_back('`'); }
@@ -301,11 +321,69 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
           use_statement.push_back('`');
           sql.assign_ptr(use_statement.data(), use_statement.size());
         }
-        if (!command_ret) { command_ret = execute(*slots[index].owner, sql, snapshot); }
+        fprintf(stderr, "PROTOTYPE_V12_EXECUTE_BEGIN request=%llu generation=%llu session=%u\n",
+            (unsigned long long)job.request->tag.slot, (unsigned long long)job.request->tag.generation,
+            job.owner->session.get_server_sid());
+        if (!result) { result = execute(*job.owner, sql, snapshot); }
+        job.owner->running = false;
       }
-    } else { command_ret = OB_NOT_SUPPORTED; }
-    if (!ret) { Frame done('D'); done.number(command_ret); ret = worker_send(done); }
+      complete(job.request, result);
+      worker_request = nullptr;
+    }
+  });
+  if ((ret = executors.start())) { return ret; }
+  fprintf(stderr, "PROTOTYPE_V12_EXECUTORS count=%lld max_requests=%zu\n", (long long)concurrency, MAX_REQUESTS);
+  Frame ready('Y'); ready.number(worker_namespace); ret = worker_send_wire(ready);
+  while (!ret) {
+    Frame input;
+    if ((ret = worker_read_wire(input))) { break; }
+    const RequestTag tag = input.tag();
+    if (input.ret || !tag.generation || tag.slot >= MAX_REQUESTS) { ret = OB_INVALID_ARGUMENT; break; }
+    if (input.type() == 'K' || input.type() == 'c' || input.type() == 's') {
+      auto request = requests.find(tag);
+      if (request) { ret = request->post(std::move(input)); }
+      continue;
+    }
+    auto request = requests.accept(tag);
+    if (!request) { ret = OB_INVALID_ARGUMENT; break; }
+    if (input.type() == 'P') { complete(request, input.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT); continue; }
+    int result = OB_SUCCESS;
+    std::shared_ptr<SessionOwner> owner;
+    if (input.type() == 'Q' || input.type() == 'U' || input.type() == 'C') {
+      const uint64_t index = input.number(), generation = input.number();
+      {
+        std::lock_guard<std::mutex> guard(sessions_mutex);
+        if (input.ret || index >= slots.size() || generation != slots[index].generation || !slots[index].owner) {
+          result = OB_ERR_SESSION_INTERRUPTED;
+        } else if (input.type() == 'C') {
+          if (!input.consumed()) { result = OB_INVALID_ARGUMENT; }
+          else {
+            owner = std::move(slots[index].owner); --active_sessions;
+            if (slots[index].generation != UINT64_MAX) { ++slots[index].generation; free_slots.push_back(index); }
+            fprintf(stderr, "PROTOTYPE_V11_SESSION_CLOSE ns=%llu slot=%llu generation=%llu active=%llu slots=%zu\n",
+                (unsigned long long)worker_namespace, (unsigned long long)index,
+                (unsigned long long)generation, (unsigned long long)active_sessions, slots.size());
+          }
+        } else if (slots[index].owner->running.exchange(true)) { result = OB_EAGAIN; }
+        else { owner = slots[index].owner; }
+      }
+      if (input.type() == 'C') {
+        // An admitted query owns a reference; closing/reusing its slot cannot
+        // destroy the old session until that query has finished using it.
+        owner.reset(); complete(request, result); continue;
+      }
+    } else if (input.type() != 'A') { result = OB_NOT_SUPPORTED; }
+    if (result) { complete(request, result); continue; }
+    {
+      std::lock_guard<std::mutex> guard(jobs_mutex);
+      jobs.push_back(Job{std::move(input), request, owner});
+    }
+    jobs_changed.notify_one();
   }
+  requests.fail();
+  { std::lock_guard<std::mutex> guard(jobs_mutex); stopping = true; }
+  jobs_changed.notify_all(); executors.stop(); executors.wait();
+
 #undef WORKER_STEP
   return ret;
 }

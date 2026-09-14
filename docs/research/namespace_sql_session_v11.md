@@ -2,6 +2,8 @@
 
 日期：2026-09-14。实验分支：`codex/namespace-sql-session-v11`。基于 V10 及其 worker 内存定容修正。
 
+同 worker 的有限并发和 IPC 分发已继续到 [V12 原型](namespace_worker_concurrency_v12.md)。本文保留 V11 的实现与验收记录；当前流程脚本已扩展到 V12。
+
 每个 MySQL 连接在登录时创建一个 worker 内的真实 `ObSQLSessionInfo`，后续请求使用同一个对象。用户变量、允许的 session 系统变量和默认数据库随连接保留；关闭连接后销毁 session。共享端口、namespace 固定绑定和真实引擎扫描沿用 V10。
 
 ## 路径与所有权
