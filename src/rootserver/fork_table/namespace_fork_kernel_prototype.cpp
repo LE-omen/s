@@ -1,5 +1,5 @@
 // PROTOTYPE: real immutable B+ tree pages stored in engine tables, one-engine transactions.
-// Fixed two-integer-column schemas; V6 snapshot roots protect deleted sources, no page reclamation.
+// Fixed two-integer-column schemas; snapshot/tablet reclamation, no metadata page reclamation.
 #define USING_LOG_PREFIX STORAGE
 #include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "rootserver/ob_tablet_creator.h"
@@ -41,8 +41,11 @@ const char *ROOTS = "__fork_proto_meta.roots";
 const char *PAGES = "__fork_proto_meta.pages";
 const char *NAMESPACES = "__fork_proto_meta.namespaces";
 const char *SNAPSHOTS = "__fork_proto_meta.snapshots";
-// ponytail: only native namespace 1 can be deleted in this disposable prototype.
+// Only the native source DROP uses this scoped internal DDL capability.
 std::atomic<const ObISQLClient *> source_drop_trans{nullptr};
+// ponytail: one global count, so DROP can wait for unrelated long scans/DAGs.
+// No per-namespace registry/cache; use worker-local draining for production isolation.
+std::atomic<int64_t> active_accesses{0};
 struct Ref { uint64_t page = 0; int64_t cap = 0; };
 struct Value { std::string data; int64_t cap = 0; };
 struct Node {
@@ -73,7 +76,7 @@ struct DatabaseHolder {
   ObSimpleDatabaseSchema simple;
   DatabaseHolder() : allocator("ForkProtoDB"), schema(&allocator), simple(&allocator) {}
 };
-// Same lifetime as the existing schema cache; namespace DROP/ALTER is outside this prototype.
+// Schemas stay alive for old guards/plans; storage admission rejects deleted namespaces.
 std::map<uint64_t, std::unique_ptr<DatabaseHolder>> database_schemas;
 
 int64_t cap_min(int64_t a, int64_t b) { return a == 0 ? b : b == 0 ? a : std::min(a, b); }
@@ -386,50 +389,131 @@ NamespaceSourceDropGuard::NamespaceSourceDropGuard(ObISQLClient &trans) : valid_
 NamespaceSourceDropGuard::~NamespaceSourceDropGuard() {
   if (valid_) { source_drop_trans.store(nullptr); }
 }
-int NamespaceForkKernelPrototype::begin_namespace_drop(const ObString &name, bool &done) {
-  done = false;
+int NamespaceForkKernelPrototype::begin_namespace_drop(const ObString &name, uint64_t &id, bool &done) {
+  done = false; id = 0;
   if (!lifetime_mode() || !GCTX.sql_proxy_) { return OB_NOT_SUPPORTED; }
-  ObMySQLTransaction trans; Roots root; uint64_t id = 0; ObSqlString q;
+  ObMySQLTransaction trans; Roots root; ObSqlString q;
   int ret = trans.start(GCTX.sql_proxy_);
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(namespace_named(trans, name, id))) {
-  } else if (id != 1) { ret = OB_NOT_SUPPORTED;
   } else if (OB_FAIL(roots(trans, id, root, true, true))) {
   } else if (root.state == 2) { done = true;
   } else if (root.state != 0 && root.state != 1) { ret = OB_STATE_NOT_MATCH;
-  } else if (OB_FAIL(q.assign_fmt("UPDATE %s SET state=1 WHERE namespace_id=1", NAMESPACES))) {
+  } else if (OB_FAIL(q.assign_fmt("UPDATE %s SET state=1 WHERE namespace_id=%lu", NAMESPACES, id))) {
   } else { ret = write_sql(trans, q); }
   if (trans.is_started()) { const int end = trans.end(ret == OB_SUCCESS); if (ret == OB_SUCCESS) { ret = end; } }
-  LOG_INFO("PROTOTYPE_V6_NAMESPACE_CLOSE", K(ret), K(id), K(done));
+  LOG_INFO("PROTOTYPE_V7_NAMESPACE_CLOSE", K(ret), K(id), K(done));
   return ret;
 }
-int NamespaceForkKernelPrototype::lock_namespace_drop(ObISQLClient &trans) {
-  Roots root; int ret = roots(trans, 1, root, true, true);
-  return ret != OB_SUCCESS ? ret : root.state == 1 ? OB_SUCCESS : OB_STATE_NOT_MATCH;
+int NamespaceForkKernelPrototype::lock_namespace_drop(ObISQLClient &trans, uint64_t id,
+    ObIArray<const ObTableSchema *> &bound_schemas) {
+  Roots root; int ret = roots(trans, id, root, true, true);
+  if (ret != OB_SUCCESS) { return ret; }
+  if (root.state != 1) { return OB_STATE_NOT_MATCH; }
+  if (id == 1) { return OB_SUCCESS; } // Native DROP owns its own enumeration.
+  std::vector<Ref> pending; if (root.directory.page) { pending.push_back(root.directory); }
+  while (OB_SUCC(ret) && !pending.empty()) {
+    Ref ref = pending.back(); pending.pop_back(); Node node;
+    if (OB_FAIL(read_node(trans, ref, node))) {
+    } else if (!node.leaf) { pending.insert(pending.end(), node.children.begin(), node.children.end());
+    } else {
+      for (const auto &value : node.values) {
+        uint64_t object = 0, table = 0, source = 0, bound = 0;
+        const ObTableSchema *schema = nullptr;
+        if (!entry(value.data, object, table, source, bound)) { ret = OB_CHECKSUM_ERROR;
+        } else if (!bound) { continue; // Inherited input belongs to the snapshot, never this branch.
+        } else if (bound != encoded(id, source)) { ret = OB_STATE_NOT_MATCH;
+        } else if (OB_FAIL(schema_from_value(id, value, schema))) {
+        } else if (schema->get_tablet_id().id() != bound) { ret = OB_STATE_NOT_MATCH;
+        } else { ret = bound_schemas.push_back(schema); }
+        if (ret != OB_SUCCESS) { break; }
+      }
+    }
+  }
+  return ret;
 }
-int NamespaceForkKernelPrototype::finish_namespace_drop(ObISQLClient &trans) {
-  ObSqlString q;
-  int ret = q.assign_fmt("UPDATE %s SET state=2,source_id=0,snapshot_ref=0,catalog_page=0,catalog_cap=0,directory_page=0,directory_cap=0,snapshot=0,schema_version=0 WHERE namespace_id=1 AND state=1", NAMESPACES);
-  return ret == OB_SUCCESS ? write_sql(trans, q) : ret;
-}
-int NamespaceForkKernelPrototype::check_table_access(uint64_t table_id, const ObTabletID &tablet_id) {
-  // Internal index/LOB scans are identified by their actual owning tablet.
-  if (!lifetime_mode() || tablet_id.is_inner_tablet() || is_encoded_id(table_id) || is_inner_table(table_id)
-      || table_id == OB_INVALID_ID) { return OB_SUCCESS; }
-  ObSchemaGetterGuard guard; const ObTableSchema *table = nullptr; const ObDatabaseSchema *db = nullptr;
-  int ret = GSCHEMASERVICE.get_runtime_schema_guard(guard);
+int NamespaceForkKernelPrototype::finish_namespace_drop(ObISQLClient &trans, uint64_t id) {
+  Roots root; ObSqlString q; int ret = roots(trans, id, root, true, true);
   if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(guard.get_table_schema(table_id, table))) {
-  } else if (!table) { ret = OB_TABLE_NOT_EXIST;
-  } else if (is_inner_db(table->get_database_id())) { return OB_SUCCESS;
-  } else if (OB_FAIL(guard.get_database_schema(table->get_database_id(), db))) {
-  } else if (!db) { ret = OB_ERR_BAD_DATABASE;
-  } else if (db->get_database_name_str().prefix_match("__fork_proto_meta")) { return OB_SUCCESS;
-  } else {
+  } else if (root.state != 1) { ret = OB_STATE_NOT_MATCH;
+  } else if (OB_FAIL(q.assign_fmt("UPDATE %s SET state=2,source_id=0,snapshot_ref=0,catalog_page=0,catalog_cap=0,directory_page=0,directory_cap=0,snapshot=0,schema_version=0 WHERE namespace_id=%lu AND state=1", NAMESPACES, id))) {
+  } else { ret = write_sql(trans, q); }
+  if (OB_SUCC(ret) && root.snapshot_ref) {
+    // Lock the canonical snapshot before deciding whether its final owner is gone.
+    // V7 creates one snapshot per fork; no API attaches new owners to an existing snapshot.
+    bool referenced = false;
+    {
+      ObMySQLProxy::MySQLResult res; sqlclient::ObMySQLResult *r = nullptr;
+      if (OB_FAIL(q.assign_fmt("SELECT snapshot_id FROM %s WHERE snapshot_id=%lu FOR UPDATE", SNAPSHOTS, root.snapshot_ref))) {
+      } else if (OB_FAIL(trans.read(res, q.ptr()))) {
+      } else if (OB_ISNULL(r = res.get_result())) { ret = OB_ERR_UNEXPECTED;
+      } else { ret = r->next(); }
+    }
+    if (OB_SUCC(ret)) {
+      ObMySQLProxy::MySQLResult res; sqlclient::ObMySQLResult *r = nullptr;
+      if (OB_FAIL(q.assign_fmt("SELECT namespace_id FROM %s WHERE snapshot_ref=%lu LIMIT 1", NAMESPACES, root.snapshot_ref))) {
+      } else if (OB_FAIL(trans.read(res, q.ptr()))) {
+      } else if (OB_ISNULL(r = res.get_result())) { ret = OB_ERR_UNEXPECTED;
+      } else if ((ret = r->next()) == OB_ITER_END) { ret = OB_SUCCESS;
+      } else if (OB_SUCC(ret)) { referenced = true; }
+    }
+    if (OB_SUCC(ret) && !referenced) {
+      Roots snapshot; ObSnapshotInfo pin; ObSnapshotTableProxy pins; SCN scn; ObArray<ObTabletID> tablets;
+      if (OB_FAIL(snapshot_roots(trans, root.snapshot_ref, snapshot))) {
+      } else if (snapshot.snapshot != root.snapshot || snapshot.schema_version != root.schema_version) { ret = OB_STATE_NOT_MATCH;
+      } else if (OB_FAIL(scn.convert_for_tx(snapshot.snapshot))) {
+      } else if (OB_FAIL(pins.get_snapshot(trans, SNAPSHOT_FOR_MULTI_VERSION, scn, pin))) {
+      } else if (pin.tablet_id_ != 0 || pin.schema_version_ != snapshot.schema_version) { ret = OB_STATE_NOT_MATCH;
+      } else if (OB_FAIL(tablets.push_back(ObTabletID(0)))) {
+      } else if (OB_FAIL(pins.batch_remove_snapshots(trans, SNAPSHOT_FOR_MULTI_VERSION,
+          snapshot.schema_version, scn, tablets))) {
+      } else if (OB_FAIL(q.assign_fmt("DELETE FROM %s WHERE snapshot_id=%lu", SNAPSHOTS, root.snapshot_ref))) {
+      } else { ret = write_sql(trans, q); }
+      LOG_INFO("PROTOTYPE_V7_RELEASE_SNAPSHOT_IN_TRANS", K(ret), K(id), "snapshot", root.snapshot_ref);
+    }
+  }
+  return ret;
+}
+void NamespaceForkKernelPrototype::release_access(bool &held) {
+  if (held) { held = false; active_accesses.fetch_sub(1); }
+}
+int NamespaceForkKernelPrototype::drain_access() {
+  int ret = OB_SUCCESS;
+  // Called after durable close, BEFORE taking the directory or DDL locks. Otherwise
+  // an admitted cold-table materializer could wait on DROP while DROP waited on it.
+  while (active_accesses.load() != 0 && OB_SUCC(ret = THIS_WORKER.check_status())) {
+    if (REACH_TIME_INTERVAL(1000 * 1000)) {
+      LOG_INFO("PROTOTYPE_V7_DRAIN_ACCESS", "active", active_accesses.load());
+    }
+    ob_usleep(10 * 1000);
+  }
+  return ret;
+}
+int NamespaceForkKernelPrototype::check_table_access(uint64_t table_id, const ObTabletID &tablet_id, bool &held) {
+  if (!lifetime_mode() || tablet_id.is_inner_tablet()) { return OB_SUCCESS; }
+  // Classify encoded storage by its actual tablet, including old plans and DML callers
+  // without a schema parameter. Internal LOB scans must still bypass by owning tablet.
+  const uint64_t id = is_encoded_id(tablet_id.id()) ? database_of(tablet_id.id()) : 1;
+  int ret = OB_SUCCESS;
+  if (id == 1) {
+    if (is_inner_table(table_id) || table_id == OB_INVALID_ID) { return OB_SUCCESS; }
+    ObSchemaGetterGuard guard; const ObTableSchema *table = nullptr; const ObDatabaseSchema *db = nullptr;
+    if (OB_FAIL(GSCHEMASERVICE.get_runtime_schema_guard(guard))) {
+    } else if (OB_FAIL(guard.get_table_schema(table_id, table))) {
+    } else if (!table) { ret = OB_TABLE_NOT_EXIST;
+    } else if (is_inner_db(table->get_database_id())) { return OB_SUCCESS;
+    } else if (OB_FAIL(guard.get_database_schema(table->get_database_id(), db))) {
+    } else if (!db) { ret = OB_ERR_BAD_DATABASE;
+    } else if (db->get_database_name_str().prefix_match("__fork_proto_meta")) { return OB_SUCCESS; }
+  }
+  if (OB_SUCC(ret)) {
+    // Register BEFORE reading LIVE; release only after iterators/store contexts or
+    // a baseline DAG have released their inputs. New work after close cannot enter.
+    if (!held) { active_accesses.fetch_add(1); held = true; }
     bool ready = false; Roots root;
     if (OB_FAIL(namespace_registry_ready(ready))) {
-    } else if (!ready) { return OB_SUCCESS;
-    } else if ((ret = roots(*GCTX.sql_proxy_, 1, root, false, true)) == OB_ITER_END) { ret = OB_SUCCESS;
+    } else if (!ready) { ret = id == 1 ? OB_SUCCESS : OB_EAGAIN;
+    } else if ((ret = roots(*GCTX.sql_proxy_, id, root, false, true)) == OB_ITER_END && id == 1) { ret = OB_SUCCESS;
     } else if (OB_SUCC(ret) && root.state != 0) {
       ret = OB_OP_NOT_ALLOW;
       LOG_USER_ERROR(OB_OP_NOT_ALLOW, "access a closing or deleted prototype namespace");

@@ -36,10 +36,13 @@ public:
   static bool enabled();
   static bool namespace_mode();
   static bool lifetime_mode();
-  static int begin_namespace_drop(const common::ObString &name, bool &done);
-  static int lock_namespace_drop(common::ObISQLClient &trans);
-  static int finish_namespace_drop(common::ObISQLClient &trans);
-  static int check_table_access(uint64_t table_id, const common::ObTabletID &tablet_id);
+  static int begin_namespace_drop(const common::ObString &name, uint64_t &id, bool &done);
+  static int lock_namespace_drop(common::ObISQLClient &trans, uint64_t id,
+                                 common::ObIArray<const share::schema::ObTableSchema *> &bound);
+  static int finish_namespace_drop(common::ObISQLClient &trans, uint64_t id);
+  static int check_table_access(uint64_t table_id, const common::ObTabletID &tablet_id, bool &held);
+  static void release_access(bool &held);
+  static int drain_access();
   static int protect_snapshot_tablets(common::ObIArray<common::ObTabletID> &candidates, bool &need_retry);
   static bool is_namespace_address(const common::ObString &name);
   static int control_namespace(const common::ObString &source, const common::ObString &target,

@@ -1,5 +1,7 @@
 # Namespace 原型 V6：快照独立持有与来源删除
 
+后续：[V7：分支删除、最后引用释放与存储回收](namespace_snapshot_reclaim_v7.md)。本文保留 V6 当时的范围和证据。
+
 日期：2026-09-14。分支：`codex/namespace-snapshot-lifetime-v6`，基于 V5 `bb21fa618`。
 
 ## 本轮验证的问题

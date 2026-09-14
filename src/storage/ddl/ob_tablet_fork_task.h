@@ -171,6 +171,7 @@ public:
   ObTablesHandleArray created_sstable_handles_;
   lib::ObMutex created_sstable_handles_lock_;  // Protect concurrent access to created_sstable_handles_
   int64_t row_inserted_;
+  bool prototype_access_; // Protect the snapshot through asynchronous baseline completion.
   DISALLOW_COPY_AND_ASSIGN(ObTabletForkCtx);
 };
 

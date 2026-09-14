@@ -19,6 +19,7 @@
 #include "rootserver/ddl_task/ob_sys_ddl_util.h"
 #include "rootserver/fork_table/ob_fork_table_helper.h"
 #include "rootserver/ob_ddl_operator.h"
+#include "rootserver/ob_tablet_drop.h"
 #include "rootserver/ob_ddl_service.h"
 #include "rootserver/fork_table/ob_fork_table_util.h"
 #include "rootserver/ob_rootserver_local_runtime.h"
@@ -41,40 +42,67 @@ namespace rootserver {
 
 int ObDDLService::drop_namespace_prototype_(const ObString &name)
 {
-  bool done = false;
-  int ret = NamespaceForkKernelPrototype::begin_namespace_drop(name, done);
+  bool done = false; uint64_t id = 0;
+  int ret = NamespaceForkKernelPrototype::begin_namespace_drop(name, id, done);
   if (ret != OB_SUCCESS || done) { return ret; }
   ObSchemaGetterGuard guard; int64_t version = 0;
   ObArray<const ObDatabaseSchema *> databases;
+  ObArray<const ObTableSchema *> bound;
   ObDDLSQLTransaction trans(schema_service_);
   ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
-  if (OB_FAIL(get_runtime_schema_guard_with_version_in_inner_table(guard))) {
+  if (OB_FAIL(NamespaceForkKernelPrototype::drain_access())) {
+  } else if (OB_FAIL(get_runtime_schema_guard_with_version_in_inner_table(guard))) {
   } else if (OB_FAIL(guard.get_schema_version(version))) {
-  } else if (OB_FAIL(guard.get_database_schemas_in_runtime(databases))) {
+  } else if (id == 1 && OB_FAIL(guard.get_database_schemas_in_runtime(databases))) {
   } else if (OB_FAIL(trans.start(sql_proxy_, version))) {
-  } else if (OB_FAIL(NamespaceForkKernelPrototype::lock_namespace_drop(trans))) {
+  } else if (OB_FAIL(NamespaceForkKernelPrototype::lock_namespace_drop(trans, id, bound))) {
   } else {
-    // Close is durable first; ordinary DDL X locks drain existing write transactions.
-    // All native schema deletions, tablet DELETE MDS and namespace root removal commit together.
-    NamespaceSourceDropGuard capability(trans);
-    if (!capability.is_valid()) { ret = OB_EAGAIN; }
-    for (int64_t i = 0; OB_SUCC(ret) && i < databases.count(); ++i) {
-      const auto &db = *databases.at(i);
-      if (is_inner_db(db.get_database_id()) || db.get_database_name_str().prefix_match("__fork_proto_meta")) { continue; }
-      if (OB_FAIL(lock_tables_of_database_for_drop(db, trans))) {
-      } else if (OB_FAIL(lock_tables_in_recyclebin(db, trans))) {
-      } else { ret = ddl_operator.drop_database(db, trans); }
+    if (id == 1) {
+      NamespaceSourceDropGuard capability(trans);
+      if (!capability.is_valid()) { ret = OB_EAGAIN; }
+      for (int64_t i = 0; OB_SUCC(ret) && i < databases.count(); ++i) {
+        const auto &db = *databases.at(i);
+        if (is_inner_db(db.get_database_id()) || db.get_database_name_str().prefix_match("__fork_proto_meta")) { continue; }
+        if (OB_FAIL(lock_tables_of_database_for_drop(db, trans))) {
+        } else if (OB_FAIL(lock_tables_in_recyclebin(db, trans))) {
+        } else { ret = ddl_operator.drop_database(db, trans); }
+      }
+    } else {
+      // Virtual branch schemas have no native catalog rows. Delete only the private
+      // tablets recorded by its current directory, using ordinary DDL locks and MDS.
+      ObTabletDrop drop(trans, version);
+      ObLockAloneTabletRequest locks;
+      locks.lock_mode_ = EXCLUSIVE;
+      locks.op_type_ = ObTableLockOpType::IN_TRANS_COMMON_LOCK;
+      locks.timeout_us_ = std::max(int64_t(1), THIS_WORKER.get_timeout_remain());
+      if (OB_FAIL(drop.init())) {
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < bound.count(); ++i) {
+          ObArray<const ObTableSchema *> table;
+          if (OB_FAIL(locks.tablet_ids_.push_back(bound.at(i)->get_tablet_id()))) {
+          } else if (OB_FAIL(table.push_back(bound.at(i)))) {
+          } else { ret = drop.add_drop_tablets_of_table_arg(table); }
+        }
+        if (OB_SUCC(ret) && !bound.empty()) {
+          if (OB_FAIL(ObInnerConnectionLockUtil::lock_tablet(locks, trans.get_connection()))) {
+          } else { ret = drop.execute(); }
+        }
+      }
     }
-    if (OB_SUCC(ret)) { ret = NamespaceForkKernelPrototype::finish_namespace_drop(trans); }
+    if (OB_SUCC(ret)) { ret = NamespaceForkKernelPrototype::finish_namespace_drop(trans, id); }
     if (OB_SUCC(ret)) {
       DEBUG_SYNC(AFTER_UPDATE_TABLET_TO_LS);
       ret = THIS_WORKER.check_status();
     }
   }
   if (trans.is_started()) { const int end = trans.end(ret == OB_SUCCESS); if (ret == OB_SUCCESS) { ret = end; } }
-  if (OB_SUCC(ret)) { ret = publish_schema(); }
+  if (OB_SUCC(ret)) {
+    auto *freeze = share::server_service<ObFreezeInfoMgr>();
+    ret = freeze ? freeze->reload_for_test() : OB_NOT_INIT;
+  }
+  if (OB_SUCC(ret) && id == 1) { ret = publish_schema(); }
   // A failed attempt leaves DELETING persisted. Reissuing the same operation resumes it.
-  LOG_INFO("PROTOTYPE_V6_NAMESPACE_DROP", K(ret), K(name));
+  LOG_INFO("PROTOTYPE_V7_NAMESPACE_DROP", K(ret), K(name), K(id), "private_tablets", bound.count());
   return ret;
 }
 

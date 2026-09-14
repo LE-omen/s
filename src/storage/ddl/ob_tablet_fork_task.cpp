@@ -371,7 +371,8 @@ ObTabletForkCtx::ObTabletForkCtx()
     clipped_schemas_map_(),
     created_sstable_handles_(),
     created_sstable_handles_lock_(),
-    row_inserted_(0)
+    row_inserted_(0),
+    prototype_access_(false)
 {
 }
 
@@ -389,6 +390,7 @@ ObTabletForkCtx::~ObTabletForkCtx()
   created_sstable_handles_.reset();
   range_allocator_.reset();
   allocator_.reset();
+  NamespaceForkKernelPrototype::release_access(prototype_access_);
 }
 
 bool ObTabletForkCtx::is_valid() const
@@ -433,6 +435,15 @@ int ObTabletForkCtx::init(const ObTabletForkParam &param)
   } else if (OB_UNLIKELY(!param.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arg", K(ret), K(param));
+  } else if (NamespaceForkKernelPrototype::is_encoded_id(param.dest_tablet_id_.id())
+      && OB_FAIL(NamespaceForkKernelPrototype::check_table_access(
+          param.table_id_, param.dest_tablet_id_, prototype_access_))) {
+  } else if (FALSE_IT([&] {
+      if (NamespaceForkKernelPrototype::lifetime_mode()
+          && NamespaceForkKernelPrototype::is_encoded_id(param.dest_tablet_id_.id())) {
+        DEBUG_SYNC(FORK_TABLE_BUILD_DATA);
+      }
+    }())) {
   } else if (OB_FAIL(ObTabletForkUtil::check_satisfy_fork_condition(param, is_satisfied))) {
   } else if (!is_satisfied) {
     ret = OB_NEED_RETRY;

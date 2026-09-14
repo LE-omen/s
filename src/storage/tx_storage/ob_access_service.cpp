@@ -20,6 +20,7 @@
 #include "storage/tablelock/ob_table_lock_rpc_struct.h"
 #include "share/rc/ob_server_runtime.h"
 #include "share/ob_io_device_helper.h" // LOCAL_DEVICE_INSTANCE
+#include "share/ob_debug_sync.h"
 #include "share/io/ob_io_manager.h"
 #include "storage/ob_tablet_stat_mgr.h"
 #include "storage/ob_query_iterator_factory.h"
@@ -107,6 +108,7 @@ void ObStoreCtxGuard::reset()
     ctx_.reset();
     is_inited_ = false;
   }
+  NamespaceForkKernelPrototype::release_access(prototype_access_);
 }
 
 int ObStoreCtxGuard::init(ObLS *ls)
@@ -570,7 +572,7 @@ int ObAccessService::check_read_allowed_(
   int ret = OB_SUCCESS;
   ObLS *ls = nullptr;
 
-  if (OB_FAIL(NamespaceForkKernelPrototype::check_table_access(scan_param.index_id_, tablet_id))) {
+  if (OB_FAIL(NamespaceForkKernelPrototype::check_table_access(scan_param.index_id_, tablet_id, ctx_guard.prototype_access()))) {
   } else if (OB_FAIL(NamespaceForkKernelPrototype::ensure_tablet(tablet_id))) {
   } else if (OB_FAIL(ls_svr_->get_ls(ls))) {
   } else if (OB_FAIL(ctx_guard.init(ls))) {
@@ -640,6 +642,11 @@ int ObAccessService::check_read_allowed_(
       }
     }
   }
+  if (OB_SUCC(ret) && NamespaceForkKernelPrototype::lifetime_mode()
+      && NamespaceForkKernelPrototype::is_encoded_id(tablet_id.id())) {
+    // Existing sync point: admitted scan has not fetched its inherited inputs yet.
+    DEBUG_SYNC(AFTER_TABLE_SCAN);
+  }
   return ret;
 }
 
@@ -677,7 +684,7 @@ int ObAccessService::check_write_allowed_(
     ret = OB_SUCCESS;
   }
   if (OB_FAIL(NamespaceForkKernelPrototype::check_table_access(dml_param.table_param_
-      ? dml_param.table_param_->get_data_table().get_table_id() : OB_INVALID_ID, tablet_id))) {
+      ? dml_param.table_param_->get_data_table().get_table_id() : OB_INVALID_ID, tablet_id, ctx_guard.prototype_access()))) {
   } else if (OB_FAIL(NamespaceForkKernelPrototype::ensure_tablet(tablet_id))) {
   } else if (OB_FAIL(check_memstore_limit_(is_out_of_mem))) {
   } else if (is_out_of_mem && !tablet_id.is_inner_tablet()) {
