@@ -2,6 +2,8 @@
 
 日期：2026-09-14。分支：`codex/namespace-fork-fastpath-v4`，基于 V3 `41888648f`。状态：快路径、并发物化、超时回滚和提交前崩溃恢复验收通过。
 
+后续的跨数据库 namespace 身份原型见 [V5](namespace_identity_v5.md)。本文保留 V4 的实现和原始验收记录。
+
 ## 本轮问题
 
 V3 每次访问已物化的 fork tablet，仍会在 `ensure_tablet` 中开启内部事务、锁住目录根、读取 B+ tree 确认绑定。本轮验证：能否直接使用 tablet 现有的已提交状态跳过这些操作，不增加独立缓存、缓存条目或每个 tablet 的字段。

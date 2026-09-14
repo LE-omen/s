@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_OPT
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "ob_sql_utils.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "sql/executor/ob_maintain_dependency_info_task.h"
 #include "share/rc/ob_server_runtime.h"
 #include "sql/ob_sql.h"
@@ -724,6 +725,9 @@ int ObSQLUtils::cvt_db_name_to_org(share::schema::ObSchemaGetterGuard &schema_gu
                                    ObIAllocator *allocator)
 {
   int ret = OB_SUCCESS;
+  // The prototype address carries the namespace; replacing it with the logical
+  // database name would silently resolve subsequent lookups in namespace 1.
+  if (storage::NamespaceForkKernelPrototype::is_namespace_address(name)) { return ret; }
   if (session != NULL && !session->is_inner()) {
     ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
     if (OB_FAIL(session->get_name_case_mode(case_mode))) {

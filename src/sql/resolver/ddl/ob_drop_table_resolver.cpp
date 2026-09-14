@@ -110,8 +110,9 @@ int ObDropTableResolver::resolve(const ParseNode &parse_tree)
           if (OB_FAIL(resolve_table_relation_node(table_node,
                                                   table_name,
                                                   db_name))) {
-          } else if (storage::NamespaceForkKernelPrototype::enabled()
-                     && db_name.prefix_match("__fork_proto_b")) {
+          } else if ((storage::NamespaceForkKernelPrototype::enabled()
+                     && db_name.prefix_match("__fork_proto_b"))
+                     || storage::NamespaceForkKernelPrototype::is_namespace_address(db_name)) {
             // The prototype has a read-only inherited catalog, including for IF EXISTS.
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "DROP TABLE in namespace fork prototype");

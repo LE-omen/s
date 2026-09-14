@@ -113,6 +113,10 @@ int ObDDLService::fork_database(
   } else if (!fork_database_arg.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arg", K(ret), K(fork_database_arg));
+  } else if (NamespaceForkKernelPrototype::namespace_mode()) {
+    // Disposable control transport: these names identify namespaces, not databases.
+    ret = NamespaceForkKernelPrototype::control_namespace(fork_database_arg.src_database_name_,
+        fork_database_arg.dst_database_name_, res.schema_id_);
   } else if (NamespaceForkPrototype::is_target(fork_database_arg.dst_database_name_)) {
     ret = fork_database_prototype_(fork_database_arg, res);
   } else {

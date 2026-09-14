@@ -565,6 +565,12 @@ int ObSchemaGetterGuard::get_can_write_index_array(const uint64_t table_id,
 int ObSchemaGetterGuard::get_database_id(const ObString &database_name,
                                          uint64_t &database_id)
 {
+  if (storage::NamespaceForkKernelPrototype::is_namespace_address(database_name)) {
+    const ObDatabaseSchema *schema = nullptr;
+    int ret = storage::NamespaceForkKernelPrototype::database_by_address(database_name, schema);
+    database_id = schema ? schema->get_database_id() : OB_INVALID_ID;
+    return ret;
+  }
   int ret = OB_SUCCESS;
   const ObSchemaMgr *mgr = NULL;
   database_id = OB_INVALID_ID;
@@ -602,6 +608,10 @@ static int prototype_catalog_schema(ObSchemaGetterGuard &guard, uint64_t db,
 {
   schema = nullptr;
   if (!storage::NamespaceForkKernelPrototype::enabled()) { return OB_SUCCESS; }
+  if (storage::NamespaceForkKernelPrototype::namespace_mode()) {
+    return storage::NamespaceForkKernelPrototype::is_encoded_id(db)
+        ? storage::NamespaceForkKernelPrototype::schema_by_name(db, name, schema) : OB_SUCCESS;
+  }
   const ObDatabaseSchema *database = nullptr;
   int ret = guard.get_database_schema(db, database);
   if (ret == OB_SUCCESS && database != nullptr
@@ -615,6 +625,10 @@ static int prototype_catalog_schemas(ObSchemaGetterGuard &guard, uint64_t db,
                                      ObIArray<const ObTableSchema *> &schemas)
 {
   if (!storage::NamespaceForkKernelPrototype::enabled()) { return OB_SUCCESS; }
+  if (storage::NamespaceForkKernelPrototype::namespace_mode()) {
+    return storage::NamespaceForkKernelPrototype::is_encoded_id(db)
+        ? storage::NamespaceForkKernelPrototype::list_schemas(db, schemas) : OB_SUCCESS;
+  }
   const ObDatabaseSchema *database = nullptr;
   int ret = guard.get_database_schema(db, database);
   if (ret == OB_SUCCESS && database != nullptr
@@ -867,6 +881,10 @@ int ObSchemaGetterGuard::get_database_schema(
                                              const uint64_t database_id,
                                              const ObDatabaseSchema *&database_schema)
 {
+  if (storage::NamespaceForkKernelPrototype::namespace_mode()
+      && storage::NamespaceForkKernelPrototype::is_encoded_id(database_id)) {
+    return storage::NamespaceForkKernelPrototype::database_by_id(database_id, database_schema);
+  }
   int ret = OB_SUCCESS;
   database_schema = NULL;
 
@@ -888,6 +906,10 @@ int ObSchemaGetterGuard::get_database_schema(
                                              const uint64_t database_id,
                                              const ObSimpleDatabaseSchema *&database_schema)
 {
+  if (storage::NamespaceForkKernelPrototype::namespace_mode()
+      && storage::NamespaceForkKernelPrototype::is_encoded_id(database_id)) {
+    return storage::NamespaceForkKernelPrototype::database_by_id(database_id, database_schema);
+  }
   int ret = OB_SUCCESS;
   const ObSchemaMgr *mgr = NULL;
   database_schema = NULL;
@@ -1032,6 +1054,9 @@ int ObSchemaGetterGuard::get_database_schema(
                                              const ObString &database_name,
                                              const ObDatabaseSchema *&database_schema)
 {
+  if (storage::NamespaceForkKernelPrototype::is_namespace_address(database_name)) {
+    return storage::NamespaceForkKernelPrototype::database_by_address(database_name, database_schema);
+  }
   int ret = OB_SUCCESS;
   const ObSchemaMgr *mgr = NULL;
   database_schema = NULL;
@@ -2257,6 +2282,14 @@ int ObSchemaGetterGuard::get_schema_version(
     int64_t &schema_version,
     uint64_t *schema_belong_db_id)
 {
+  if (schema_type == DATABASE_SCHEMA && storage::NamespaceForkKernelPrototype::namespace_mode()
+      && storage::NamespaceForkKernelPrototype::is_encoded_id(schema_id)) {
+    const ObDatabaseSchema *schema = nullptr;
+    int ret = storage::NamespaceForkKernelPrototype::database_by_id(schema_id, schema);
+    schema_version = schema ? schema->get_schema_version() : OB_INVALID_VERSION;
+    if (schema_belong_db_id && schema) { *schema_belong_db_id = schema->get_database_id(); }
+    return ret;
+  }
   if (schema_type == TABLE_SCHEMA && storage::NamespaceForkKernelPrototype::is_encoded_id(schema_id)) {
     const ObTableSchema *inherited = nullptr;
     int ret = storage::NamespaceForkKernelPrototype::schema_by_id(schema_id, inherited);

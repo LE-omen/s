@@ -29,6 +29,7 @@
 #include "share/ob_dml_sql_splicer.h"
 #include "share/schema/ob_schema_struct.h"
 #include "share/schema/ob_schema_utils.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 
 namespace oceanbase
 {
@@ -101,6 +102,9 @@ int ObDatabaseSqlService::insert_database(const ObDatabaseSchema &database_schem
       }
     }
   }
+  if (OB_SUCC(ret) && !is_only_history) {
+    ret = storage::NamespaceForkKernelPrototype::observe_database(sql_client, database_schema);
+  }
   return ret;
 }
 
@@ -109,6 +113,9 @@ int ObDatabaseSqlService::update_database(const ObDatabaseSchema &database_schem
                                           const ObSchemaOperationType op_type,
                                           const ObString *ddl_stmt_str/*=NULL*/)
 {
+  if (storage::NamespaceForkKernelPrototype::check_database_ddl(database_schema) != OB_SUCCESS) {
+    return OB_NOT_SUPPORTED;
+  }
   int ret = OB_SUCCESS;
   ObSqlString sql_string;
   
@@ -178,6 +185,9 @@ int ObDatabaseSqlService::delete_database(const ObDatabaseSchema &db_schema,
                                           common::ObISQLClient &sql_client,
                                           const ObString *ddl_stmt_str/*=NULL*/)
 {
+  if (storage::NamespaceForkKernelPrototype::check_database_ddl(db_schema) != OB_SUCCESS) {
+    return OB_NOT_SUPPORTED;
+  }
   int ret = OB_SUCCESS;
   ObSqlString sql;
   int64_t affected_rows = 0;
