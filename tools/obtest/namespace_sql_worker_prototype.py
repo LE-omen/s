@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Throwaway V13/V14: SQL-only workers, query deadlines and autocommit INSERT.
+"""Throwaway SQL-only workers, query deadlines and autocommit DML.
 
 SEEKDB_FORK_PROTOTYPE_TEST_ROOT=/tmp python3 tools/obtest/namespace_sql_worker_prototype.py --binary build_release/src/observer/seekdb
 Add --case insert for V14 writes, rollback, isolation and crash recovery.
+Add --case dml for V15 UPDATE/DELETE through the same data-plane proxies.
 Linux integration probe. No claim of Windows/macOS or high-concurrency validation.
 """
 import argparse
@@ -128,6 +129,128 @@ class WorkerExperiment(LineageExperiment):
                 if line.startswith("PROTOTYPE_V11_SESSION_" + kind + " "):
                     events.append({k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line)})
         return events
+
+    def run_dml(self):
+        self.setup_lineage()
+        c, _ = self.capture("b", "c")
+        first = second = sibling = None
+        try:
+            first, second, sibling = self.worker_connect(self.b), self.worker_connect(self.b), self.worker_connect(c)
+            self.sql("INSERT INTO t1 VALUES(3,NULL),(4,-40)", first)
+            self.sql("SET @delta=7", first)
+            with first.cursor() as cursor:
+                assert cursor.execute("UPDATE t1 SET v=COALESCE(v,0)+@delta WHERE id<=4 AND (v IS NULL OR v<20)") == 3
+            assert self.sql("SELECT id,v FROM t1 ORDER BY id", second) == ((1,17),(2,20),(3,7),(4,-33))
+            with first.cursor() as cursor:
+                assert cursor.execute("UPDATE t1 SET v=v WHERE id=1") == 0
+                assert cursor.execute("UPDATE t1 SET v=99 WHERE id=999") == 0
+                assert cursor.execute("DELETE FROM t1 WHERE id=999") == 0
+                assert cursor.execute("UPDATE t1 SET v=CASE WHEN id=2 THEN v+1 ELSE v END") == 1
+                assert cursor.execute("UPDATE t1 SET v=v-1 WHERE id=2") == 1
+            assert self.sql("SELECT id,v FROM t1 ORDER BY id", second) == ((1,17),(2,20),(3,7),(4,-33))
+            self.record("dml_filters_expressions_affected_rows", noop_update=0, no_match=0, mixed_update=1)
+
+            rows = tuple((i, i*10) for i in range(100,196))
+            self.sql("INSERT INTO t1 VALUES" + ",".join(f"({i},{v})" for i,v in rows), first)
+            with first.cursor() as cursor:
+                assert cursor.execute("UPDATE t1 SET v=v+5 WHERE id>=100") == 96
+                assert cursor.execute("UPDATE t1 SET id=id+1000 WHERE id>=100") == 96
+            moved = tuple((i+1000, v+5) for i,v in rows)
+            assert self.sql("SELECT id,v FROM t1 WHERE id>=100 ORDER BY id", second) == moved
+            self.record("update_batches_and_primary_key", rows=96)
+            try:
+                self.sql("UPDATE t1 SET id=CASE WHEN id=1141 THEN 1 ELSE id+1000 END WHERE id>=1100 ORDER BY id", first)
+            except pymysql.IntegrityError as error:
+                assert error.args[0] == 1062, error.args
+                self.record("update_duplicate_rolls_back_batches", error=error.args, successful_rows_before_conflict=41)
+            else:
+                raise AssertionError("duplicate UPDATE succeeded")
+            assert self.sql("SELECT id,v FROM t1 WHERE id>=100 ORDER BY id", second) == moved
+
+            with first.cursor() as cursor:
+                assert cursor.execute("DELETE FROM t1 WHERE id>=1100 AND v<1645") == 64
+            remaining = moved[64:]
+            assert self.sql("SELECT id,v FROM t1 WHERE id>=100 ORDER BY id", second) == remaining
+            self.record("delete_multiple_batches", rows=64)
+            self.sql("SET SESSION ob_query_timeout=500000", first)
+            started = time.monotonic()
+            try:
+                self.sql("DELETE FROM t1 WHERE id>=1100 AND SLEEP(2)=0", first)
+            except pymysql.MySQLError as error:
+                assert error.args[0] == 4012, error.args
+                self.record("delete_timeout_rolled_back", seconds=time.monotonic()-started, error=error.args)
+            else:
+                raise AssertionError("expired DELETE succeeded")
+            self.sql("SET SESSION ob_query_timeout=10000000", first)
+            assert self.sql("SELECT id,v FROM t1 WHERE id>=100 ORDER BY id", second) == remaining
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(self.sql, "UPDATE t1 SET v=v+1+SLEEP(0.2) WHERE id=1", connection)
+                           for connection in (first, second)]
+                conflicts = []
+                for future, connection in zip(futures, (first, second)):
+                    try:
+                        future.result(timeout=15)
+                    except pymysql.MySQLError as error:
+                        # The worker does not yet run the MySQL dispatcher's
+                        # outer lock-conflict retry loop. Conflicts must fail,
+                        # roll back and leave the connection reusable.
+                        assert error.args[0] == 6005, error.args
+                        conflicts.append(connection)
+                assert len(conflicts) <= 1
+                assert self.sql("SELECT v FROM t1 WHERE id=1", second) == ((19-len(conflicts),),)
+                for connection in conflicts:
+                    self.sql("UPDATE t1 SET v=v+1 WHERE id=1", connection)
+            assert self.sql("SELECT v FROM t1 WHERE id=1", second) == ((19,),)
+            self.record("concurrent_update_same_row", initial=17, final=19, client_retries=len(conflicts))
+
+            scans_before = self.engine_log().count("PROTOTYPE_V15_TX_SCAN")
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                slow = pool.submit(self.sql, "UPDATE t1 SET v=v+1+SLEEP(2) WHERE id=2", first)
+                self.wait_until(lambda: self.engine_log().count("PROTOTYPE_V15_TX_SCAN") > scans_before,
+                                "slow UPDATE did not acquire its snapshot")
+                self.sql("UPDATE t1 SET v=v+1 WHERE id=2", second)
+                try:
+                    slow.result(timeout=15)
+                except pymysql.MySQLError as error:
+                    assert error.args[0] == 6001, error.args
+                    assert self.sql("SELECT v FROM t1 WHERE id=2", second) == ((21,),)
+                    self.sql("UPDATE t1 SET v=v+1 WHERE id=2", first)
+                else:
+                    raise AssertionError("stale UPDATE did not report the expected snapshot conflict")
+            assert self.sql("SELECT v FROM t1 WHERE id=2", second) == ((22,),)
+            self.record("update_snapshot_conflict_rolled_back", initial=20, final=22, client_retries=1)
+            for query in ("UPDATE IGNORE t1 SET v=0", "DELETE IGNORE FROM t1", "BEGIN", "SET autocommit=0"):
+                try:
+                    self.sql(query, first)
+                except pymysql.MySQLError as error:
+                    self.record("unsupported_dml_rejected", sql=query, error=error.args)
+                else:
+                    raise AssertionError(query)
+            assert self.sql("SELECT id,v FROM t1 ORDER BY id", sibling) == ((1,10),(2,20))
+            assert self.sql("SELECT id,v FROM db1.t1 ORDER BY id") == ((1,10),(2,20))
+            assert self.sql("SELECT id,v FROM " + self.table(self.root("a")[0], "db1.t1") + " ORDER BY id") == ((1,10),(2,20))
+            expected = ((1,19),(2,22),(3,7),(4,-33)) + remaining
+            assert self.sql("SELECT id,v FROM t1 ORDER BY id", first) == expected
+            self.record("update_delete_namespace_isolation", source_unchanged=True, sibling_unchanged=True)
+        finally:
+            for connection in (first, second, sibling):
+                if connection is not None:
+                    connection.close()
+        self.restart()
+        first, sibling = self.worker_connect(self.b), self.worker_connect(c)
+        try:
+            assert self.sql("SELECT id,v FROM t1 ORDER BY id", first) == expected
+            assert self.sql("SELECT id,v FROM t1 ORDER BY id", sibling) == ((1,10),(2,20))
+            with first.cursor() as cursor:
+                assert cursor.execute("UPDATE t1 SET v=NULL WHERE id=3") == 1
+                assert cursor.execute("DELETE FROM t1 WHERE id=4") == 1
+            assert self.sql("SELECT id,v FROM t1 WHERE id<=4 ORDER BY id", first) == ((1,19),(2,22),(3,None))
+            self.record("PASS", case="namespace_worker_dml", crash_recovery=True,
+                        worker_sql_and_das=True, shared_transaction_and_storage=True)
+        finally:
+            first.close()
+            sibling.close()
 
     def run_sessions(self, first, second):
         assert self.sql("SELECT CONNECTION_ID()", first) == ((first.thread_id(),),)
@@ -424,7 +547,7 @@ class WorkerExperiment(LineageExperiment):
             self.run_sessions(bconn, stale)
             self.run_concurrency(bconn, stale)
             self.run_timeouts(bconn, stale)
-            for query in ("UPDATE t1 SET v=1", "SELECT * FROM __fork_ns_3__db1.t1" if self.b != 3 else "SELECT * FROM __fork_ns_2__db1.t1"):
+            for query in ("UPDATE IGNORE t1 SET v=1", "SELECT * FROM __fork_ns_3__db1.t1" if self.b != 3 else "SELECT * FROM __fork_ns_2__db1.t1"):
                 try:
                     self.sql(query, bconn)
                 except pymysql.MySQLError as error:
@@ -520,14 +643,17 @@ class WorkerExperiment(LineageExperiment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
-    parser.add_argument("--case", choices=("full", "slow-timeout", "insert"), default="full")
+    parser.add_argument("--case", choices=("full", "slow-timeout", "insert", "dml"), default="full")
     args = parser.parse_args()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.environ["SEEKDB_NAMESPACE_SQL_WORKER_PROTOTYPE"] = "1"
-    experiment = WorkerExperiment(args.binary, "insert_v14" if args.case == "insert" else "timeout_v13", prototype=6)
+    case_name = {"insert": "insert_v14", "dml": "dml_v15"}.get(args.case, "timeout_v13")
+    experiment = WorkerExperiment(args.binary, case_name, prototype=6)
     try:
         experiment.start()
-        if args.case == "insert":
+        if args.case == "dml":
+            experiment.run_dml()
+        elif args.case == "insert":
             experiment.run_inserts()
         elif args.case == "slow-timeout":
             experiment.setup_lineage()

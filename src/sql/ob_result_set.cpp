@@ -290,12 +290,13 @@ int ObResultSet::implicit_commit_before_cmd_execute(ObSQLSessionInfo &session_in
 int ObResultSet::start_stmt()
 {
   if (observer::namespace_worker_prototype::worker_namespace != 0) {
-    // Plain reads use the snapshot pinned by the gateway. V14 inserts follow
+    // Plain reads use the snapshot pinned by the gateway. Worker writes follow
     // native SQL transaction control through the worker's remote service.
     const ObPhysicalPlan *plan = get_physical_plan();
     if (plan && plan->is_plain_select()) {
       return get_exec_context().get_das_ctx().get_snapshot().is_valid() ? OB_SUCCESS : OB_NOT_SUPPORTED;
-    } else if (!plan || !plan->is_plain_insert()) {
+    } else if (!plan || (!plan->is_plain_insert()
+        && get_stmt_type() != stmt::T_UPDATE && get_stmt_type() != stmt::T_DELETE)) {
       return OB_NOT_SUPPORTED;
     }
   }

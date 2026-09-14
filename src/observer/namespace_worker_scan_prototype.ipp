@@ -1,9 +1,10 @@
-// V10 bounded, read-only tablet RPC. SQL expressions stay in the worker.
+// Bounded tablet RPC. SQL expressions stay in the worker; V15 preserves DML snapshots.
 #include "data_plane/access/ob_table_scan_param.h"
 #include "storage/tx_storage/ob_access_service.h"
 #include "storage/access/ob_table_scan_iterator.h"
 #include "data_plane/access/ob_table_param.h"
 #include "sql/engine/basic/ob_pushdown_filter.h"
+#include "data_plane/transaction/ob_tx_desc_access.h"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 using namespace common;
 using namespace share;
@@ -19,7 +20,7 @@ struct EngineScan {
   ObNewRowIterator *iter = nullptr;
   const ObTableSchema *schema = nullptr;
   ~EngineScan() { if (iter) { share::server_service<ObITabletScan>()->revert_scan_iter(iter); } }
-  int open(uint64_t ns, uint64_t snapshot, Frame &request) {
+  int open(uint64_t ns, uint64_t snapshot, Frame &request, transaction::ObTxDesc *tx) {
     const uint64_t table_id = request.number(), tablet_id = request.number();
     const bool reverse = request.number() != 0, get = request.number() != 0;
     param.limit_param_.limit_ = static_cast<int64_t>(request.number());
@@ -45,6 +46,21 @@ struct EngineScan {
       range.start_key_.assign(&keys[i * 2], 1); range.end_key_.assign(&keys[i * 2 + 1], 1);
       ret = param.key_ranges_.push_back(range);
     }
+    const uint64_t txid = request.number();
+    const bool read_latest = request.number() != 0;
+    if (txid) {
+      if (!tx || static_cast<uint64_t>(data_plane::tx_desc_id(tx).get_id()) != txid) { return OB_INVALID_ARGUMENT; }
+      request.read(param.snapshot_);
+      param.tx_lock_timeout_ = request.number();
+      param.tx_seq_base_ = request.number();
+      param.tx_id_ = data_plane::tx_desc_id(tx);
+      param.trans_desc_ = tx; // Native pointer from this request, never from IPC.
+      if (!param.snapshot_.is_valid() || param.snapshot_.is_weak_read()
+          || (param.snapshot_.core_.tx_id_.is_valid() && param.snapshot_.core_.tx_id_ != param.tx_id_)) { return OB_INVALID_ARGUMENT; }
+    } else {
+      if (tx || read_latest) { return OB_INVALID_ARGUMENT; }
+      SCN scn; scn.convert_for_tx(snapshot); param.snapshot_.init_weak_read(scn);
+    }
     if (ret || !request.consumed()) { return ret ? ret : OB_INVALID_ARGUMENT; }
     param.index_id_ = table_id; param.tablet_id_ = ObTabletID(tablet_id);
     param.schema_version_ = schema->get_schema_version();
@@ -52,15 +68,15 @@ struct EngineScan {
     param.timeout_ = THIS_WORKER.get_timeout_ts();
     param.is_get_ = get;
     param.scan_flag_ = ObQueryFlag(reverse ? ObQueryFlag::Reverse : ObQueryFlag::Forward,
-        false, false, false, true, false, false, false);
+        false, false, false, true, false, false, read_latest);
     param.allocator_ = &allocator; param.scan_allocator_ = &allocator;
     param.reserved_cell_count_ = count;
-    SCN scn; scn.convert_for_tx(snapshot); param.snapshot_.init_weak_read(scn);
     ret = table.convert(*schema, param.column_ids_, sql::ObStoragePushdownFlag());
     param.table_param_ = &table;
     if (!ret) { ret = share::server_service<ObITabletScan>()->table_scan(param, iter); }
     fprintf(stderr, "PROTOTYPE_V10_SCAN_OPEN ns=%llu table=%llu ret=%d\n",
         static_cast<unsigned long long>(ns), static_cast<unsigned long long>(table_id), ret);
+    if (txid) { fprintf(stderr, "PROTOTYPE_V15_TX_SCAN tx=%llu latest=%d ret=%d\n", (unsigned long long)txid, read_latest, ret); }
     return ret;
   }
   int fetch(Frame &reply) {
@@ -97,13 +113,13 @@ struct ReadScans {
     fprintf(stderr, "PROTOTYPE_V13_SCANS_RELEASED ns=%llu remaining=%zu\n",
         (unsigned long long)ns, remaining);
   }
-  int process(Frame &request, Frame &reply) {
+  int process(Frame &request, Frame &reply, transaction::ObTxDesc *tx = nullptr) {
     int ret = OB_SUCCESS;
     reply = Frame('s');
     if (request.type() == 'O') {
       if (scans.size() >= 4) { ret = OB_NOT_SUPPORTED; }
       auto scan = std::make_unique<EngineScan>();
-      if (!ret) { ret = scan->open(ns, snapshot, request); }
+      if (!ret) { ret = scan->open(ns, snapshot, request, tx); }
       reply.number(ret); reply.number(ret ? 0 : ++sequence);
       if (!ret) { scans.emplace(sequence, std::move(scan)); }
     } else {
@@ -146,6 +162,11 @@ public:
       if (range.start_key_.get_obj_cnt() != 1 || range.end_key_.get_obj_cnt() != 1) { return OB_NOT_SUPPORTED; }
       request.number(range.border_flag_.get_data());
       request.append(range.start_key_.get_obj_ptr()[0]); request.append(range.end_key_.get_obj_ptr()[0]);
+    }
+    const auto &scan = static_cast<const ObTableScanParam &>(param);
+    request.number(scan.tx_id_.get_id()); request.number(param.scan_flag_.is_read_latest());
+    if (scan.tx_id_.is_valid()) {
+      request.append(scan.snapshot_); request.number(scan.tx_lock_timeout_); request.number(scan.tx_seq_base_);
     }
     Frame reply; int ret = exchange(request, reply);
     if (!ret) { handle = reply.number(); if (!reply.consumed() || handle == 0) { ret = OB_INVALID_ARGUMENT; } }

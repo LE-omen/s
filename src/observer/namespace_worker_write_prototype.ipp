@@ -1,4 +1,4 @@
-// Throwaway V14: DAS stays in the SQL worker; transactions and writes stay here.
+// Throwaway V15: DAS stays in the SQL worker; transactions and writes stay here.
 #include "data_plane/ob_i_dml_service.h"
 #include "data_plane/ob_i_write_context_service.h"
 #include "data_plane/access/ob_dml_table_plan.h"
@@ -46,7 +46,7 @@ struct EngineWrite {
     concurrent_control::ObWriteFlag flag;
     request.read(snapshot); request.read(flag);
     const uint64_t count = request.number();
-    if (request.ret || count != 2 || ((table & ~(1ULL << 62)) >> 32) != ns) { return OB_NOT_SUPPORTED; }
+    if (request.ret || count == 0 || count > 2 || ((table & ~(1ULL << 62)) >> 32) != ns) { return OB_NOT_SUPPORTED; }
     int ret = NamespaceForkKernelPrototype::schema_by_id(table, schema);
     if (ret) { return ret; }
     // Namespace catalog currently admits only these simple integer schemas.
@@ -70,11 +70,30 @@ struct EngineWrite {
     return ret;
   }
 
-  int insert(ObTxDesc &tx, Frame &request, int64_t &affected) {
+  int batch(char operation, ObTxDesc &tx, Frame &request, int64_t &affected) {
     const uint64_t tablet_id = request.number(), count = request.number();
-    if (request.ret || tablet_id != tablet.id() || count == 0 || count > 32) { return OB_INVALID_ARGUMENT; }
+    const bool update = operation == 'U';
+    if (request.ret || tablet_id != tablet.id() || count == 0
+        || count > (update ? 64 : 32) || (update && count % 2)
+        || (operation != 'L' && columns.count() != 2)) { return OB_INVALID_ARGUMENT; }
+    int64_t lock_timeout = 0;
+    ObRowLockMode lock_mode = ObRowLockMode::NONE;
+    if (operation == 'L') {
+      lock_timeout = request.number(); lock_mode = static_cast<ObRowLockMode>(request.number());
+      if (request.ret || (lock_mode != ObRowLockMode::NONE && lock_mode != ObRowLockMode::WRITE)) { return OB_INVALID_ARGUMENT; }
+    }
+    ObSEArray<uint64_t, 2> updated_columns;
+    const uint64_t updated_count = request.number();
+    if (request.ret || updated_count > 2 || (update ? updated_count == 0 : updated_count != 0)) { return OB_INVALID_ARGUMENT; }
+    for (uint64_t i = 0; i < updated_count; ++i) {
+      const uint64_t column = request.number();
+      if (request.ret || (column != columns.at(0) && column != columns.at(1))
+          || (i && column == updated_columns.at(0))) { return OB_INVALID_ARGUMENT; }
+      int ret = updated_columns.push_back(column);
+      if (ret) { return ret; }
+    }
     // Decode and validate a bounded batch before entering native storage.
-    std::vector<ObObj> cells(count * 2);
+    std::vector<ObObj> cells(count * columns.count());
     for (auto &cell : cells) {
       request.read(cell);
       if (request.ret || (!cell.is_null() && !ob_is_integer_type(cell.get_type()))) { return OB_INVALID_ARGUMENT; }
@@ -83,21 +102,28 @@ struct EngineWrite {
     class Rows final : public ObDatumRowIterator {
     public:
       std::vector<ObObj> &cells;
+      int64_t width;
       size_t position = 0;
-      ObDatumRow row;
-      explicit Rows(std::vector<ObObj> &values) : cells(values) {}
+      // UPDATE's old row must remain alive while storage obtains its new row.
+      ObDatumRow rows[2];
+      Rows(std::vector<ObObj> &values, int64_t columns) : cells(values), width(columns) {}
       int get_next_row(ObDatumRow *&out) override {
         if (position == cells.size()) { return OB_ITER_END; }
+        ObDatumRow &row = rows[(position / width) % 2];
         int ret = OB_SUCCESS;
-        for (int i = 0; !ret && i < 2; ++i) { ret = row.storage_datums_[i].from_obj_enhance(cells[position++]); }
+        for (int64_t i = 0; !ret && i < width; ++i) { ret = row.storage_datums_[i].from_obj_enhance(cells[position++]); }
         row.row_flag_.set_flag(DF_INSERT); out = &row; return ret;
       }
-    } rows(cells);
-    int ret = rows.row.init(2);
-    if (!ret) { ret = share::server_service<ObIDmlService>()->insert_rows(
-        tablet, tx, execution, columns, &rows, affected); }
-    fprintf(stderr, "PROTOTYPE_V14_INSERT_BATCH tx=%lld rows=%llu affected=%lld ret=%d\n",
-        (long long)tx.get_tx_id().get_id(), (unsigned long long)count, (long long)affected, ret);
+    } rows(cells, columns.count());
+    int ret = rows.rows[0].init(columns.count());
+    if (!ret) { ret = rows.rows[1].init(columns.count()); }
+    auto *service = share::server_service<ObIDmlService>();
+    if (!ret && update) { ret = service->update_rows(tablet, tx, execution, columns, updated_columns, &rows, affected); }
+    else if (!ret && operation == 'D') { ret = service->delete_rows(tablet, tx, execution, columns, &rows, affected); }
+    else if (!ret && operation == 'L') { ret = service->lock_rows(tablet, tx, execution, lock_timeout, lock_mode, &rows, affected); }
+    else if (!ret) { ret = service->insert_rows(tablet, tx, execution, columns, &rows, affected); }
+    fprintf(stderr, "PROTOTYPE_V15_WRITE_BATCH op=%c tx=%lld rows=%llu affected=%lld ret=%d\n",
+        operation, (long long)tx.get_tx_id().get_id(), (unsigned long long)(update ? count / 2 : count), (long long)affected, ret);
     return ret;
   }
 };
@@ -181,9 +207,9 @@ struct EngineWrites {
         const uint64_t handle = request.number();
         if (request.ret || !write || handle != sequence) { ret = OB_INVALID_ARGUMENT; }
         else if (operation == 'X' && request.consumed()) { write.reset(); }
-        else if (operation == 'I') {
+        else if (operation == 'I' || operation == 'U' || operation == 'D' || operation == 'L') {
           int64_t affected = 0;
-          ret = write->insert(*tx, request, affected); values.number(affected);
+          ret = write->batch(operation, *tx, request, affected); values.number(affected);
         } else { ret = OB_INVALID_ARGUMENT; }
       }
     }
@@ -317,6 +343,7 @@ struct RemoteExecution final : public ObIDmlExecutionState {
   ObTxDesc *tx = nullptr; // Borrowed query view; never sent across IPC.
   int64_t deadline = 0;
   std::vector<ObObjMeta> types;
+  std::vector<uint64_t> columns;
   void destroy() override {
     if (handle) {
       Frame request('W'), reply; request.number('X'); request.number(txid); request.number(handle);
@@ -345,7 +372,7 @@ public:
       ObDmlExecution &execution) override {
     const auto view = table_plan.get_data_table();
     const auto &columns = table_plan.get_col_descs();
-    if (!write_context.is_valid() || columns.count() != 2 || !write_spec.tz_info_) { return OB_NOT_SUPPORTED; }
+    if (!write_context.is_valid() || columns.empty() || columns.count() > 2 || !write_spec.tz_info_) { return OB_NOT_SUPPORTED; }
     auto prepared = std::make_unique<RemoteExecution>();
     auto &tx = *static_cast<ObTxDesc *>(write_context.native_handle());
     prepared->tx = &tx;
@@ -361,6 +388,7 @@ public:
     for (int64_t i = 0; i < columns.count(); ++i) {
       if (!ob_is_integer_type(columns.at(i).col_type_.get_type())) { return OB_NOT_SUPPORTED; }
       request.number(columns.at(i).col_id_); prepared->types.push_back(columns.at(i).col_type_);
+      prepared->columns.push_back(columns.at(i).col_id_);
     }
     execution.reset();
     int ret = write_rpc(request, reply);
@@ -376,7 +404,8 @@ public:
       const ObDmlExecution &execution,
       const common::ObIArray<uint64_t> &column_ids,
       blocksstable::ObDatumRowIterator *row_iter,
-      int64_t &affected_rows) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_DML delete_rows\n"); return OB_NOT_SUPPORTED; }
+      int64_t &affected_rows) override {
+    return write_rows('D', tablet_id, tx_desc, execution, &column_ids, nullptr, row_iter, affected_rows); }
   int put_rows(
       const common::ObTabletID &tablet_id,
       transaction::ObTxDesc &tx_desc,
@@ -391,31 +420,47 @@ public:
       const common::ObIArray<uint64_t> &column_ids,
       blocksstable::ObDatumRowIterator *row_iter,
       int64_t &affected_rows) override {
+    return write_rows('I', tablet_id, tx_desc, execution, &column_ids, nullptr, row_iter, affected_rows); }
+  int write_rows(char operation, const ObTabletID &tablet_id, ObTxDesc &tx_desc,
+      const ObDmlExecution &execution, const ObIArray<uint64_t> *column_ids,
+      const ObIArray<uint64_t> *updated_column_ids, ObDatumRowIterator *row_iter, int64_t &affected_rows,
+      int64_t lock_timeout = 0, ObRowLockMode lock_mode = ObRowLockMode::NONE) {
     auto *state = static_cast<RemoteExecution *>(execution_state(execution));
-    if (!state || !row_iter || column_ids.count() != 2
+    if (!state || !row_iter || (column_ids && column_ids->count() != static_cast<int64_t>(state->columns.size()))
         || state->txid != static_cast<uint64_t>(tx_desc.get_tx_id().get_id())) { return OB_INVALID_ARGUMENT; }
+    const int64_t width = state->columns.size();
+    for (int64_t i = 0; column_ids && i < width; ++i) {
+      if (column_ids->at(i) != state->columns[i]) { return OB_INVALID_ARGUMENT; }
+    }
     affected_rows = 0;
     int ret = OB_SUCCESS;
     bool end = false;
     while (!ret && !end) {
       Frame cells;
       int64_t rows = 0;
-      while (!ret && rows < 32) {
+      // Keep old/new pairs in the same frame: at most 32 logical writes.
+      while (!ret && rows < (operation == 'U' ? 64 : 32)) {
         ObDatumRow *row = nullptr;
         ret = THIS_WORKER.check_status();
         if (!ret) { ret = row_iter->get_next_row(row); }
         if (ret == OB_ITER_END) { ret = OB_SUCCESS; end = true; break; }
-        if (!ret && (!row || row->get_column_count() != 2)) { ret = OB_INVALID_ARGUMENT; }
-        for (int i = 0; !ret && i < 2; ++i) {
+        if (!ret && (!row || row->get_column_count() != width)) { ret = OB_INVALID_ARGUMENT; }
+        for (int64_t i = 0; !ret && i < width; ++i) {
           ObObj value;
           ret = row->storage_datums_[i].to_obj_enhance(value, state->types[i]);
           if (!ret) { cells.append(value); ret = cells.ret; }
         }
         if (!ret) { ++rows; }
       }
+      if (!ret && operation == 'U' && rows % 2) { ret = OB_INVALID_ARGUMENT; }
       if (!ret && rows) {
-        Frame request('W'), reply; request.number('I'); request.number(state->txid);
+        Frame request('W'), reply; request.number(operation); request.number(state->txid);
         request.number(state->handle); request.number(tablet_id.id()); request.number(rows);
+        if (operation == 'L') { request.number(lock_timeout); request.number(static_cast<int>(lock_mode)); }
+        request.number(updated_column_ids ? updated_column_ids->count() : 0);
+        if (updated_column_ids) {
+          for (int64_t i = 0; i < updated_column_ids->count(); ++i) { request.number(updated_column_ids->at(i)); }
+        }
         request.data.insert(request.data.end(), cells.data.begin() + Frame::HEADER_SIZE, cells.data.end());
         ret = write_rpc(request, reply);
         if (!ret) {
@@ -444,7 +489,8 @@ public:
       const common::ObIArray<uint64_t> &column_ids,
       const common::ObIArray<uint64_t> &updated_column_ids,
       blocksstable::ObDatumRowIterator *row_iter,
-      int64_t &affected_rows) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_DML update_rows\n"); return OB_NOT_SUPPORTED; }
+      int64_t &affected_rows) override {
+    return write_rows('U', tablet_id, tx_desc, execution, &column_ids, &updated_column_ids, row_iter, affected_rows); }
   int lock_rows(
       const common::ObTabletID &tablet_id,
       transaction::ObTxDesc &tx_desc,
@@ -452,6 +498,7 @@ public:
       const int64_t abs_lock_timeout,
       const ObRowLockMode lock_mode,
       blocksstable::ObDatumRowIterator *row_iter,
-      int64_t &affected_rows) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_DML lock_rows\n"); return OB_NOT_SUPPORTED; }
+      int64_t &affected_rows) override {
+    return write_rows('L', tablet_id, tx_desc, execution, nullptr, nullptr, row_iter, affected_rows, abs_lock_timeout, lock_mode); }
 };
 } } }

@@ -51,3 +51,5 @@ SEEKDB_FORK_PROTOTYPE_TEST_ROOT=/tmp python3 tools/obtest/namespace_sql_worker_p
 仅普通 VALUES INSERT、自动提交、现有两列整数表、root。INSERT IGNORE、REPLACE、ON DUPLICATE KEY UPDATE、INSERT SELECT、UPDATE/DELETE、显式事务、DDL 和复杂表仍不支持。保留已有扫描代理的查询范围限制。
 
 真实跨进程事务对象只有共享端一份，但兼容描述符、请求参数及有界批次会有进程间传输和临时内存成本。本轮没有做内存优化或新增性能结论。沿用现有协作取消；提交期间断链可能造成结果不确定，不自动重放写入。没有新增跨平台实机验证。
+
+后续 [V15](namespace_worker_dml_v15.md) 复用这些接口接通 UPDATE、DELETE 及锁行，并为写语句的扫描传递事务快照。

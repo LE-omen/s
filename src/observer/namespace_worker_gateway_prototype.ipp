@@ -176,7 +176,7 @@ int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
       Frame result; ret = catalog(ns, reply, result); result.tag(pending->tag);
       if (!ret) { ret = channel.send(result); }
     } else if (scans && (reply.type() == 'O' || reply.type() == 'F' || reply.type() == 'X')) {
-      Frame result; ret = scans->process(reply, result); result.tag(pending->tag);
+      Frame result; ret = scans->process(reply, result, writes ? writes->tx : nullptr); result.tag(pending->tag);
       if (!ret) { ret = channel.send(result); }
     } else if (writes && (reply.type() == 'T' || reply.type() == 'W')) {
       Frame result; ret = writes->process(reply, result); result.tag(pending->tag);
@@ -244,8 +244,8 @@ void close_session(SessionBinding *binding) {
 int query(SessionBinding &binding, uint64_t snapshot, const ObString &sql, bool change_database,
           const std::function<int(Frame &)> &response) {
   if (binding.channel->closed) { return OB_CONNECT_ERROR; }
-  ReadScans scans(binding.ns, snapshot);
   EngineWrites writes(binding.ns, binding.gateway->get_server_sid());
+  ReadScans scans(binding.ns, snapshot); // Release scans before their borrowed transaction.
   Frame request(change_database ? 'U' : 'Q');
   request.number(binding.slot); request.number(binding.slot_generation);
   const int64_t deadline = THIS_WORKER.get_timeout_ts();

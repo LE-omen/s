@@ -130,7 +130,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     WORKER_STEP(session.test_init(1, sid, &owner.allocator));
     WORKER_STEP(session.load_default_sys_variable(false, false));
     WORKER_STEP(session.set_user(ObString::make_string("root"), ObString::make_string("%"), OB_SYS_USER_ID));
-    session.set_user_priv_set(OB_PRIV_SELECT | OB_PRIV_INSERT);
+    session.set_user_priv_set(OB_PRIV_SELECT | OB_PRIV_INSERT | OB_PRIV_UPDATE | OB_PRIV_DELETE);
     session.set_session_manager(&session_mgr_);
     if (!ret && state) {
       ret = apply_session_state(session, *state);
@@ -172,7 +172,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         THIS_WORKER.set_session(nullptr);
       }
     } finish{*session};
-    // Reject commands outside the SELECT/session/simple autocommit INSERT slice.
+    // Reject commands outside the SELECT/session/simple autocommit DML slice.
     ObParser parser(allocator, session->get_sql_mode(), session->get_charsets4parser());
     ObSEArray<ObString, 2> statements;
     ObMPParseStat parse_stat;
@@ -183,9 +183,13 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     if (!ret) {
       const ParseNode *node = parsed.result_tree_;
       if (node && node->type_ == T_STMT_LIST && node->num_child_ == 1) { node = node->children_[0]; }
-      if (!node || (node->type_ != T_SELECT && node->type_ != T_INSERT && node->type_ != T_VARIABLE_SET
+      if (!node || (node->type_ != T_SELECT && node->type_ != T_INSERT && node->type_ != T_UPDATE
+                    && node->type_ != T_DELETE && node->type_ != T_VARIABLE_SET
                     && node->type_ != T_USE_DATABASE)) { ret = OB_NOT_SUPPORTED; }
       if (!ret && node->type_ == T_INSERT && (node->num_child_ != 4 || node->children_[3])) { ret = OB_NOT_SUPPORTED; }
+      // IGNORE needs additional savepoint operations; keep it outside this slice.
+      if (!ret && node->type_ == T_UPDATE && (node->num_child_ != 11 || node->children_[8])) { ret = OB_NOT_SUPPORTED; }
+      if (!ret && node->type_ == T_DELETE && (node->num_child_ != 10 || node->children_[9])) { ret = OB_NOT_SUPPORTED; }
       std::vector<const ParseNode *> pending;
       if (!ret) { pending.push_back(node); }
       while (!ret && !pending.empty()) {
@@ -209,6 +213,8 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       if (!result->get_physical_plan() || !result->get_physical_plan()->is_plain_select()) { ret = OB_NOT_SUPPORTED; }
     } else if (!ret && result->get_stmt_type() == stmt::T_INSERT) {
       if (!serve || !result->get_physical_plan() || !result->get_physical_plan()->is_plain_insert()) { ret = OB_NOT_SUPPORTED; }
+    } else if (!ret && (result->get_stmt_type() == stmt::T_UPDATE || result->get_stmt_type() == stmt::T_DELETE)) {
+      if (!serve || !result->get_physical_plan()) { ret = OB_NOT_SUPPORTED; }
     } else if (!ret && result->get_stmt_type() == stmt::T_VARIABLE_SET) {
       auto *command = static_cast<ObVariableSetStmt *>(result->get_cmd());
       if (!command || command->has_global_variable()) { ret = OB_NOT_SUPPORTED; }
