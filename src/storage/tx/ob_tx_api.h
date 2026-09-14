@@ -115,6 +115,8 @@ int release_tx(ObTxDesc &tx);
  * Return: OB_SUCCESS -OK
  */
 int reuse_tx(ObTxDesc &tx);
+int prepare_tx_for_statement(ObTxDesc &tx) override;
+int prepare_tx_for_autocommit_retry(ObTxDesc &tx) override;
 
 /**
  * stop_tx - stop txn immediately (for admin reason)

@@ -35,7 +35,7 @@ class ObQueryRetryCtrl;
 namespace observer
 {
 
-class ObMPPacketSender;
+class ObIMPPacketSender;
 class ObMySQLResultSet;
 class ObSyncPlanDriver : public ObQueryDriver
 {
@@ -44,7 +44,7 @@ public:
                    const sql::ObSqlCtx &ctx,
                    sql::ObSQLSessionInfo &session,
                    sql::ObQueryRetryCtrl &retry_ctrl,
-                   ObMPPacketSender &sender,
+                   ObIMPPacketSender &sender,
                    int32_t iteration_count = common::OB_INVALID_COUNT);
   virtual ~ObSyncPlanDriver();
 

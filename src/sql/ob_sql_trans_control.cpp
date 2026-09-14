@@ -506,7 +506,7 @@ int ObSqlTransControl::start_stmt(ObExecContext &exec_ctx)
   OZ (acquire_tx_if_need_(txs, *session));
   OZ (stmt_sanity_check_(session, plan, plan_ctx));
   if (!ObSQLUtils::is_nested_sql(&exec_ctx)) {
-    OX (data_plane::prepare_tx_for_statement(*session->get_tx_desc()));
+    OZ (txs->prepare_tx_for_statement(*session->get_tx_desc()));
   }
   uint32_t session_id = 0;
   ObTxDesc *tx_desc = NULL;
@@ -516,7 +516,7 @@ int ObSqlTransControl::start_stmt(ObExecContext &exec_ctx)
   OX (session_id = session->get_server_sid());
   OX (tx_desc = session->get_tx_desc());
   OX (is_plain_select = plan->is_plain_select());
-  OX (data_plane::prepare_tx_for_statement(*tx_desc));
+  OZ (txs->prepare_tx_for_statement(*tx_desc));
   if (OB_SUCC(ret) && !is_plain_select) {
     OZ (stmt_setup_savepoint_(session, das_ctx, plan_ctx, txs, nested_level),
         session_id, "tx_id", data_plane::tx_desc_id(tx_desc));
@@ -1237,7 +1237,9 @@ int ObSqlTransControl::reset_trans_for_autocommit_lock_conflict(ObExecContext &e
   ObTxDesc *tx_desc = NULL;
   CK (OB_NOT_NULL(session));
   CK (OB_NOT_NULL(tx_desc = session->get_tx_desc()));
-  OZ (data_plane::prepare_tx_for_autocommit_retry(*tx_desc));
+  data_plane::ObITransactionService *txs = nullptr;
+  OZ (get_tx_service(session, txs));
+  OZ (txs->prepare_tx_for_autocommit_retry(*tx_desc));
   return ret;
 }
 

@@ -3,10 +3,12 @@
 
 SEEKDB_FORK_PROTOTYPE_TEST_ROOT=/tmp python3 tools/obtest/namespace_sql_worker_prototype.py --binary build_release/src/observer/seekdb
 Add --case insert for V14 writes, rollback, isolation and crash recovery.
-Add --case dml for V15 UPDATE/DELETE through the same data-plane proxies.
+Add --case dml for native drivers, automatic conflict retries, DML and recovery.
 Linux integration probe. No claim of Windows/macOS or high-concurrency validation.
 """
 import argparse
+import datetime
+from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor
 import os
 from pathlib import Path
@@ -26,10 +28,10 @@ class WorkerExperiment(LineageExperiment):
         super().start()
         self.sql("ALTER SYSTEM SET syslog_level='WARN'")
 
-    def worker_connect(self, namespace):
+    def worker_connect(self, namespace, client_flag=0):
         return pymysql.connect(host="127.0.0.1", port=self.port, user="root", password="",
                                database=f"__fork_ns_{namespace}__db1", charset="utf8mb4",
-                               autocommit=True, connect_timeout=10, read_timeout=40, write_timeout=10)
+                               autocommit=True, connect_timeout=10, read_timeout=40, write_timeout=10, client_flag=client_flag)
 
     def worker_pid(self, namespace):
         matches = re.findall(r"PROTOTYPE_V10_WORKER_READY ns=(\d+) generation=(\d+) pid=(\d+)",
@@ -136,6 +138,18 @@ class WorkerExperiment(LineageExperiment):
         first = second = sibling = None
         try:
             first, second, sibling = self.worker_connect(self.b), self.worker_connect(self.b), self.worker_connect(c)
+            assert self.sql("SELECT CAST(12.340 AS DECIMAL(8,3)), DATE '2026-09-15', "
+                            "TIMESTAMP '2026-09-15 01:02:03', TIME '-12:34:56', NULL, '你好'", first) == (
+                (Decimal("12.340"), datetime.date(2026,9,15), datetime.datetime(2026,9,15,1,2,3),
+                 -datetime.timedelta(hours=12, minutes=34, seconds=56), None, "你好"),)
+            self.record("native_driver_result_types", decimal=True, date=True, datetime=True, time=True, utf8=True)
+            original_mode = self.sql("SELECT @@sql_mode", first)[0][0]
+            with first.cursor() as cursor:
+                cursor.execute("SET sql_mode='NO_BACKSLASH_ESCAPES'")
+                assert cursor._result.server_status & 512, "native OK lost NO_BACKSLASH_ESCAPES"
+                cursor.execute("SET sql_mode=%s", (original_mode,))
+                assert not cursor._result.server_status & 512
+            self.record("native_ok_status_flags", no_backslash_escapes=True)
             self.sql("INSERT INTO t1 VALUES(3,NULL),(4,-40)", first)
             self.sql("SET @delta=7", first)
             with first.cursor() as cursor:
@@ -149,6 +163,14 @@ class WorkerExperiment(LineageExperiment):
                 assert cursor.execute("UPDATE t1 SET v=v-1 WHERE id=2") == 1
             assert self.sql("SELECT id,v FROM t1 ORDER BY id", second) == ((1,17),(2,20),(3,7),(4,-33))
             self.record("dml_filters_expressions_affected_rows", noop_update=0, no_match=0, mixed_update=1)
+            found_rows = self.worker_connect(self.b, client_flag=pymysql.constants.CLIENT.FOUND_ROWS)
+            try:
+                with found_rows.cursor() as cursor:
+                    assert cursor.execute("UPDATE t1 SET v=v WHERE id=1") == 1
+                    assert cursor.execute("UPDATE t1 SET v=v WHERE id=999") == 0
+                self.record("native_client_capabilities", found_rows=1, unchanged_default=0)
+            finally:
+                found_rows.close()
 
             rows = tuple((i, i*10) for i in range(100,196))
             self.sql("INSERT INTO t1 VALUES" + ",".join(f"({i},{v})" for i,v in rows), first)
@@ -187,22 +209,10 @@ class WorkerExperiment(LineageExperiment):
             with ThreadPoolExecutor(max_workers=2) as pool:
                 futures = [pool.submit(self.sql, "UPDATE t1 SET v=v+1+SLEEP(0.2) WHERE id=1", connection)
                            for connection in (first, second)]
-                conflicts = []
-                for future, connection in zip(futures, (first, second)):
-                    try:
-                        future.result(timeout=15)
-                    except pymysql.MySQLError as error:
-                        # The worker does not yet run the MySQL dispatcher's
-                        # outer lock-conflict retry loop. Conflicts must fail,
-                        # roll back and leave the connection reusable.
-                        assert error.args[0] == 6005, error.args
-                        conflicts.append(connection)
-                assert len(conflicts) <= 1
-                assert self.sql("SELECT v FROM t1 WHERE id=1", second) == ((19-len(conflicts),),)
-                for connection in conflicts:
-                    self.sql("UPDATE t1 SET v=v+1 WHERE id=1", connection)
+                for future in futures:
+                    future.result(timeout=15)
             assert self.sql("SELECT v FROM t1 WHERE id=1", second) == ((19,),)
-            self.record("concurrent_update_same_row", initial=17, final=19, client_retries=len(conflicts))
+            self.record("concurrent_update_same_row", initial=17, final=19, client_retries=0)
 
             scans_before = self.engine_log().count("PROTOTYPE_V15_TX_SCAN")
             with ThreadPoolExecutor(max_workers=1) as pool:
@@ -210,16 +220,12 @@ class WorkerExperiment(LineageExperiment):
                 self.wait_until(lambda: self.engine_log().count("PROTOTYPE_V15_TX_SCAN") > scans_before,
                                 "slow UPDATE did not acquire its snapshot")
                 self.sql("UPDATE t1 SET v=v+1 WHERE id=2", second)
-                try:
-                    slow.result(timeout=15)
-                except pymysql.MySQLError as error:
-                    assert error.args[0] == 6001, error.args
-                    assert self.sql("SELECT v FROM t1 WHERE id=2", second) == ((21,),)
-                    self.sql("UPDATE t1 SET v=v+1 WHERE id=2", first)
-                else:
-                    raise AssertionError("stale UPDATE did not report the expected snapshot conflict")
+                slow.result(timeout=15)
             assert self.sql("SELECT v FROM t1 WHERE id=2", second) == ((22,),)
-            self.record("update_snapshot_conflict_rolled_back", initial=20, final=22, client_retries=1)
+            worker_log = "".join(path.read_text(errors="replace") for path in
+                                 (self.base / "run").glob(f"namespace-worker-{self.b}-*/process.out"))
+            assert re.search(r"PROTOTYPE_V16_NATIVE_EXECUTE .*attempt=[1-9]", worker_log), "no native retry observed"
+            self.record("update_snapshot_conflict_retried", initial=20, final=22, client_retries=0)
             for query in ("UPDATE IGNORE t1 SET v=0", "DELETE IGNORE FROM t1", "BEGIN", "SET autocommit=0"):
                 try:
                     self.sql(query, first)
@@ -647,7 +653,7 @@ def main():
     args = parser.parse_args()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.environ["SEEKDB_NAMESPACE_SQL_WORKER_PROTOTYPE"] = "1"
-    case_name = {"insert": "insert_v14", "dml": "dml_v15"}.get(args.case, "timeout_v13")
+    case_name = {"insert": "insert_v14", "dml": "native_execution_v16"}.get(args.case, "timeout_v13")
     experiment = WorkerExperiment(args.binary, case_name, prototype=6)
     try:
         experiment.start()

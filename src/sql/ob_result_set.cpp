@@ -16,7 +16,6 @@
 
 #define USING_LOG_PREFIX SQL
 #include "ob_result_set.h"
-#include "observer/namespace_worker_protocol_prototype.h"
 #include "data_plane/transaction/ob_tx_desc_access.h"
 #include "share/rc/ob_server_runtime.h"
 #include "sql/resolver/dml/ob_del_upd_stmt.h"
@@ -289,17 +288,6 @@ int ObResultSet::implicit_commit_before_cmd_execute(ObSQLSessionInfo &session_in
 // open transaction if need (eg. ac=1 DML)
 int ObResultSet::start_stmt()
 {
-  if (observer::namespace_worker_prototype::worker_namespace != 0) {
-    // Plain reads use the snapshot pinned by the gateway. Worker writes follow
-    // native SQL transaction control through the worker's remote service.
-    const ObPhysicalPlan *plan = get_physical_plan();
-    if (plan && plan->is_plain_select()) {
-      return get_exec_context().get_das_ctx().get_snapshot().is_valid() ? OB_SUCCESS : OB_NOT_SUPPORTED;
-    } else if (!plan || (!plan->is_plain_insert()
-        && get_stmt_type() != stmt::T_UPDATE && get_stmt_type() != stmt::T_DELETE)) {
-      return OB_NOT_SUPPORTED;
-    }
-  }
   NG_TRACE(sql_start_stmt_begin);
   int ret = OB_SUCCESS;
   ObPhysicalPlan* phy_plan = static_cast<ObPhysicalPlan*>(cache_obj_guard_.get_cache_obj());

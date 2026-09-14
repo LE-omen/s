@@ -66,6 +66,8 @@ public:
   virtual int release_tx(transaction::ObTxDesc &tx) = 0;
   virtual int reuse_tx(transaction::ObTxDesc &tx) = 0;
   virtual int interrupt(transaction::ObTxDesc &tx, int cause) = 0;
+  virtual int prepare_tx_for_statement(transaction::ObTxDesc &tx) = 0;
+  virtual int prepare_tx_for_autocommit_retry(transaction::ObTxDesc &tx) = 0;
 
   virtual int get_read_snapshot(transaction::ObTxDesc &tx,
                                 transaction::ObTxIsolationLevel isolation_level,

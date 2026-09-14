@@ -1,7 +1,5 @@
-// Throwaway V10 result transport; keep MySQL encoding in the existing gateway.
-#include "observer/namespace_worker_protocol_prototype.h"
-#include "data_plane/transaction/ob_i_transaction_service.h"
-#include "observer/mysql/obsm_row.h"
+// Native driver output crosses IPC; the existing Rust encoder owns MySQL wire bytes.
+#include "observer/namespace_worker_result_prototype.h"
 #include "rpc/obmysql/packet/ompk_row.h"
 #include "rpc/obmysql/packet/ompk_ok.h"
 extern "C" int64_t namespace_proto_response_deadline(int64_t);
@@ -12,8 +10,6 @@ int oceanbase::observer::ObMPBase::namespace_worker_request_prototype(
   ObSMConnection *conn = get_conn();
   if (!conn || !conn->namespace_worker_binding_ || session.get_user_id() != OB_SYS_USER_ID || session.get_in_transaction()) { return OB_NOT_SUPPORTED; }
   if (!session.is_valid() || session.is_zombie()) { return OB_ERR_SESSION_INTERRUPTED; }
-  auto *txs = data_plane::query_transaction_service();
-  SCN snapshot;
   int64_t timeout = 0;
   int ret = session.get_query_timeout(timeout);
   if (ret) { return ret; }
@@ -28,66 +24,81 @@ int oceanbase::observer::ObMPBase::namespace_worker_request_prototype(
     int64_t previous;
     ~ResponseDeadline() { namespace_proto_response_deadline(previous); }
   } response_deadline{namespace_proto_response_deadline(deadline)};
-  ret = txs ? txs->get_read_snapshot_version(THIS_WORKER.get_timeout_ts(), snapshot) : OB_NOT_INIT;
-  if (ret) { return ret; }
-  session.set_reserved_snapshot_version(snapshot);
-  struct ResetSnapshot { ObSQLSessionInfo &s; ~ResetSnapshot() { s.reset_reserved_snapshot_version(); } } reset{session};
-  Frame header;
-  ObSEArray<ObField, 8> fields;
-  bool got_header = false, got_state = false, with_rows = false;
-  uint64_t affected = 0, warnings = 0;
+  // Metadata and cell bytes are consumed synchronously while their IPC frame
+  // is alive. No schema/result cache or second SQL conversion in the gateway.
+  uint64_t columns = 0;
+  Frame terminal;
+  bool finished = false;
   ret = namespace_worker_prototype::query(*conn->namespace_worker_binding_,
-      snapshot.get_val_for_tx(), text, change_database, [&](Frame &frame) -> int {
+      text, change_database, [&](Frame &frame) -> int {
     int ret = OB_SUCCESS;
-    if (frame.type() == 'S' && !got_state && !got_header) {
-      with_rows = frame.number() != 0; affected = frame.number(); warnings = frame.number();
-      ret = apply_session_state(session, frame);
-      if (!ret && !frame.consumed()) { ret = OB_INVALID_ARGUMENT; }
-      got_state = !ret;
-    } else if (frame.type() == 'H' && got_state && with_rows && !got_header) {
-      header = std::move(frame);
-      const uint64_t count = header.number();
-      if (count == 0 || count > 64) { return OB_INVALID_ARGUMENT; }
-      ObSEArray<ObMySQLField, 8> mysql_fields;
-      for (uint64_t i = 0; !ret && i < count; ++i) {
-        ObField field; header.read(field);
-        ObMySQLField mysql;
-        if (header.ret) { ret = header.ret; }
-        else if ((ret = fields.push_back(field))) {}
-        else if ((ret = ObMySQLResultSet::to_mysql_field(field, mysql))) {}
-        else { ret = mysql_fields.push_back(mysql); }
-      }
-      if (!ret && !header.consumed()) { ret = OB_INVALID_ARGUMENT; }
-      if (!ret) { ret = packet_sender_.response_resultset_metadata(mysql_fields, true, 0xfe, 0, 2); }
-      got_header = !ret;
-    } else if (frame.type() == 'R' && got_header) {
+    if (finished) { return OB_INVALID_ARGUMENT; }
+    if (frame.type() == 'H' && !columns) {
       const uint64_t count = frame.number();
-      if (count != static_cast<uint64_t>(fields.count())) { return OB_INVALID_ARGUMENT; }
-      std::vector<ObObj> cells(count);
-      for (auto &cell : cells) {
-        frame.read(cell);
-        if (!cell.is_null() && !ob_is_numeric_type(cell.get_type()) && !ob_is_string_type(cell.get_type())) { return OB_NOT_SUPPORTED; }
+      const bool include_header = frame.number() != 0;
+      const uint8_t eof_count = frame.number();
+      const uint16_t warnings = frame.number(), status = frame.number();
+      if (count == 0 || count > 64) { return OB_INVALID_ARGUMENT; }
+      ObSEArray<ObMySQLField, 8> fields;
+      for (uint64_t i = 0; !ret && i < count; ++i) {
+        ObMySQLField field; read_field(frame, field);
+        ret = frame.ret ? frame.ret : fields.push_back(field);
       }
+      if (!ret && !frame.consumed()) { ret = OB_INVALID_ARGUMENT; }
+      if (!ret) { ret = packet_sender_.response_resultset_metadata(fields, include_header, eof_count, warnings, status); }
+      if (!ret) { columns = count; }
+    } else if (frame.type() == 'R' && columns) {
+      const uint64_t protocol = frame.number();
+      const bool packed = frame.number() != 0;
+      const uint64_t count = frame.number();
+      if (protocol != obmysql::TEXT || (packed ? count != 1 : count != columns)) { return OB_INVALID_ARGUMENT; }
+      class ProtocolRow final : public obmysql::ObMySQLRow {
+      public:
+        std::vector<obmysql::ObMySQLCellValue> cells;
+        ObString blob;
+        explicit ProtocolRow(size_t count) : ObMySQLRow(obmysql::TEXT), cells(count) {}
+        int64_t get_cells_cnt() const override { return cells.size(); }
+        int build_cell_value(int64_t index, ObIAllocator &, obmysql::ObMySQLCellValue &value) const override {
+          if (index < 0 || index >= static_cast<int64_t>(cells.size())) { return OB_INVALID_ARGUMENT; }
+          value = cells[index]; return OB_SUCCESS;
+        }
+        int get_packed_row_blob(const char *&data, int64_t &size) const override {
+          data = blob.ptr(); size = blob.length(); return OB_SUCCESS;
+        }
+      } row(count);
+      row.set_packed(packed);
+      if (packed) { row.blob = frame.string(); }
+      else { for (auto &cell : row.cells) { read_cell(frame, cell); } }
       if (!frame.consumed()) { return OB_INVALID_ARGUMENT; }
-      ObNewRow row; row.cells_ = cells.data(); row.count_ = count;
-      const ObDataTypeCastParams casts = ObBasicSessionInfo::create_dtc_params(&session);
-      ObSMRow text_row(obmysql::TEXT, row, casts, session, &fields, nullptr);
-      obmysql::OMPKRow packet(text_row);
+      obmysql::OMPKRow packet(row);
       ret = response_packet(packet);
+    } else if ((frame.type() == 'e' && columns) || (frame.type() == 'o' && !columns)) {
+      terminal = std::move(frame); finished = true;
     } else { ret = OB_INVALID_ARGUMENT; }
     return ret;
   });
-  if (!ret && (!got_state || with_rows != got_header)) { ret = OB_ERR_UNEXPECTED; }
-  if (!ret && !with_rows) {
-    obmysql::OMPKOK ok;
-    ok.set_capability(conn->cap_flags_); ok.set_use_standard_serialize(true);
-    ok.set_affected_rows(affected); ok.set_warnings(warnings);
-    obmysql::ObServerStatusFlags flags; flags.flags_ = 2; ok.set_server_status(flags);
-    ret = response_packet(ok);
+  // A native success packet is published only after D and the engine's check
+  // that the transaction has finished. Errors/uncertain commits cannot emit OK.
+  if (!ret && !finished) { ret = OB_ERR_UNEXPECTED; }
+  if (!ret && terminal.type() == 'o') {
+    ObOKPParam param;
+    param.affected_rows_ = terminal.number(); param.lii_ = terminal.number();
+    param.warnings_count_ = terminal.number(); param.has_more_result_ = terminal.number() != 0;
+    param.cursor_exist_ = terminal.number() != 0; param.send_last_row_ = terminal.number() != 0;
+    param.has_pl_out_ = terminal.number() != 0; param.take_trace_id_to_client_ = terminal.number() != 0;
+    const ObString bytes = terminal.string();
+    if (!terminal.consumed()) { ret = OB_INVALID_ARGUMENT; }
+    else {
+      std::string message(bytes.ptr(), bytes.length());
+      param.message_ = message.empty() ? nullptr : &message[0];
+      ret = packet_sender_.send_ok_packet(session, param);
+    }
   } else if (!ret) {
     obmysql::OMPKEOF eof;
-    obmysql::ObServerStatusFlags flags; flags.flags_ = 2; eof.set_server_status(flags);
-    ret = response_packet(eof);
+    eof.set_warning_count(terminal.number());
+    obmysql::ObServerStatusFlags flags; flags.flags_ = terminal.number(); eof.set_server_status(flags);
+    if (!terminal.consumed()) { ret = OB_INVALID_ARGUMENT; }
+    else { ret = response_packet(eof); }
   }
   return ret;
 }

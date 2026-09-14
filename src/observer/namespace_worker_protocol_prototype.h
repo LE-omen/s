@@ -71,7 +71,7 @@ sql::ObSQLSessionInfo *bound_session(SessionBinding *binding);
 int append_session_state(sql::ObSQLSessionInfo &session, Frame &frame);
 int apply_session_state(sql::ObSQLSessionInfo &session, Frame &frame);
 void close_session(SessionBinding *binding);
-int query(SessionBinding &binding, uint64_t snapshot, const common::ObString &sql, bool change_database,
+int query(SessionBinding &binding, const common::ObString &sql, bool change_database,
           const std::function<int(Frame &)> &response);
 void stop_all();
 } } }

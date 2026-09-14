@@ -51,7 +51,6 @@ enum class ObTxWeakReadPolicy
 // descriptor fields and logical-clock representation remain data-plane details.
 ObTxWeakReadPolicy evaluate_tx_weak_read_policy(
     const transaction::ObTxDesc &tx);
-void prepare_tx_for_statement(transaction::ObTxDesc &tx);
 void initialize_plain_insert_snapshot(
     const transaction::ObTxDesc &tx,
     transaction::ObTxReadSnapshot &snapshot);
@@ -62,7 +61,6 @@ bool tx_owns_local_temporary_tables(
 int allocate_tx_branches(transaction::ObTxDesc &tx,
                          int64_t count,
                          int16_t &first_branch_id);
-int prepare_tx_for_autocommit_retry(transaction::ObTxDesc &tx);
 
 enum class ObTxAbortReason
 {

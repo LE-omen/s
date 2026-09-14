@@ -220,6 +220,7 @@ int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&b
   if ((ret = share::server_service<sql::ObSQLSessionMgr>()->get_session(gateway.get_server_sid(), owned->gateway))) { return ret; }
   owned->ns = ns;
   Frame request('A'); request.number(gateway.get_server_sid());
+  request.number(gateway.get_capability().capability_);
   if ((ret = append_session_state(gateway, request))) { return ret; }
   bool opened = false;
   ret = exchange(*owned->channel, ns, request, nullptr, [&](Frame &reply) {
@@ -241,15 +242,15 @@ void close_session(SessionBinding *binding) {
   // remote session is unsafe. Fail this activation and wake all its callers.
   if (ret) { owned->channel->fail(); }
 }
-int query(SessionBinding &binding, uint64_t snapshot, const ObString &sql, bool change_database,
+int query(SessionBinding &binding, const ObString &sql, bool change_database,
           const std::function<int(Frame &)> &response) {
   if (binding.channel->closed) { return OB_CONNECT_ERROR; }
-  EngineWrites writes(binding.ns, binding.gateway->get_server_sid());
-  ReadScans scans(binding.ns, snapshot); // Release scans before their borrowed transaction.
+  EngineWrites writes(binding.ns, *binding.gateway);
+  ReadScans scans(binding.ns); // Release scans before their borrowed transaction.
   Frame request(change_database ? 'U' : 'Q');
   request.number(binding.slot); request.number(binding.slot_generation);
   const int64_t deadline = THIS_WORKER.get_timeout_ts();
-  request.number(snapshot); request.number(deadline); request.string(sql);
+  request.number(deadline); request.string(sql);
   if (request.ret) { return request.ret; }
   int response_ret = OB_SUCCESS;
   const int ret = exchange(*binding.channel, binding.ns, request, &scans, [&](Frame &frame) {

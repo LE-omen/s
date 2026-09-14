@@ -62,23 +62,23 @@ def run(binary):
                 if reply[:1] == b"D":
                     assert len(reply) >= 9 and struct.unpack("<q", reply[1:9])[0] == expected, (reply, base)
                     return replies
-                assert reply[:1] in (b"a", b"S", b"H", b"R"), (reply, base)
+                assert reply[:1] in (b"a", b"H", b"R", b"o", b"e"), (reply, base)
                 send(tag, b"K")
                 replies.append(reply)
 
         def query_payload(handle, sql, timeout=30):
             text = sql.encode()
-            return b"Q" + numbers(*handle, 1, time.time_ns()//1000 + int(timeout*1000000), len(text)) + text
+            return b"Q" + numbers(*handle, time.time_ns()//1000 + int(timeout*1000000), len(text)) + text
 
         def open_session(sid):
             # Invalid default DB avoids catalog requests. Seven protocol scalars:
             # client/connection/results charset, connection/DB collation, mode, timeout.
-            reply, = command(b"A" + numbers(sid, (1<<64)-1, 0, 45, 45, 45, 45, 45, 0, 30000000))
+            reply, = command(b"A" + numbers(sid, 0, (1<<64)-1, 0, 45, 45, 45, 45, 45, 0, 30000000))
             assert reply[:1] == b"a" and len(reply) == 17
             return struct.unpack("<QQ", reply[1:])
 
         def query(handle, sql, expected=0):
-            return command(query_payload(handle, sql), expected)
+            return [reply for reply in command(query_payload(handle, sql), expected) if reply[:1] == b"R"]
 
         try:
             assert receive() == ((0, 0), b"Y" + numbers(2))
@@ -114,14 +114,14 @@ def run(binary):
                     send(tag, b"K")
                     replies.setdefault(tag, []).append(reply)
             assert done.index((2,1)) < done.index((1,1)), done
-            assert replies[(2,1)][-1] == fast_row
+            assert [reply for reply in replies[(2,1)] if reply[:1] == b"R"][-1] == fast_row
 
             # Hold all credits after the first frame. Control and a different
             # session must still progress; an old request generation cannot
             # accidentally grant credit to its replacement.
             send((1,2), query_payload(reused, "SELECT @x"))
             tag, reply = receive()
-            assert tag == (1,2) and reply[:1] == b"S", (tag,reply,base)
+            assert tag == (1,2) and reply[:1] == b"H", (tag,reply,base)
             send((1,1), b"K")
             assert query(handles[0], "SELECT @x")[-1] == fast_row
             assert not select.select([proc.stdout], [], [], .2)[0], "stale credit released replacement request"
@@ -139,7 +139,7 @@ def run(binary):
                     break
                 old_rows.append(reply)
                 send(tag, b"K")
-            assert old_rows[-1] == baseline, "in-flight session was freed/rebound"
+            assert [reply for reply in old_rows if reply[:1] == b"R"][-1] == baseline, "in-flight session was freed/rebound"
             reused = replacement
             query(reused, "SET @x=17")
 
@@ -158,12 +158,8 @@ def run(binary):
             # Cancel at a native expression checkpoint, without waiting for the
             # ten-second SLEEP or the query's thirty-second deadline.
             send((4,1), query_payload(reused, "SELECT SLEEP(10),@x"))
-            while True:
-                tag, reply = receive()
-                assert tag == (4,1) and reply[:1] != b"D", (tag,reply,base)
-                send(tag, b"K")
-                if reply[:1] == b"H":
-                    break
+            # Native driver fetches the first row before exposing metadata.
+            time.sleep(.2)
             finish_cancel((4,1), -5065)
             assert query(reused, "SELECT @x")[-1] == baseline
             command(query_payload(reused, "SET @expired=999", timeout=-1), -4012)
@@ -190,13 +186,7 @@ def run(binary):
             # query must complete before either running SQL finishes.
             for tag, handle in (((5,1),reused), ((6,1),handles[0])):
                 send(tag, query_payload(handle, "SELECT SLEEP(10)"))
-            headers = set()
-            while len(headers) < 2:
-                tag, reply = receive()
-                assert tag in ((5,1),(6,1)) and reply[:1] != b"D", (tag,reply,base)
-                send(tag,b"K")
-                if reply[:1] == b"H":
-                    headers.add(tag)
+            time.sleep(.2)  # both native first-row fetches are sleeping
             send((7,1), query_payload(handles[1], "SET @queued=999", timeout=.2))
             time.sleep(.3)
             finish_cancel((7,1))

@@ -37,7 +37,7 @@ ObSyncCmdDriver::ObSyncCmdDriver(const share::ObGlobalContext &gctx,
                                  const ObSqlCtx &ctx,
                                  sql::ObSQLSessionInfo &session,
                                  ObQueryRetryCtrl &retry_ctrl,
-                                 ObMPPacketSender &sender)
+                                 ObIMPPacketSender &sender)
     : ObQueryDriver(gctx, ctx, session, retry_ctrl, sender)
 {
 }

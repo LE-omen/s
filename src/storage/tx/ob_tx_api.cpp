@@ -61,6 +61,17 @@ using namespace share;
 
 namespace transaction {
 
+int ObTransService::prepare_tx_for_statement(ObTxDesc &tx)
+{
+  tx.clear_interrupt();
+  return OB_SUCCESS;
+}
+
+int ObTransService::prepare_tx_for_autocommit_retry(ObTxDesc &tx)
+{
+  return tx.clear_state_for_autocommit_retry();
+}
+
 inline int ObTransService::init_tx_(ObTxDesc &tx,
                                     const uint32_t session_id)
 {
@@ -1735,11 +1746,6 @@ ObTxWeakReadPolicy evaluate_tx_weak_read_policy(const transaction::ObTxDesc &tx)
   return policy;
 }
 
-void prepare_tx_for_statement(transaction::ObTxDesc &tx)
-{
-  tx.clear_interrupt();
-}
-
 void initialize_plain_insert_snapshot(
     const transaction::ObTxDesc &tx,
     transaction::ObTxReadSnapshot &snapshot)
@@ -1763,11 +1769,6 @@ int allocate_tx_branches(transaction::ObTxDesc &tx,
                          int16_t &first_branch_id)
 {
   return tx.alloc_branch_id(count, first_branch_id);
-}
-
-int prepare_tx_for_autocommit_retry(transaction::ObTxDesc &tx)
-{
-  return tx.clear_state_for_autocommit_retry();
 }
 
 static int transaction_abort_cause_(ObTxAbortReason reason)

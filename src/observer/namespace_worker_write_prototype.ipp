@@ -132,15 +132,17 @@ struct EngineWrite {
 // session-owned engine transaction. No transaction map or background collector.
 struct EngineWrites {
   uint64_t ns;
+  sql::ObSQLSessionInfo &session;
   uint32_t sid;
   ObTxDesc *tx = nullptr;
   uint64_t sequence = 0;
   std::unique_ptr<EngineWrite> write;
-  explicit EngineWrites(uint64_t namespace_id, uint32_t session_id) : ns(namespace_id), sid(session_id) {}
+  explicit EngineWrites(uint64_t namespace_id, sql::ObSQLSessionInfo &s) : ns(namespace_id), session(s), sid(s.get_server_sid()) {}
   int check_finished() const {
     return write || (tx && tx->is_in_tx() && !tx->is_tx_end()) ? OB_ERR_UNEXPECTED : OB_SUCCESS;
   }
   ~EngineWrites() {
+    session.reset_reserved_snapshot_version();
     write.reset();
     if (tx) {
       auto *service = query_transaction_service();
@@ -156,13 +158,18 @@ struct EngineWrites {
     const uint64_t txid = request.number();
     int ret = request.ret;
     Frame values;
-    if (!ret && !tx && request.type() == 'T' && (operation == 'A' || operation == 'P')) {
+    if (!ret && !tx && request.type() == 'T' && (operation == 'A' || operation == 'S')) {
       ret = service->acquire_tx(tx, sid);
     }
     if (!ret && (!tx || static_cast<uint64_t>(tx->get_tx_id().get_id()) != txid)) { ret = OB_INVALID_ARGUMENT; }
     if (!ret && request.type() == 'T') {
       if (operation == 'A') {
         if (!request.consumed()) { ret = OB_INVALID_ARGUMENT; }
+      } else if (operation == 'S' || operation == 'N' || operation == 'U') {
+        if (!request.consumed() || write) { ret = OB_INVALID_ARGUMENT; }
+        else if (operation == 'S') { ret = service->prepare_tx_for_statement(*tx); }
+        else if (operation == 'N') { ret = service->prepare_tx_for_autocommit_retry(*tx); }
+        else { ret = service->reuse_tx(*tx); }
       } else if (operation == 'P') {
         ObTxParam param; ObTxSEQ savepoint;
         request.read(param); const bool release = request.number() != 0;
@@ -175,6 +182,7 @@ struct EngineWrites {
         ObTxReadSnapshot snapshot;
         if (!request.consumed() || isolation != ObTxIsolationLevel::RC) { ret = OB_NOT_SUPPORTED; }
         else { ret = service->get_read_snapshot(*tx, isolation, std::min(deadline, THIS_WORKER.get_timeout_ts()), snapshot); }
+        if (!ret) { session.set_reserved_snapshot_version(snapshot.core_.version_); }
         values.append(snapshot);
       } else if (operation == 'C') {
         const int64_t deadline = request.number();
@@ -268,7 +276,9 @@ public:
                                int64_t expire_ts,
                                transaction::ObITxCallback &callback) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX submit_commit_tx\n"); return OB_NOT_SUPPORTED; }
   int release_tx(transaction::ObTxDesc &tx) override { delete &tx; return OB_SUCCESS; }
-  int reuse_tx(transaction::ObTxDesc &tx) override { tx.~ObTxDesc(); new (&tx) ObTxDesc(); return OB_SUCCESS; }
+  int reuse_tx(transaction::ObTxDesc &tx) override { Frame request, reply; return tx_rpc('U', tx, request, reply); }
+  int prepare_tx_for_statement(transaction::ObTxDesc &tx) override { Frame request, reply; return tx_rpc('S', tx, request, reply); }
+  int prepare_tx_for_autocommit_retry(transaction::ObTxDesc &tx) override { Frame request, reply; return tx_rpc('N', tx, request, reply); }
   int interrupt(transaction::ObTxDesc &tx, int cause) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX interrupt\n"); return OB_NOT_SUPPORTED; }
   int get_read_snapshot(transaction::ObTxDesc &tx,
                                 transaction::ObTxIsolationLevel isolation_level,

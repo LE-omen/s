@@ -39,7 +39,7 @@ class ObQueryRetryCtrl;
 namespace observer
 {
 
-class ObMPPacketSender;
+class ObIMPPacketSender;
 class ObMySQLResultSet;
 class ObQueryDriver
 {
@@ -50,7 +50,7 @@ public:
                 const sql::ObSqlCtx &ctx,
                 sql::ObSQLSessionInfo &session,
                 sql::ObQueryRetryCtrl &retry_ctrl,
-                ObMPPacketSender &sender)
+                ObIMPPacketSender &sender)
     : gctx_(gctx),
       ctx_(ctx),
       session_(session),
@@ -70,7 +70,7 @@ public:
                                     bool has_more_result,
                                     bool &can_retry,
                                     int64_t fetch_limit  = common::OB_INVALID_COUNT);
-  ObMPPacketSender& get_packet_sender() { return sender_; }
+  ObIMPPacketSender& get_packet_sender() { return sender_; }
   int response_query_header(const ColumnsFieldIArray &fields,
                                     bool has_more_result = false,
                                     bool need_set_ps_out = false,
@@ -114,7 +114,7 @@ protected:
   const sql::ObSqlCtx &ctx_;
   sql::ObSQLSessionInfo &session_;
   sql::ObQueryRetryCtrl &retry_ctrl_;
-  ObMPPacketSender &sender_;
+  ObIMPPacketSender &sender_;
   /* const */
   /* disallow copy & assign */
   DISALLOW_COPY_AND_ASSIGN(ObQueryDriver);
