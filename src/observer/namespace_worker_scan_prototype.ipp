@@ -91,6 +91,12 @@ struct ReadScans {
   std::map<uint64_t, std::unique_ptr<EngineScan>> scans;
   uint64_t sequence = 0;
   ReadScans(uint64_t n, uint64_t s) : ns(n), snapshot(s) {}
+  ~ReadScans() {
+    const size_t remaining = scans.size();
+    scans.clear();
+    fprintf(stderr, "PROTOTYPE_V13_SCANS_RELEASED ns=%llu remaining=%zu\n",
+        (unsigned long long)ns, remaining);
+  }
   int process(Frame &request, Frame &reply) {
     int ret = OB_SUCCESS;
     reply = Frame('s');

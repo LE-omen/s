@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""V12 IPC admission/concurrency probe: slot reuse, stale generations, invalid handles.
+"""V13 IPC deadline/cancellation probe: slot reuse, stale generations, invalid handles.
 
 python3 tools/obtest/namespace_worker_handles_prototype.py --binary build_release/src/observer/seekdb
 No engine/table reads: complements the real MySQL integration probe.
@@ -36,13 +36,13 @@ def run(binary):
 
         def read():
             magic, size = struct.unpack("<4sI", read_exact(8))
-            assert magic == b"NS12" and 0 < size <= 256*1024
+            assert magic == b"NS13" and 0 < size <= 256*1024
             return read_exact(size)
 
         sequence = 0
         def send(tag, payload):
             frame = payload[:1] + numbers(*tag) + payload[1:]
-            proc.stdin.write(b"NS12" + struct.pack("<I", len(frame)) + frame)
+            proc.stdin.write(b"NS13" + struct.pack("<I", len(frame)) + frame)
             proc.stdin.flush()
 
         def receive():
@@ -60,15 +60,15 @@ def run(binary):
                 actual, reply = receive()
                 assert actual == tag, (actual, tag, base)
                 if reply[:1] == b"D":
-                    assert len(reply) == 9 and struct.unpack("<q", reply[1:])[0] == expected, (reply, base)
+                    assert len(reply) >= 9 and struct.unpack("<q", reply[1:9])[0] == expected, (reply, base)
                     return replies
                 assert reply[:1] in (b"a", b"S", b"H", b"R"), (reply, base)
                 send(tag, b"K")
                 replies.append(reply)
 
-        def query_payload(handle, sql):
+        def query_payload(handle, sql, timeout=30):
             text = sql.encode()
-            return b"Q" + numbers(*handle, 1, len(text)) + text
+            return b"Q" + numbers(*handle, 1, time.time_ns()//1000 + int(timeout*1000000), len(text)) + text
 
         def open_session(sid):
             # Invalid default DB avoids catalog requests. Seven protocol scalars:
@@ -108,7 +108,7 @@ def run(binary):
                 assert tag in ((1,1), (2,1), (3,1)), (tag, base)
                 if reply[:1] == b"D":
                     expected = -4023 if tag == (3,1) else 0
-                    assert struct.unpack("<q", reply[1:])[0] == expected, (tag,reply,base)
+                    assert struct.unpack("<q", reply[1:9])[0] == expected, (tag,reply,base)
                     done.append(tag)
                 else:
                     send(tag, b"K")
@@ -135,17 +135,89 @@ def run(binary):
                 tag, reply = receive()
                 assert tag == (1,2), tag
                 if reply[:1] == b"D":
-                    assert struct.unpack("<q", reply[1:])[0] == 0, (reply,base)
+                    assert struct.unpack("<q", reply[1:9])[0] == 0, (reply,base)
                     break
                 old_rows.append(reply)
                 send(tag, b"K")
             assert old_rows[-1] == baseline, "in-flight session was freed/rebound"
             reused = replacement
+            query(reused, "SET @x=17")
+
+            def finish_cancel(tag, reason=-4012):
+                started = time.monotonic()
+                send(tag, b"Z" + numbers((1<<64)+reason))
+                while True:
+                    actual, reply = receive()
+                    assert actual == tag, (actual, tag, base)
+                    if reply[:1] == b"D":
+                        assert struct.unpack("<q", reply[1:9])[0] == reason, (reply,base)
+                        assert time.monotonic()-started < 2, "cancel did not interrupt execution"
+                        return
+                    send(tag, b"K")
+
+            # Cancel at a native expression checkpoint, without waiting for the
+            # ten-second SLEEP or the query's thirty-second deadline.
+            send((4,1), query_payload(reused, "SELECT SLEEP(10),@x"))
+            while True:
+                tag, reply = receive()
+                assert tag == (4,1) and reply[:1] != b"D", (tag,reply,base)
+                send(tag, b"K")
+                if reply[:1] == b"H":
+                    break
+            finish_cancel((4,1), -5065)
+            assert query(reused, "SELECT @x")[-1] == baseline
+            command(query_payload(reused, "SET @expired=999", timeout=-1), -4012)
+            assert query(reused, "SELECT @expired")[-1] != query(reused, "SELECT 999")[-1]
+
+            # Same slot, new generation: stale cancel/credit must have no effect.
+            send((4,2), query_payload(reused, "SELECT @x"))
+            assert receive()[0] == (4,2)  # withhold the first frame's credit
+            send((4,1), b"Z" + numbers((1<<64)-4012))
+            send((4,1), b"K")
+            assert query(handles[0], "SELECT @x")[-1] == fast_row
+            assert not select.select([proc.stdout], [], [], .2)[0]
+            finish_cancel((4,2))  # wakes the credit wait; D needs no credit
+
+            # A worker blocked on a catalog RPC is also cancellable without a
+            # reply from storage. No fake catalog is needed for this probe.
+            send((4,3), query_payload(reused, "USE missing_db"))
+            tag, reply = receive()
+            assert tag == (4,3) and reply[:1] in (b"d",b"b",b"t",b"i"), (tag,reply,base)
+            send(tag, b"K")
+            finish_cancel(tag)
+
+            # Fill both execution threads; cancellation of the queued third
+            # query must complete before either running SQL finishes.
+            for tag, handle in (((5,1),reused), ((6,1),handles[0])):
+                send(tag, query_payload(handle, "SELECT SLEEP(10)"))
+            headers = set()
+            while len(headers) < 2:
+                tag, reply = receive()
+                assert tag in ((5,1),(6,1)) and reply[:1] != b"D", (tag,reply,base)
+                send(tag,b"K")
+                if reply[:1] == b"H":
+                    headers.add(tag)
+            send((7,1), query_payload(handles[1], "SET @queued=999", timeout=.2))
+            time.sleep(.3)
+            finish_cancel((7,1))
+            finish_cancel((5,1))
+            finish_cancel((6,1))
+            assert query(handles[1], "SELECT @queued")[-1] != query(handles[1], "SELECT 999")[-1]
+            assert query(reused, "SELECT @x")[-1] == baseline
+            for generation in range(4,14):
+                send((4,generation), query_payload(reused, "SELECT @x"))
+                tag, reply = receive()
+                assert tag == (4,generation)
+                finish_cancel(tag)
+                # A completed cancel remains harmless even after a session's
+                # next query has started on another request slot.
+                send(tag, b"Z" + numbers((1<<64)-4012))
+                assert query(reused, "SELECT @x")[-1] == baseline
             for handle in [reused] + handles:
                 command(b"C" + numbers(*handle))
             command(b"C" + numbers(*reused), -5066)
             assert "active=0 slots=17" in (base / "process.out").read_text()
-            print(f"PASS: concurrent execution, bounded credits, control progress, in-flight close/reuse, stale handles, active=0; {base}")
+            print(f"PASS: execution/credit/RPC/queued cancellation, stale cancellation, repeated reuse, concurrency, active=0; {base}")
         finally:
             proc.stdin.close()
             try:

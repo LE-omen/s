@@ -1,21 +1,43 @@
-//! Throwaway V12 process transport. Bounded framed child pipes prove the real
+//! Throwaway V13 process transport. Bounded framed child pipes prove the real
 //! SQL/storage split first. This synchronous adapter is not the planned Mio IPC
 //! reactor and does not establish a high-concurrency performance claim.
+use std::cell::Cell;
 use std::ffi::c_void;
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_FRAME: usize = 256 * 1024;
+
+thread_local! {
+    static RESPONSE_DEADLINE: Cell<i64> = const { Cell::new(0) };
+}
+
+// The native request thread scopes this around namespace result delivery. No
+// deadline/cache is attached to connections or to the common NIO reactor.
+#[no_mangle]
+pub extern "C" fn namespace_proto_response_deadline(deadline_us: i64) -> i64 {
+    RESPONSE_DEADLINE.with(|deadline| deadline.replace(deadline_us))
+}
+
+pub(crate) fn response_expired() -> bool {
+    RESPONSE_DEADLINE.with(|deadline| {
+        let deadline = deadline.get();
+        deadline > 0
+            && SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .is_ok_and(|now| now.as_micros() >= deadline as u128)
+    })
+}
 
 fn read_frame(input: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut header = [0; 8];
     input.read_exact(&mut header)?;
     let len = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
-    if header[..4] != *b"NS12" || len == 0 || len > MAX_FRAME {
+    if header[..4] != *b"NS13" || len == 0 || len > MAX_FRAME {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid worker frame",
@@ -34,7 +56,7 @@ fn write_frame(output: &mut impl Write, payload: &[u8]) -> io::Result<()> {
         ));
     }
     let mut header = [0; 8];
-    header[..4].copy_from_slice(b"NS12");
+    header[..4].copy_from_slice(b"NS13");
     header[4..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
     output.write_all(&header)?;
     output.write_all(payload)?;

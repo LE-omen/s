@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Throwaway V12: connection sessions, two real SQL-only workers, one engine.
+"""Throwaway V13: query deadlines/cancellation, two SQL-only workers, one engine.
 
 SEEKDB_FORK_PROTOTYPE_TEST_ROOT=/tmp python3 tools/obtest/namespace_sql_worker_prototype.py --binary build_release/src/observer/seekdb
 Linux integration probe. No claim of Windows/macOS or high-concurrency validation.
@@ -211,6 +211,112 @@ class WorkerExperiment(LineageExperiment):
         finally:
             slow.close()
 
+    def run_timeouts(self, first, second):
+        pid = self.worker_pid(self.b)
+        directory = max((self.base / "run").glob(f"namespace-worker-{self.b}-*"),
+                        key=lambda path: int(path.name.rsplit("-", 1)[1]))
+        def worker_log():
+            return (directory / "process.out").read_text(errors="replace")
+        def expect_timeout(future):
+            try:
+                future.result(timeout=5)
+            except pymysql.MySQLError as error:
+                assert error.args[0] == 4012, error.args
+                return error.args
+            raise AssertionError("query exceeded its deadline without an error")
+
+        # A real interval longer than the removed IPC limit. B must progress
+        # while A sends no rows for 31 seconds, and A must then succeed.
+        self.sql("SET ob_query_timeout=40000000", first)
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self.sql, "SELECT SLEEP(31),@x,v FROM t1 WHERE id=1", first)
+            time.sleep(.3)
+            assert self.sql("SELECT @x,v FROM t1 WHERE id=1", second) == ((29,90),)
+            assert not pending.done()
+            assert pending.result(timeout=38) == ((0,17,90),)
+        self.record("query_exceeds_old_30_second_ipc_limit", seconds=time.monotonic()-started, pid=pid)
+
+        self.sql("SET ob_query_timeout=500000", first)
+        for attempt in range(5):
+            started = time.monotonic()
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pending = pool.submit(self.sql, "SELECT SLEEP(10)+v FROM t1 WHERE id=1", first)
+                assert self.sql("SELECT @x,v FROM t1 WHERE id=1", second) == ((29,90),)
+                error = expect_timeout(pending)
+            elapsed = time.monotonic()-started
+            assert .3 < elapsed < 2, elapsed
+            assert self.sql("SELECT @x,v FROM t1 WHERE id=1", first) == ((17,90),)
+            assert self.worker_pid(self.b) == pid and Path(f"/proc/{pid}").exists()
+            self.record("query_timeout_keeps_session_and_worker", attempt=attempt, seconds=elapsed, error=error)
+        assert f"PROTOTYPE_V13_SCANS_RELEASED ns={self.b} remaining=1" in self.engine_log()
+
+        queued = self.worker_connect(self.b)
+        try:
+            self.sql("SET ob_query_timeout=500000", queued)
+            self.sql("SET ob_query_timeout=10000000", first)
+            self.sql("SET ob_query_timeout=10000000", second)
+            offset = len(worker_log())
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                a = pool.submit(self.sql, "SELECT SLEEP(3)", first)
+                b = pool.submit(self.sql, "SELECT SLEEP(3)", second)
+                self.wait_until(lambda: all(re.search(rf"PROTOTYPE_V12_EXECUTE_BEGIN .*session={sid}\n",
+                                                      worker_log()[offset:])
+                                            for sid in (first.thread_id(),second.thread_id())),
+                                "both execution threads did not start")
+                started = time.monotonic()
+                c = pool.submit(self.sql, "SET @queued=999", queued)
+                expect_timeout(c)
+                elapsed = time.monotonic()-started
+                assert elapsed < 2 and not a.done() and not b.done(), elapsed
+                a.result(timeout=5); b.result(timeout=5)
+            assert self.sql("SELECT @queued", queued) == ((None,),)
+            assert self.sql("SELECT 1", queued) == ((1,),)
+            assert self.worker_pid(self.b) == pid
+            self.record("queued_timeout_does_not_wait_for_executor", seconds=elapsed, statement_not_executed=True)
+        finally:
+            queued.close()
+
+    def run_slow_client_timeout(self, healthy):
+        assert self.sql("SELECT REPEAT('x',65536)", log=False) == (("x"*65536,),)
+        assert self.sql("SELECT REPEAT('x',65536)", healthy, log=False) == (("x"*65536,),)
+        slow = self.worker_connect(self.b)
+        pid = self.worker_pid(self.b)
+        directory = max((self.base / "run").glob(f"namespace-worker-{self.b}-*"),
+                        key=lambda path: int(path.name.rsplit("-", 1)[1]))
+        log = directory / "process.out"
+        offset = len(log.read_text(errors="replace"))
+        try:
+            self.sql("SET ob_query_timeout=2000000", slow)
+            # Exclude the SET completion from the cancellation evidence.
+            offset = len(log.read_text(errors="replace"))
+            before = self.engine_log().count(f"PROTOTYPE_V13_SCANS_RELEASED ns={self.b} ")
+            slow._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            started = time.monotonic()
+            slow._execute_command(3, "SELECT id,REPEAT('x',65536) FROM t1 ORDER BY id")
+            self.wait_until(lambda: re.search(rf"PROTOTYPE_V12_EXECUTE_END .*session={slow.thread_id()} ret=-4012",
+                                              log.read_text(errors="replace")[offset:]),
+                            "slow client kept execution alive after deadline")
+            self.wait_until(lambda: self.engine_log().count(f"PROTOTYPE_V13_SCANS_RELEASED ns={self.b} ") > before,
+                            "slow client kept gateway scans alive after deadline")
+            elapsed = time.monotonic()-started
+            assert elapsed < 5, elapsed
+            assert self.sql("SELECT 1", healthy) == ((1,),)
+            # Resume reading: already sent rows followed by ERR must form a
+            # valid MySQL response so this same connection can be reused.
+            slow._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024*1024)
+            try:
+                slow._read_query_result(unbuffered=False)
+            except pymysql.MySQLError as error:
+                assert error.args[0] == 4012, error.args
+            else:
+                raise AssertionError("slow client query did not time out")
+            assert self.sql("SELECT 1", slow) == ((1,),)
+            assert self.worker_pid(self.b) == pid
+            self.record("slow_client_timeout_releases_scans_and_keeps_session", seconds=elapsed, pid=pid)
+        finally:
+            slow.close()
+
     def run_workers(self):
         self.setup_lineage()
         c, _ = self.capture("b", "c")
@@ -230,6 +336,7 @@ class WorkerExperiment(LineageExperiment):
             assert self.sql("SELECT id,v FROM t1 WHERE id=1", cconn) == ((1,10),)
             self.run_sessions(bconn, stale)
             self.run_concurrency(bconn, stale)
+            self.run_timeouts(bconn, stale)
             for query in ("UPDATE t1 SET v=1", "SELECT * FROM __fork_ns_3__db1.t1" if self.b != 3 else "SELECT * FROM __fork_ns_2__db1.t1"):
                 try:
                     self.sql(query, bconn)
@@ -293,6 +400,7 @@ class WorkerExperiment(LineageExperiment):
             assert self.sql("SELECT id FROM t1 WHERE v<0", reconnect) == ()
             self.record("bounded_scan_batches_and_worker_filter_sort", rows=len(extra), batch_limit=32)
             self.run_slow_client(reconnect)
+            self.run_slow_client_timeout(reconnect)
             assert self.root("b") and self.root("c")
             for pid in (self.worker_pid(self.b), cp):
                 status = Path(f"/proc/{pid}/status").read_text()
@@ -325,13 +433,25 @@ class WorkerExperiment(LineageExperiment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
+    parser.add_argument("--case", choices=("full", "slow-timeout"), default="full")
     args = parser.parse_args()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.environ["SEEKDB_NAMESPACE_SQL_WORKER_PROTOTYPE"] = "1"
-    experiment = WorkerExperiment(args.binary, "concurrency_v12", prototype=6)
+    experiment = WorkerExperiment(args.binary, "timeout_v13", prototype=6)
     try:
         experiment.start()
-        experiment.run_workers()
+        if args.case == "slow-timeout":
+            experiment.setup_lineage()
+            experiment.sql("INSERT INTO " + experiment.table(experiment.b, "db1.t1") + " VALUES" +
+                           ",".join(f"({i},{i*10})" for i in range(3,99)))
+            conn = experiment.worker_connect(experiment.b)
+            try:
+                for _ in range(5):
+                    experiment.run_slow_client_timeout(conn)
+            finally:
+                conn.close()
+        else:
+            experiment.run_workers()
     finally:
         experiment.close()
 

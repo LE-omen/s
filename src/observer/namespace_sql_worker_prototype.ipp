@@ -1,4 +1,4 @@
-// Throwaway V12 SQL-only composition. Included by ob_server.cpp so the prototype
+// Throwaway V13 SQL-only composition. Included by ob_server.cpp so the prototype
 // can reuse the existing composition owner without a second server object graph.
 #include "sql/plan_cache/ob_plan_cache.h"
 #include "sql/plan_cache/ob_ps_cache.h"
@@ -14,6 +14,7 @@
 #include "sql/resolver/cmd/ob_variable_set_stmt.h"
 #include "sql/resolver/ddl/ob_use_database_stmt.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
+#include "observer/mysql/ob_query_driver.h"
 
 namespace oceanbase { namespace observer {
 int ObServer::namespace_sql_worker_prototype(const char *query)
@@ -138,15 +139,25 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     }
     return ret;
   };
-  auto execute = [&](SessionOwner &owner, const ObString &text, uint64_t snapshot) -> int {
+  // Native expression/operator checkpoints dispatch through THIS_WORKER. The
+  // base lib::Worker used by a plain thread does not check SQL timeout/cancel.
+  class RequestWorker final : public lib::Worker {
+  public:
+    int check_status() override {
+      int ret = worker_request ? worker_request->status() : OB_SUCCESS;
+      if (!ret && get_session()) { get_session()->is_terminate(ret); }
+      if (!ret && is_timeout()) { ret = OB_TIMEOUT; }
+      return ret ? ret : lib::Worker::check_status();
+    }
+  };
+  auto execute = [&](SessionOwner &owner, const ObString &text, uint64_t snapshot, int64_t deadline) -> int {
     int ret = OB_SUCCESS;
     ObArenaAllocator allocator(ObMemAttr("WorkerProto"));
     ObSQLSessionInfo *session = &owner.session;
     session->set_query_start_time(ObTimeUtility::current_time());
-    int64_t timeout = 0;
-    WORKER_STEP(session->get_query_timeout(timeout));
-    THIS_WORKER.set_timeout_ts(ObTimeUtility::current_time() + timeout);
+    THIS_WORKER.set_timeout_ts(deadline);
     THIS_WORKER.set_session(session);
+    ret = THIS_WORKER.check_status();
     struct FinishRequest {
       ObSQLSessionInfo &session;
       ~FinishRequest() {
@@ -237,9 +248,14 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       if (serve) {
         Frame output('R'); output.number(row->get_count());
         for (int64_t i = 0; i < row->get_count(); ++i) {
-          const ObObj &value = row->get_cell(i);
+          ObObj value = row->get_cell(i);
           if (!value.is_null() && !ob_is_numeric_type(value.get_type()) && !ob_is_string_type(value.get_type())) { ret = OB_NOT_SUPPORTED; break; }
-          output.append(value);
+          // REPEAT and other large string expressions return LOB values with an
+          // internal header. Reuse the normal MySQL result conversion before IPC.
+          if (value.is_lob()) {
+            ret = ObQueryDriver::process_lob_locator_results(value, &allocator, session, &result->get_exec_context());
+          }
+          if (!ret) { output.append(value); }
         }
         if (!ret) { ret = worker_send(output); }
       } else {
@@ -257,7 +273,13 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   if (!serve) {
     SessionOwner owner;
     ret = initialize(owner, 1, nullptr);
-    return ret ? ret : execute(owner, ObString::make_string(query), 0);
+    int64_t timeout = 0;
+    if (!ret) { ret = owner.session.get_query_timeout(timeout); }
+    RequestWorker request_worker;
+    lib::Worker::set_worker_to_thread_local(&request_worker);
+    if (!ret) { ret = execute(owner, ObString::make_string(query), 0, ObTimeUtility::current_time() + timeout); }
+    lib::Worker::set_worker_to_thread_local(&worker);
+    return ret;
   }
   struct Job {
     Frame input;
@@ -269,14 +291,24 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   std::condition_variable jobs_changed;
   std::deque<Job> jobs;
   bool stopping = false;
-  auto complete = [&](const std::shared_ptr<PendingRequest> &request, int result) {
+  auto complete = [&](const std::shared_ptr<PendingRequest> &request, int result, SessionOwner *owner = nullptr) {
+    if (owner && !result) { result = request->status(); }
+    Frame done('D'); done.tag(request->tag); done.number(result);
+    if (owner) {
+      if (append_session_state(owner->session, done)) { std::_Exit(1); }
+      owner->running = false;
+    }
     // Release before publishing D: the peer may immediately reuse this slot.
     requests.release(request->tag);
-    Frame done('D'); done.tag(request->tag); done.number(result);
+    fprintf(stderr, "PROTOTYPE_V13_DONE request=%llu generation=%llu ret=%d\n",
+        (unsigned long long)request->tag.slot, (unsigned long long)request->tag.generation, result);
     if (worker_send_wire(std::move(done))) { std::_Exit(1); }
   };
   PrototypeThreads executors(concurrency, [&] {
     lib::set_thread_name("NsSQLExecute");
+    lib::Worker *previous = &THIS_WORKER;
+    RequestWorker request_worker;
+    lib::Worker::set_worker_to_thread_local(&request_worker);
     for (;;) {
       Job job;
       {
@@ -286,6 +318,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         job = std::move(jobs.front()); jobs.pop_front();
       }
       worker_request = job.request.get();
+      THIS_WORKER.set_timeout_ts(job.request->deadline);
       Frame &input = job.input;
       int result = OB_SUCCESS;
       if (input.type() == 'A') {
@@ -309,6 +342,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         }
       } else {
         const uint64_t snapshot = input.number();
+        const int64_t deadline = static_cast<int64_t>(input.number());
         ObString sql = input.string();
         std::string use_statement;
         if (!input.consumed()) { result = OB_INVALID_ARGUMENT; }
@@ -324,12 +358,13 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         fprintf(stderr, "PROTOTYPE_V12_EXECUTE_BEGIN request=%llu generation=%llu session=%u\n",
             (unsigned long long)job.request->tag.slot, (unsigned long long)job.request->tag.generation,
             job.owner->session.get_server_sid());
-        if (!result) { result = execute(*job.owner, sql, snapshot); }
-        job.owner->running = false;
+        if (!result) { result = execute(*job.owner, sql, snapshot, deadline); }
       }
-      complete(job.request, result);
+      complete(job.request, result, job.owner.get());
       worker_request = nullptr;
+      THIS_WORKER.set_timeout_ts(INT64_MAX);
     }
+    lib::Worker::set_worker_to_thread_local(previous);
   });
   if ((ret = executors.start())) { return ret; }
   fprintf(stderr, "PROTOTYPE_V12_EXECUTORS count=%lld max_requests=%zu\n", (long long)concurrency, MAX_REQUESTS);
@@ -339,6 +374,25 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     if ((ret = worker_read_wire(input))) { break; }
     const RequestTag tag = input.tag();
     if (input.ret || !tag.generation || tag.slot >= MAX_REQUESTS) { ret = OB_INVALID_ARGUMENT; break; }
+    if (input.type() == 'Z') {
+      const int reason = static_cast<int>(input.number());
+      if (!input.consumed() || (reason != OB_TIMEOUT && reason != OB_ERR_QUERY_INTERRUPTED)) {
+        ret = OB_INVALID_ARGUMENT; break;
+      }
+      auto request = requests.find(tag);
+      if (!request || !request->cancellable) { continue; }
+      request->cancel(reason);
+      std::optional<Job> queued;
+      {
+        std::lock_guard<std::mutex> guard(jobs_mutex);
+        for (auto it = jobs.begin(); it != jobs.end(); ++it) {
+          if (it->request == request) { queued = std::move(*it); jobs.erase(it); break; }
+        }
+      }
+      // Queued cancellation must not wait for an execution thread to become free.
+      if (queued) { complete(request, reason, queued->owner.get()); }
+      continue;
+    }
     if (input.type() == 'K' || input.type() == 'c' || input.type() == 's') {
       auto request = requests.find(tag);
       if (request) { ret = request->post(std::move(input)); }
@@ -373,7 +427,16 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         owner.reset(); complete(request, result); continue;
       }
     } else if (input.type() != 'A') { result = OB_NOT_SUPPORTED; }
-    if (result) { complete(request, result); continue; }
+    if (!result && owner) {
+      const int64_t saved = input.pos;
+      input.number(); // snapshot
+      const uint64_t deadline = input.number();
+      if (input.ret || !deadline || deadline > INT64_MAX) { result = OB_INVALID_ARGUMENT; }
+      else { request->deadline = static_cast<int64_t>(deadline); request->cancellable = true; }
+      input.pos = saved;
+      if (!result) { result = request->status(); }
+    }
+    if (result) { complete(request, result, owner.get()); continue; }
     {
       std::lock_guard<std::mutex> guard(jobs_mutex);
       jobs.push_back(Job{std::move(input), request, owner});

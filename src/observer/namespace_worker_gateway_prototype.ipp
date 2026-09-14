@@ -133,24 +133,42 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   return reply.ret;
 }
 int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
-             const std::function<int(Frame &)> &response) {
-  auto pending = channel.routes.allocate(request.type() != 'Q' && request.type() != 'U');
+             const std::function<int(Frame &)> &response, int64_t deadline = INT64_MAX) {
+  const bool query = request.type() == 'Q' || request.type() == 'U';
+  auto pending = channel.routes.allocate(!query);
   if (!pending) { return channel.closed ? OB_CONNECT_ERROR : OB_EAGAIN; }
+  pending->deadline = query ? deadline : ObTimeUtility::current_time() + 30L * 1000000;
   struct Release { RequestRoutes &routes; RequestTag tag; ~Release() { routes.release(tag, true); } } release{channel.routes, pending->tag};
   request.tag(pending->tag);
   int ret = channel.send(request);
+  int cancelled = OB_SUCCESS;
+  auto cancel = [&](int reason) {
+    cancelled = reason;
+    Frame message('Z'); message.tag(pending->tag);
+    message.number(reason == OB_TIMEOUT ? OB_TIMEOUT : OB_ERR_QUERY_INTERRUPTED);
+    fprintf(stderr, "PROTOTYPE_V13_CANCEL request=%llu generation=%llu ret=%d\n",
+        (unsigned long long)pending->tag.slot, (unsigned long long)pending->tag.generation, reason);
+    return channel.send(message);
+  };
   while (!ret) {
     Frame reply;
-    if ((ret = pending->take(reply))) { break; }
+    ret = pending->take(reply, cancelled != OB_SUCCESS);
+    if (ret == OB_TIMEOUT && query && !cancelled) { ret = cancel(ret); continue; }
+    if (ret) { break; }
     if (reply.type() == 'D') {
       const int query_ret = static_cast<int>(reply.number());
+      // Terminal scalar state also covers SET that completed just as cancellation
+      // arrived. It must be applied even when result delivery was interrupted.
+      if (query && !reply.ret && !reply.consumed()) { ret = response(reply); }
+      if (ret) { break; }
       if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; break; }
-      return query_ret;
+      return cancelled ? cancelled : query_ret;
     }
     // One buffered reply per request, independent of every other request. Give
     // its credit back after taking ownership, before doing SQL/storage work.
     Frame credit('K'); credit.tag(pending->tag);
     if ((ret = channel.send(credit))) { break; }
+    if (cancelled) { continue; } // Keep ownership until D; no new storage work.
     if (reply.type() == 'd' || reply.type() == 'b' || reply.type() == 't' || reply.type() == 'i') {
       Frame result; ret = catalog(ns, reply, result); result.tag(pending->tag);
       if (!ret) { ret = channel.send(result); }
@@ -158,6 +176,7 @@ int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
       Frame result; ret = scans->process(reply, result); result.tag(pending->tag);
       if (!ret) { ret = channel.send(result); }
     } else { ret = response(reply); }
+    if (ret && query && !channel.closed) { ret = cancel(ret); }
   }
   channel.fail(); return ret;
 }
@@ -222,10 +241,12 @@ int query(SessionBinding &binding, uint64_t snapshot, const ObString &sql, bool 
   ReadScans scans(binding.ns, snapshot);
   Frame request(change_database ? 'U' : 'Q');
   request.number(binding.slot); request.number(binding.slot_generation);
-  request.number(snapshot); request.string(sql);
+  const int64_t deadline = THIS_WORKER.get_timeout_ts();
+  request.number(snapshot); request.number(deadline); request.string(sql);
   if (request.ret) { return request.ret; }
   int response_ret = OB_SUCCESS;
   const int ret = exchange(*binding.channel, binding.ns, request, &scans, [&](Frame &frame) {
+    if (frame.type() == 'D') { return apply_session_state(*binding.gateway, frame); }
     if (!response_ret) {
       response_ret = response(frame);
       if (response_ret) {
@@ -233,8 +254,11 @@ int query(SessionBinding &binding, uint64_t snapshot, const ObString &sql, bool 
             (unsigned long long)binding.ns, (unsigned long long)binding.slot, response_ret);
       }
     }
-    return OB_SUCCESS;
-  });
+    // Worker::is_timeout uses the cached clock, which can lag the Rust writer's
+    // real clock. Use the same absolute deadline when classifying its failure.
+    return response_ret && ObTimeUtility::current_time() >= deadline ? OB_TIMEOUT : response_ret;
+  }, deadline);
+  if (ret == OB_TIMEOUT) { return ret; }
   return response_ret ? response_ret : ret;
 }
 void stop_all() {

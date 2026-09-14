@@ -4,6 +4,7 @@
 #include "observer/mysql/obsm_row.h"
 #include "rpc/obmysql/packet/ompk_row.h"
 #include "rpc/obmysql/packet/ompk_ok.h"
+extern "C" int64_t namespace_proto_response_deadline(int64_t);
 int oceanbase::observer::ObMPBase::namespace_worker_request_prototype(
     ObSQLSessionInfo &session, const ObString &text, bool change_database)
 {
@@ -16,7 +17,17 @@ int oceanbase::observer::ObMPBase::namespace_worker_request_prototype(
   int64_t timeout = 0;
   int ret = session.get_query_timeout(timeout);
   if (ret) { return ret; }
-  THIS_WORKER.set_timeout_ts(ObTimeUtility::current_time() + timeout);
+  const int64_t received = get_receive_timestamp();
+  if (timeout <= 0 || received > INT64_MAX - timeout) { return OB_TIMEOUT; }
+  const int64_t deadline = received + timeout;
+  THIS_WORKER.set_timeout_ts(deadline);
+  if (ObTimeUtility::current_time() >= deadline) { return OB_TIMEOUT; }
+  // Scope this only to the namespace query's blocking MySQL result delivery.
+  // Existing final/error flushing runs after this guard restores the old value.
+  struct ResponseDeadline {
+    int64_t previous;
+    ~ResponseDeadline() { namespace_proto_response_deadline(previous); }
+  } response_deadline{namespace_proto_response_deadline(deadline)};
   ret = txs ? txs->get_read_snapshot_version(THIS_WORKER.get_timeout_ts(), snapshot) : OB_NOT_INIT;
   if (ret) { return ret; }
   session.set_reserved_snapshot_version(snapshot);

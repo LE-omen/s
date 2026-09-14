@@ -1,4 +1,4 @@
-// Throwaway V12 wire protocol. Request routes are values, never pointers.
+// Throwaway V13 wire protocol. Q/U carry one absolute deadline; Z cancels its tag.
 #ifndef SEEKDB_NAMESPACE_WORKER_PROTOCOL_PROTOTYPE_H_
 #define SEEKDB_NAMESPACE_WORKER_PROTOCOL_PROTOTYPE_H_
 #include "lib/ob_errno.h"

@@ -2,6 +2,8 @@
 
 日期：2026-09-15。实验分支：`codex/namespace-worker-concurrency-v12`，基于 V11 的连接级 session。
 
+后续：[V13 查询截止时间与请求取消](namespace_worker_timeout_v13.md) 已接上现有 SQL 超时，本文保留 V12 的实现和验证记录。
+
 本轮验证：多个连接共用一组进程管道时，能否让慢查询、存储回调和慢客户端各自等待，同时让另一 session 继续执行，并保持 session/扫描的生命周期正确。
 
 ## 实现
