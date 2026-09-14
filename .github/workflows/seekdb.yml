@@ -150,7 +150,7 @@ jobs:
               ...context.repo,
               sha: process.env.CHECKOUT_SHA,
               state: 'pending',
-              context: 'SeekDB CI / mysqltest',
+              context: 'collect',
               description: 'SeekDB CI is running',
               target_url: targetUrl,
             });
@@ -559,7 +559,7 @@ jobs:
               ...context.repo,
               sha: process.env.CHECKOUT_SHA,
               state: passed ? 'success' : 'failure',
-              context: 'SeekDB CI / mysqltest',
+              context: 'collect',
               description: passed ? 'SeekDB CI passed' : `SeekDB CI failed: ${failedJobs}`,
               target_url: targetUrl,
             });
