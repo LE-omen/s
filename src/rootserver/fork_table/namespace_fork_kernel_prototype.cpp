@@ -11,6 +11,8 @@
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/rc/ob_server_runtime.h"
 #include "storage/compaction/ob_freeze_info_mgr.h"
+#include "storage/compaction/ob_schedule_dag_func.h"
+#include "storage/ddl/ob_tablet_fork_task.h"
 #include "lib/checksum/ob_crc64.h"
 #include <algorithm>
 #include <cstdlib>
@@ -344,6 +346,20 @@ int NamespaceForkKernelPrototype::schema_by_id(uint64_t id, const ObTableSchema 
   ret = find(*GCTX.sql_proxy_, root.catalog, "#" + key_of(local_of(id)), value);
   return ret != OB_SUCCESS ? ret : schema_from_value(database_of(id), value, schema);
 }
+int NamespaceForkKernelPrototype::table_id_for_tablet(const ObTabletID &tablet, int64_t schema_version,
+                                                     uint64_t &table_id) {
+  table_id = OB_INVALID_ID;
+  if (!is_encoded_id(tablet.id()) || !GCTX.sql_proxy_) { return OB_INVALID_ARGUMENT; }
+  const uint64_t db = database_of(tablet.id()); Roots root; Value value;
+  int ret = roots(*GCTX.sql_proxy_, db, root);
+  if (ret != OB_SUCCESS) { return ret; }
+  if (!root.snapshot || schema_version < root.schema_version) { return OB_SUCCESS; }
+  if ((ret = find(*GCTX.sql_proxy_, root.directory, key_of(local_of(tablet.id())), value)) != OB_SUCCESS) { return ret; }
+  uint64_t object = 0, table = 0, source = 0, bound = 0;
+  if (!entry(value.data, object, table, source, bound)) { return OB_CHECKSUM_ERROR; }
+  if (bound == tablet.id()) { table_id = encoded(db, table); }
+  return OB_SUCCESS;
+}
 int NamespaceForkKernelPrototype::list_schemas(uint64_t db, ObIArray<const ObTableSchema *> &out) {
   Roots root; int ret = roots(*GCTX.sql_proxy_, db, root);
   if (ret == OB_ITER_END) { return OB_SUCCESS; }
@@ -380,6 +396,39 @@ int NamespaceForkKernelPrototype::check_ddl(const ObSimpleTableSchemaV2 &schema)
   ret = find(*GCTX.sql_proxy_, root.catalog, "#" + key_of(schema.get_table_id()), existing);
   // Fixed physical definitions: new source tables are supported; existing ones cannot be altered/dropped.
   return ret == OB_ENTRY_NOT_EXIST ? OB_SUCCESS : ret == OB_SUCCESS ? OB_NOT_SUPPORTED : ret;
+}
+int NamespaceForkKernelPrototype::schedule_baseline(const ObTablet &tablet) {
+  const auto &meta = tablet.get_tablet_meta();
+  if (!is_encoded_id(meta.tablet_id_.id()) || tablet.is_empty_shell()
+      || !meta.fork_info_.is_valid() || meta.fork_info_.is_complete()) { return OB_SUCCESS; }
+  if (!GCTX.sql_proxy_) { return OB_NOT_INIT; }
+  int ret = OB_SUCCESS; Roots root; Value value; const ObTableSchema *schema = nullptr;
+  const uint64_t db = database_of(meta.tablet_id_.id());
+  uint64_t object = 0, table = 0, source = 0, bound = 0;
+  if (OB_FAIL(roots(*GCTX.sql_proxy_, db, root))) {
+  } else if (OB_FAIL(find(*GCTX.sql_proxy_, root.directory, key_of(local_of(meta.tablet_id_.id())), value))) {
+  } else if (!entry(value.data, object, table, source, bound)) { ret = OB_CHECKSUM_ERROR;
+  } else if (bound == 0) { // Physical CREATE MDS may not have committed its directory binding yet.
+  } else if (bound != meta.tablet_id_.id() || source != meta.fork_info_.get_fork_src_tablet_id().id()
+      || root.snapshot != meta.fork_info_.get_fork_snapshot_version()) { ret = OB_STATE_NOT_MATCH;
+  } else if (OB_FAIL(schema_from_value(db, value, schema))) {
+  } else {
+    ObTabletForkParam param; bool ready = false;
+    param.table_id_ = schema->get_table_id(); param.schema_version_ = schema->get_schema_version();
+    // Stable DAG identity only; no rootserver DDL task is created.
+    param.task_id_ = bound; param.source_tablet_id_ = ObTabletID(source);
+    param.dest_tablet_id_ = meta.tablet_id_; param.fork_snapshot_version_ = root.snapshot;
+    param.data_format_version_ = DATA_CURRENT_VERSION;
+    if (OB_FAIL(ObTabletForkUtil::check_satisfy_fork_condition(param, ready))) {
+    } else if (ready) {
+      ret = compaction::ObScheduleDagFunc::schedule_tablet_fork_dag(param, false);
+      if (ret == OB_EAGAIN || ret == OB_SIZE_OVERFLOW) { ret = OB_SUCCESS; }
+      else { LOG_INFO("PROTOTYPE_V3_BASELINE_SCHEDULE", K(ret), K(param)); }
+    }
+  }
+  // A crash needs no independent task journal: the committed tablet's incomplete fork
+  // mark retries here; the existing table-store update persists the completed baseline.
+  return ret;
 }
 int NamespaceForkKernelPrototype::ensure_tablet(const ObTabletID &tablet_id) {
   if (!is_encoded_id(tablet_id.id())) { return OB_SUCCESS; }

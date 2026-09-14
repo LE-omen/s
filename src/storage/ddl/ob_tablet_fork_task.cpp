@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/ddl/ob_tablet_fork_task.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "share/rc/ob_server_runtime.h"
 #include "storage/ls/ob_ls.h"
 #include "storage/tx_storage/ob_ls_service.h"
@@ -1409,7 +1410,8 @@ int ObTabletForkUtil::check_satisfy_fork_condition(
       }
     }
     
-    if (OB_SUCC(ret) && need_freeze) {
+    if (OB_SUCC(ret) && need_freeze
+        && !NamespaceForkKernelPrototype::is_encoded_id(param.dest_tablet_id_.id())) {
       if (OB_FAIL(ObTabletForkUtil::freeze_tablet(param.source_tablet_id_))) {
       }
       ob_usleep(100 * 1000L); // 100ms

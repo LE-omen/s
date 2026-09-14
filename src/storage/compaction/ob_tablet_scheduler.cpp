@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX STORAGE_COMPACTION
 #include "ob_tablet_scheduler.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "share/rc/ob_server_runtime.h"
 #include "storage/ob_bloom_filter_task.h"
 #include "ob_schedule_dag_func.h"
@@ -959,6 +960,9 @@ int ObTabletScheduler::schedule_tablet_minor(
     }
   }
   if (OB_SUCC(ret) && !tablet_id.is_ls_inner_tablet()) { // data tablet
+    if (OB_TMP_FAIL(storage::NamespaceForkKernelPrototype::schedule_baseline(*tablet))) {
+      LOG_WARN("failed to schedule prototype fork baseline", K(tmp_ret), K(tablet_id));
+    }
     if (OB_TMP_FAIL(schedule_ddl_tablet_merge(ls, tablet_handle))) {
       if (OB_SIZE_OVERFLOW != tmp_ret && OB_EAGAIN != tmp_ret) {
         LOG_ERROR("failed to schedule tablet ddl merge", K(tmp_ret), K(tablet_handle));

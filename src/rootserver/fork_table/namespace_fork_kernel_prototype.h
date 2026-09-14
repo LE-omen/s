@@ -5,6 +5,7 @@
 namespace oceanbase {
 namespace common { class ObISQLClient; }
 namespace storage {
+class ObTablet;
 class NamespaceForkKernelPrototype final
 {
 public:
@@ -16,9 +17,12 @@ public:
   static int schema_by_name(uint64_t database, const common::ObString &name,
                             const share::schema::ObTableSchema *&schema);
   static int schema_by_id(uint64_t table_id, const share::schema::ObTableSchema *&schema);
+  static int table_id_for_tablet(const common::ObTabletID &tablet, int64_t schema_version,
+                                 uint64_t &table_id);
   static int list_schemas(uint64_t database, common::ObIArray<const share::schema::ObTableSchema *> &schemas);
   static int check_ddl(const share::schema::ObSimpleTableSchemaV2 &schema);
   static int ensure_tablet(const common::ObTabletID &tablet_id);
+  static int schedule_baseline(const ObTablet &tablet);
 };
 }
 }

@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "ob_multi_version_schema_service.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/schema/ob_schema_publish_signal.h"
 #include "share/rc/ob_context.h"  // CREATE_WITH_TEMP_ENTITY_P/RESOURCE_OWNER(previously hidden behind a transitive include)
@@ -2583,6 +2584,9 @@ int ObMultiVersionSchemaService::get_tablet_to_table_history(const ObIArray<ObTa
       } else if (tablet_id.is_inner_tablet()) {
         // case 1: inner tablet_id is equal to its table_id
         table_id = tablet_id.id();
+      } else if (storage::NamespaceForkKernelPrototype::is_encoded_id(tablet_id.id())) {
+        // The inherited catalog has no per-table __all_table_history row.
+        ret = storage::NamespaceForkKernelPrototype::table_id_for_tablet(tablet_id, schema_version, table_id);
       } else if (OB_FAIL(key.init(tablet_id, schema_version))) {
       } else if (OB_FAIL(schema_cache_.get_tablet_cache(key, table_id))) {
         if (OB_ENTRY_NOT_EXIST != ret) {
