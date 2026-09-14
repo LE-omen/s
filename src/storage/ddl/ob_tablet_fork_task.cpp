@@ -436,8 +436,7 @@ int ObTabletForkCtx::init(const ObTabletForkParam &param)
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arg", K(ret), K(param));
   } else if (NamespaceForkKernelPrototype::is_encoded_id(param.dest_tablet_id_.id())
-      && OB_FAIL(NamespaceForkKernelPrototype::check_table_access(
-          param.table_id_, param.dest_tablet_id_, prototype_access_))) {
+      && OB_FAIL(NamespaceForkKernelPrototype::check_baseline_access(param.dest_tablet_id_, prototype_access_))) {
   } else if (FALSE_IT([&] {
       if (NamespaceForkKernelPrototype::lifetime_mode()
           && NamespaceForkKernelPrototype::is_encoded_id(param.dest_tablet_id_.id())) {

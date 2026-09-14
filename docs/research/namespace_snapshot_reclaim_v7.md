@@ -2,6 +2,8 @@
 
 分支 `codex/namespace-snapshot-reclaim-v7`，基于 V6 `2a27ca62c`。沿用实验模式 4。
 
+后续 [V8：多代 fork](namespace_lineage_v8.md) 增加 B→C 捕获、祖先快照引用链与最后持有者的级联释放；本页记录 V7 当时的单代实现和证据。
+
 ## 本轮问题
 
 A→B、C 后删除 A、B，C 的冷表仍能读取自己的 S；再删除 C，快照引用和版本保护解除，源输入与分支私有 tablet 能通过既有 GC 成为空壳。删除须处理在途读写和提交前崩溃，不提前物化冷表。B+ tree 元数据页回收另做。

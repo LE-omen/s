@@ -13,6 +13,12 @@ from namespace_fork_kernel_prototype import KernelExperiment
 
 
 class FastpathExperiment(KernelExperiment):
+    def start(self):
+        super().start()
+        # This short experiment counts traces across recovery. Disk-pressure log
+        # recycling can remove old traces even below max_syslog_file_count=16.
+        self.sql("ALTER SYSTEM SET max_syslog_file_count=0")
+
     def slow_paths(self):
         return self.engine_log().count("PROTOTYPE_V4_DIRECTORY_SLOW_PATH")
 
@@ -72,7 +78,8 @@ class FastpathExperiment(KernelExperiment):
             # Completion while another transaction owns the root proves independence
             # from the directory lock; this is a functional check, not a timing benchmark.
             pool.submit(reads_and_writes).result(timeout=10)
-            assert self.slow_paths() == before
+            after = self.slow_paths()
+            assert after == before, (phase, before, after)
             self.record("hot_access_completed_with_root_locked", phase=phase,
                         reads=20, rolled_back_writes=20, new_directory_transactions=0)
         finally:
