@@ -76,4 +76,4 @@ python3 tools/obtest/namespace_worker_handles_prototype.py \
 
 验收：通过分支 B 的普通连接插入数据，B 能读到、来源 A 和兄弟分支不变；重启后写入仍存在；多行 INSERT 遇到重复主键时整条语句回滚。先证明正常提交和语句原子性，再沿相同接口扩展 UPDATE/DELETE，之后处理 DDL 和显式事务。
 
-源码调查入口：`ObDASInsertOp` 已通过 `ObIDmlService` 写行；查询事务经 `ObITransactionService`。实际实现时在这些现有接口附近选择最小切入点，避免复制 SQL 执行或手写一套表达式/事务语义。本节记录优先级和验收目标，不代表写入已经实现。
+源码调查入口：`ObDASInsertOp` 已通过 `ObIDmlService` 写行；查询事务经 `ObITransactionService`。后续 [V14 INSERT 原型](namespace_worker_insert_v14.md) 已沿这些接口完成普通自动提交 INSERT 验证；范围及证据以 V14 文档为准。

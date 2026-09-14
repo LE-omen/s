@@ -290,11 +290,14 @@ int ObResultSet::implicit_commit_before_cmd_execute(ObSQLSessionInfo &session_in
 int ObResultSet::start_stmt()
 {
   if (observer::namespace_worker_prototype::worker_namespace != 0) {
-    // V10 read-only path: the gateway pins the shared-engine snapshot for this
-    // request. The worker has no local transaction service or write capability.
+    // Plain reads use the snapshot pinned by the gateway. V14 inserts follow
+    // native SQL transaction control through the worker's remote service.
     const ObPhysicalPlan *plan = get_physical_plan();
-    return plan && plan->is_plain_select() && get_exec_context().get_das_ctx().get_snapshot().is_valid()
-        ? OB_SUCCESS : OB_NOT_SUPPORTED;
+    if (plan && plan->is_plain_select()) {
+      return get_exec_context().get_das_ctx().get_snapshot().is_valid() ? OB_SUCCESS : OB_NOT_SUPPORTED;
+    } else if (!plan || !plan->is_plain_insert()) {
+      return OB_NOT_SUPPORTED;
+    }
   }
   NG_TRACE(sql_start_stmt_begin);
   int ret = OB_SUCCESS;

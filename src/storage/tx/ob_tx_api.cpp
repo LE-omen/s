@@ -1566,7 +1566,8 @@ namespace data_plane
 
 ObITransactionService *query_transaction_service()
 {
-  return ::oceanbase::share::server_service<::oceanbase::transaction::ObTransService>();
+  ObITransactionService *service = share::server_service<ObITransactionService>();
+  return service ? service : share::server_service<transaction::ObTransService>();
 }
 
 bool tx_desc_is_explicit(const transaction::ObTxDesc *desc)
@@ -1848,7 +1849,7 @@ int clone_tx_desc(common::ObIAllocator &allocator,
               K(ret), K(serialized_length));
   } else if (OB_FAIL(source->serialize(
                  static_cast<char *>(buffer), serialized_length, serialize_pos))) {
-  } else if (OB_FAIL(::oceanbase::share::server_service<::oceanbase::transaction::ObTransService>()->acquire_tx(
+  } else if (OB_FAIL(query_transaction_service()->acquire_tx(
                  static_cast<const char *>(buffer), serialize_pos,
                  deserialize_pos, clone))) {
   } else if (OB_ISNULL(clone) || serialize_pos != deserialize_pos) {
@@ -1856,7 +1857,7 @@ int clone_tx_desc(common::ObIAllocator &allocator,
     TRANS_LOG(WARN, "invalid cloned transaction descriptor",
               K(ret), KP(clone), K(serialize_pos), K(deserialize_pos));
     if (OB_NOT_NULL(clone)) {
-      ::oceanbase::share::server_service<::oceanbase::transaction::ObTransService>()->release_tx(*clone);
+      query_transaction_service()->release_tx(*clone);
       clone = nullptr;
     }
   }
@@ -1866,7 +1867,7 @@ int clone_tx_desc(common::ObIAllocator &allocator,
 void release_tx_desc(transaction::ObTxDesc *&desc)
 {
   if (OB_NOT_NULL(desc)) {
-    ::oceanbase::share::server_service<::oceanbase::transaction::ObTransService>()->release_tx(*desc);
+    query_transaction_service()->release_tx(*desc);
     desc = nullptr;
   }
 }

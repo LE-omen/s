@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Throwaway V13: query deadlines/cancellation, two SQL-only workers, one engine.
+"""Throwaway V13/V14: SQL-only workers, query deadlines and autocommit INSERT.
 
 SEEKDB_FORK_PROTOTYPE_TEST_ROOT=/tmp python3 tools/obtest/namespace_sql_worker_prototype.py --binary build_release/src/observer/seekdb
+Add --case insert for V14 writes, rollback, isolation and crash recovery.
 Linux integration probe. No claim of Windows/macOS or high-concurrency validation.
 """
 import argparse
@@ -33,6 +34,92 @@ class WorkerExperiment(LineageExperiment):
         matches = re.findall(r"PROTOTYPE_V10_WORKER_READY ns=(\d+) generation=(\d+) pid=(\d+)",
                              self.engine_log())
         return next(int(pid) for ns, _, pid in reversed(matches) if int(ns) == namespace)
+
+    def run_inserts(self):
+        self.setup_lineage()
+        c, _ = self.capture("b", "c")
+        first = second = sibling = None
+        try:
+            first, second, sibling = self.worker_connect(self.b), self.worker_connect(self.b), self.worker_connect(c)
+            pid = self.worker_pid(self.b)
+            self.sql("SET @v=7", first)
+            with first.cursor() as cursor:
+                assert cursor.execute("INSERT INTO t1 VALUES(3,@v*6),(4,NULL)") == 2
+            self.sql("INSERT INTO t1(v,id) VALUES(-50,5)", first)
+            assert self.sql("SELECT id,v FROM t1 WHERE id>=3 ORDER BY id", second) == ((3,42),(4,None),(5,-50))
+            self.record("worker_insert_expressions_and_affected_rows", affected=2, second_session_visible=True)
+
+            rows = tuple((i, i*10) for i in range(100,196))
+            with first.cursor() as cursor:
+                assert cursor.execute("INSERT INTO t1 VALUES" + ",".join(f"({i},{v})" for i,v in rows)) == len(rows)
+            assert self.sql("SELECT id,v FROM t1 WHERE id>=100 ORDER BY id", second) == rows
+            self.record("worker_insert_multiple_batches", rows=len(rows), batch_limit=32)
+
+            failed_rows = ",".join(f"({i},{i*10})" for i in range(200,241)) + ",(1,999)"
+            try:
+                self.sql("INSERT INTO t1 VALUES" + failed_rows, first)
+            except pymysql.IntegrityError as error:
+                assert error.args[0] == 1062, error.args
+                self.record("duplicate_rolls_back_whole_statement", error=error.args, rows_before_duplicate=41)
+            else:
+                raise AssertionError("duplicate INSERT succeeded")
+            assert self.sql("SELECT id,v FROM t1 WHERE id>=200", second) == ()
+            assert self.sql("SELECT v FROM t1 WHERE id=1", first) == ((10,),)
+            self.sql("INSERT INTO t1 VALUES(300,3000)", first)
+            assert self.worker_pid(self.b) == pid
+
+            self.sql("SET SESSION ob_query_timeout=500000", first)
+            started = time.monotonic()
+            try:
+                self.sql("INSERT INTO t1 VALUES(400,4000),(401,1+SLEEP(2))", first)
+            except pymysql.MySQLError as error:
+                assert error.args[0] == 4012, error.args
+                self.record("insert_timeout_rolled_back", seconds=time.monotonic()-started, error=error.args)
+            else:
+                raise AssertionError("expired INSERT succeeded")
+            self.sql("SET SESSION ob_query_timeout=10000000", first)
+            assert self.sql("SELECT id FROM t1 WHERE id>=400", second) == ()
+            assert self.sql("SELECT 1", first) == ((1,),)
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(self.sql, f"INSERT INTO t1 VALUES({key},{key*10})", connection)
+                           for key, connection in ((310,first),(311,second))]
+                for future in futures:
+                    future.result(timeout=15)
+            assert self.sql("SELECT id,v FROM t1 WHERE id BETWEEN 310 AND 311 ORDER BY id", first) == ((310,3100),(311,3110))
+            self.record("concurrent_insert_sessions", shared_worker=pid, transactions=2)
+
+            for query in ("INSERT IGNORE INTO t1 VALUES(1,0)",
+                          "INSERT INTO t1 VALUES(1,0) ON DUPLICATE KEY UPDATE v=0",
+                          "REPLACE INTO t1 VALUES(1,0)", "INSERT INTO t1 SELECT id+1000,v FROM t1"):
+                try:
+                    self.sql(query, first)
+                except pymysql.MySQLError as error:
+                    self.record("unsupported_insert_rejected", sql=query, error=error.args)
+                else:
+                    raise AssertionError(query)
+            assert self.sql("SELECT id FROM t1 WHERE id>=1000", second) == ()
+            assert self.sql("SELECT id,v FROM t1 ORDER BY id", sibling) == ((1,10),(2,20))
+            assert self.sql("SELECT id,v FROM db1.t1 ORDER BY id") == ((1,10),(2,20))
+            assert self.sql("SELECT id,v FROM " + self.table(self.root("a")[0], "db1.t1") + " ORDER BY id") == ((1,10),(2,20))
+            self.record("worker_insert_namespace_isolation", source_unchanged=True, sibling_unchanged=True)
+        finally:
+            for connection in (first, second, sibling):
+                if connection is not None:
+                    connection.close()
+        self.restart()
+        first, sibling = self.worker_connect(self.b), self.worker_connect(c)
+        try:
+            assert self.sql("SELECT id,v FROM t1 WHERE id>=100 ORDER BY id", first) == rows + ((300,3000),(310,3100),(311,3110))
+            assert self.sql("SELECT id,v FROM t1 WHERE id BETWEEN 3 AND 5 ORDER BY id", first) == ((3,42),(4,None),(5,-50))
+            assert self.sql("SELECT id,v FROM t1 ORDER BY id", sibling) == ((1,10),(2,20))
+            self.sql("INSERT INTO t1 VALUES(301,3010)", first)
+            assert self.sql("SELECT v FROM t1 WHERE id=301", first) == ((3010,),)
+            self.record("PASS", case="namespace_worker_insert", crash_recovery=True,
+                        worker_sql_and_das=True, shared_transaction_and_storage=True)
+        finally:
+            first.close()
+            sibling.close()
 
     def session_events(self, kind):
         events = []
@@ -433,14 +520,16 @@ class WorkerExperiment(LineageExperiment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
-    parser.add_argument("--case", choices=("full", "slow-timeout"), default="full")
+    parser.add_argument("--case", choices=("full", "slow-timeout", "insert"), default="full")
     args = parser.parse_args()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.environ["SEEKDB_NAMESPACE_SQL_WORKER_PROTOTYPE"] = "1"
-    experiment = WorkerExperiment(args.binary, "timeout_v13", prototype=6)
+    experiment = WorkerExperiment(args.binary, "insert_v14" if args.case == "insert" else "timeout_v13", prototype=6)
     try:
         experiment.start()
-        if args.case == "slow-timeout":
+        if args.case == "insert":
+            experiment.run_inserts()
+        elif args.case == "slow-timeout":
             experiment.setup_lineage()
             experiment.sql("INSERT INTO " + experiment.table(experiment.b, "db1.t1") + " VALUES" +
                            ",".join(f"({i},{i*10})" for i in range(3,99)))

@@ -15,6 +15,7 @@ int namespace_proto_worker_write(const char *, size_t);
 }
 #include "observer/namespace_worker_multiplex_prototype.ipp"
 #include "observer/namespace_worker_scan_prototype.ipp"
+#include "observer/namespace_worker_write_prototype.ipp"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 using namespace common;
 using namespace share::schema;
@@ -133,7 +134,8 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   return reply.ret;
 }
 int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
-             const std::function<int(Frame &)> &response, int64_t deadline = INT64_MAX) {
+             const std::function<int(Frame &)> &response, int64_t deadline = INT64_MAX,
+             EngineWrites *writes = nullptr) {
   const bool query = request.type() == 'Q' || request.type() == 'U';
   auto pending = channel.routes.allocate(!query);
   if (!pending) { return channel.closed ? OB_CONNECT_ERROR : OB_EAGAIN; }
@@ -162,7 +164,8 @@ int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
       if (query && !reply.ret && !reply.consumed()) { ret = response(reply); }
       if (ret) { break; }
       if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; break; }
-      return cancelled ? cancelled : query_ret;
+      const int transaction_ret = writes && !query_ret ? writes->check_finished() : OB_SUCCESS;
+      return cancelled ? cancelled : query_ret ? query_ret : transaction_ret;
     }
     // One buffered reply per request, independent of every other request. Give
     // its credit back after taking ownership, before doing SQL/storage work.
@@ -174,6 +177,9 @@ int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
       if (!ret) { ret = channel.send(result); }
     } else if (scans && (reply.type() == 'O' || reply.type() == 'F' || reply.type() == 'X')) {
       Frame result; ret = scans->process(reply, result); result.tag(pending->tag);
+      if (!ret) { ret = channel.send(result); }
+    } else if (writes && (reply.type() == 'T' || reply.type() == 'W')) {
+      Frame result; ret = writes->process(reply, result); result.tag(pending->tag);
       if (!ret) { ret = channel.send(result); }
     } else { ret = response(reply); }
     if (ret && query && !channel.closed) { ret = cancel(ret); }
@@ -239,6 +245,7 @@ int query(SessionBinding &binding, uint64_t snapshot, const ObString &sql, bool 
           const std::function<int(Frame &)> &response) {
   if (binding.channel->closed) { return OB_CONNECT_ERROR; }
   ReadScans scans(binding.ns, snapshot);
+  EngineWrites writes(binding.ns, binding.gateway->get_server_sid());
   Frame request(change_database ? 'U' : 'Q');
   request.number(binding.slot); request.number(binding.slot_generation);
   const int64_t deadline = THIS_WORKER.get_timeout_ts();
@@ -257,7 +264,7 @@ int query(SessionBinding &binding, uint64_t snapshot, const ObString &sql, bool 
     // Worker::is_timeout uses the cached clock, which can lag the Rust writer's
     // real clock. Use the same absolute deadline when classifying its failure.
     return response_ret && ObTimeUtility::current_time() >= deadline ? OB_TIMEOUT : response_ret;
-  }, deadline);
+  }, deadline, &writes);
   if (ret == OB_TIMEOUT) { return ret; }
   return response_ret ? response_ret : ret;
 }
