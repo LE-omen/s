@@ -20,6 +20,8 @@
 #define USING_LOG_PREFIX SQL_ENG
 
 #include "sql/engine/basic/ob_chunk_row_store.h"
+#include "observer/namespace_worker_protocol_prototype.h"
+#include <atomic>
 
 
 namespace oceanbase
@@ -1507,6 +1509,13 @@ bool ObChunkRowStore::need_dump(int64_t extra_size)
 
 int ObChunkStoreUtil::alloc_dir_id(int64_t &dir_id)
 {
+  if (observer::namespace_worker_prototype::worker_namespace != 0) {
+    // The real tmp-file alloc_dir also only allocates an identity. V10 keeps
+    // SQL work areas in memory and disables spill; no file is created here.
+    static std::atomic<int64_t> sequence{0};
+    dir_id = sequence.fetch_add(1) + 1;
+    return OB_SUCCESS;
+  }
   int ret = OB_SUCCESS;
   dir_id = 0;
   if (OB_FAIL(data_plane::tmp_file_alloc_dir(dir_id))) {

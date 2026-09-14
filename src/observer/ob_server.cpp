@@ -26,6 +26,7 @@
 #endif
 #include <thread>
 #include "observer/ob_server.h"
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "share/ob_autoincrement_service.h"
 #include "observer/ob_req_time_service.h"
 #include "observer/omt/ob_ai_service.h"
@@ -1527,6 +1528,7 @@ void ObServer::set_stop()
 
 int ObServer::stop()
 {
+  namespace_worker_prototype::stop_all();
   int ret = OB_SUCCESS;
   int fail_ret = OB_SUCCESS;
   FLOG_INFO("[OBSERVER_NOTICE] stop observer begin");
@@ -3035,3 +3037,6 @@ void set_server_stop()
 
 } // end of namespace observer
 } // end of namespace oceanbase
+
+#include "observer/namespace_worker_gateway_prototype.ipp"
+#include "observer/namespace_sql_worker_prototype.ipp"

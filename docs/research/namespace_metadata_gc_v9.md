@@ -137,3 +137,7 @@ GC 脚本的 Python 树遍历只用于独立验收：从持久根计算应保留
 - 存储空间、schema holder、namespace 墓碑、快照管理器本身的内存各有独立生命周期；页记录删除不等于 RSS 降低或预分配数据文件缩小。
 - 模式 6 不增加持久列，但仍不支持运行中切换实验模式或生产升级/降级。
 - namespace worker/IPC、完整复合对象键、用户/权限/config、子分支通用 DDL 均未纳入本轮。
+
+## 后续讨论
+
+后续已转向 [V10：统一端口与跨平台 SQL worker 草案](namespace_sql_worker_v10_plan.md)。[流程原型与验收记录](namespace_sql_worker_v10.md)已跑通 Linux 上两个独立 SQL worker 共用引擎的只读与退出闭环；Mio 高并发和完整平台适配仍待实现，schema holder 的单独回收不作为这一阶段的优先工作。

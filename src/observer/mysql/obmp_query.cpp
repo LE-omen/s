@@ -85,7 +85,10 @@ int ObMPQuery::process()
     ObSQLSessionInfo &session = *sess;
     ObSQLSessionInfo::LockGuard lock_guard(session.get_query_lock());
     session.set_current_trace_id(ObCurTraceId::get_trace_id());
-    if (OB_SUCC(ret)) {
+    if (conn->namespace_worker_id_ != 0 && sql_.case_compare("SET NAMES utf8mb4") != 0) {
+      ret = namespace_worker_query_prototype(session);
+      need_disconnect = ret == OB_CONNECT_ERROR;
+    } else if (OB_SUCC(ret)) {
       int64_t database_schema_version = 0;
       session.set_thread_id(GETTID());
       const ObMySQLRawPacket &pkt = reinterpret_cast<const ObMySQLRawPacket&>(req_->get_packet());
@@ -1335,3 +1338,5 @@ int ObMPQuery::deserialize_com_field_list()
   }
   return ret;
 }
+
+#include "observer/mysql/namespace_worker_query_prototype.ipp"

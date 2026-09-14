@@ -20,6 +20,8 @@
 #include "share/rc/ob_server_runtime.h"
 #include "util/easy_mod_stat.h"
 #include "observer/mysql/obmp_connect.h"
+#include "observer/namespace_worker_protocol_prototype.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "rpc/ob_sql_request_operator.h"
 #include "observer/ob_server.h"
 #include "observer/omt/ob_server_runtime.h"
@@ -229,7 +231,20 @@ int ObMPConnect::process()
       LOG_ERROR("null session", K(ret), K(session));
     } else if (OB_FAIL(verify_identify(*conn, *session))) {
     } else if (OB_FAIL(update_charset_sys_vars(*conn, *session))) {
+    } else if (namespace_worker_prototype::enabled()
+               && storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id())
+               && session->get_user_id() != OB_SYS_USER_ID) {
+      ret = OB_NOT_SUPPORTED;
+    } else if (namespace_worker_prototype::enabled()
+               && storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id())
+               && OB_FAIL(namespace_worker_prototype::attach(
+                   (session->get_database_id() & ~(1ULL << 62)) >> 32,
+                   conn->namespace_worker_generation_))) {
     } else {
+      if (namespace_worker_prototype::enabled()
+          && storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id())) {
+        conn->namespace_worker_id_ = (session->get_database_id() & ~(1ULL << 62)) >> 32;
+      }
       // set connection info to session
       LOG_TRACE("setup user session OK", "user_id", session->get_user_id(), K(user_name_));
       conn->set_auth_phase();

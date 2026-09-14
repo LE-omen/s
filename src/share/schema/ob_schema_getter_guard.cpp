@@ -18,6 +18,7 @@
 
 
 #include "ob_schema_getter_guard.h"
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "ob_ai_model_schema_getter_guard.ipp"
 
@@ -565,6 +566,15 @@ int ObSchemaGetterGuard::get_can_write_index_array(const uint64_t table_id,
 int ObSchemaGetterGuard::get_database_id(const ObString &database_name,
                                          uint64_t &database_id)
 {
+  if (observer::namespace_worker_prototype::worker_namespace != 0
+      && !storage::NamespaceForkKernelPrototype::is_namespace_address(database_name)
+      && database_name.case_compare(OB_SYS_DATABASE_NAME) != 0) {
+    const ObDatabaseSchema *schema = nullptr;
+    int ret = storage::NamespaceForkKernelPrototype::database_in_namespace(
+        observer::namespace_worker_prototype::worker_namespace, database_name, schema);
+    database_id = schema ? schema->get_database_id() : OB_INVALID_ID;
+    return ret;
+  }
   if (storage::NamespaceForkKernelPrototype::is_namespace_address(database_name)) {
     const ObDatabaseSchema *schema = nullptr;
     int ret = storage::NamespaceForkKernelPrototype::database_by_address(database_name, schema);

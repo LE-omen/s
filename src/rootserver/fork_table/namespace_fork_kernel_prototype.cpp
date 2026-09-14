@@ -2,6 +2,7 @@
 // Fixed two-integer-column schemas; mode 6 adds explicit metadata page reclamation.
 #define USING_LOG_PREFIX STORAGE
 #include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "rootserver/ob_tablet_creator.h"
 #include "rootserver/ddl_task/ob_ddl_task_util.h"
 #include "common/mysqlclient/ob_mysql_proxy.h"
@@ -108,6 +109,39 @@ struct DatabaseHolder {
 };
 // Schemas stay alive for old guards/plans; storage admission rejects deleted namespaces.
 std::map<uint64_t, std::unique_ptr<DatabaseHolder>> database_schemas;
+
+// V10: the SQL-only process owns these decoded schemas. The engine sends values
+// over IPC; neither its schema pointers nor SQL proxy cross the process boundary.
+int remote_database(char op, uint64_t id, const ObString &name, const ObDatabaseSchema *&schema) {
+  using namespace observer::namespace_worker_prototype;
+  schema = nullptr; Frame reply;
+  int ret = worker_catalog_fetch(op, id, name, reply);
+  if (ret || reply.number() == 0) { return ret ? ret : reply.ret; }
+  std::unique_ptr<DatabaseHolder> holder(new DatabaseHolder());
+  reply.read(holder->schema);
+  if (!reply.consumed()) { return reply.ret ? reply.ret : OB_INVALID_ARGUMENT; }
+  holder->simple.set_database_id(holder->schema.get_database_id());
+  holder->simple.set_schema_version(holder->schema.get_schema_version());
+  holder->simple.set_name_case_mode(OB_LOWERCASE_AND_INSENSITIVE);
+  if ((ret = holder->simple.set_database_name(holder->schema.get_database_name_str()))) { return ret; }
+  std::lock_guard<std::mutex> lock(schema_mutex);
+  auto &slot = database_schemas[holder->schema.get_database_id()];
+  if (!slot) { slot = std::move(holder); }
+  schema = &slot->schema; return OB_SUCCESS;
+}
+int remote_table(char op, uint64_t id, const ObString &name, const ObTableSchema *&schema) {
+  using namespace observer::namespace_worker_prototype;
+  schema = nullptr; Frame reply;
+  int ret = worker_catalog_fetch(op, id, name, reply);
+  if (ret || reply.number() == 0) { return ret ? ret : reply.ret; }
+  std::unique_ptr<SchemaHolder> holder(new SchemaHolder());
+  reply.read(holder->schema);
+  if (!reply.consumed()) { return reply.ret ? reply.ret : OB_INVALID_ARGUMENT; }
+  std::lock_guard<std::mutex> lock(schema_mutex);
+  auto &slot = schemas[holder->schema.get_table_id()];
+  if (!slot) { slot = std::move(holder); }
+  schema = &slot->schema; return OB_SUCCESS;
+}
 
 int64_t cap_min(int64_t a, int64_t b) { return a == 0 ? b : b == 0 ? a : std::min(a, b); }
 uint64_t encoded(uint64_t db, uint64_t local) {
@@ -830,6 +864,7 @@ int NamespaceForkKernelPrototype::database_by_address(const ObString &address, c
 }
 int NamespaceForkKernelPrototype::database_in_namespace(uint64_t ns, const ObString &name,
                                                        const ObDatabaseSchema *&schema) {
+  if (observer::namespace_worker_prototype::worker_catalog_fetch) { return remote_database('d', ns, name, schema); }
   schema = nullptr;
   if (!namespace_mode() || !GCTX.sql_proxy_ || !NamespaceObjectKey{ns, 1}.is_valid()) { return OB_INVALID_ARGUMENT; }
   MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
@@ -839,6 +874,11 @@ int NamespaceForkKernelPrototype::database_in_namespace(uint64_t ns, const ObStr
   return ret == OB_SUCCESS ? database_from_value(ns, value, schema) : ret;
 }
 int NamespaceForkKernelPrototype::database_by_id(uint64_t id, const ObDatabaseSchema *&schema) {
+  if (observer::namespace_worker_prototype::worker_catalog_fetch) {
+    { std::lock_guard<std::mutex> lock(schema_mutex);
+      auto it = database_schemas.find(id); if (it != database_schemas.end()) { schema = &it->second->schema; return OB_SUCCESS; } }
+    return remote_database('b', id, ObString(), schema);
+  }
   schema = nullptr; Roots root; Value value;
   if (!namespace_mode() || !is_encoded_id(id) || !GCTX.sql_proxy_) { return OB_INVALID_ARGUMENT; }
   MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
@@ -1063,6 +1103,7 @@ int NamespaceForkKernelPrototype::capture(ObISQLClient &trans, uint64_t source, 
   return ret;
 }
 int NamespaceForkKernelPrototype::schema_by_name(uint64_t db, const ObString &name, const ObTableSchema *&schema) {
+  if (observer::namespace_worker_prototype::worker_catalog_fetch) { return remote_table('t', db, name, schema); }
   schema = nullptr; if (!enabled() || !GCTX.sql_proxy_) { return OB_NOT_INIT; }
   MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
   const uint64_t owner = namespace_mode() ? (is_encoded_id(db) ? database_of(db) : 1) : db;
@@ -1083,6 +1124,7 @@ int NamespaceForkKernelPrototype::schema_by_id(uint64_t id, const ObTableSchema 
   schema = nullptr; if (!is_encoded_id(id)) { return OB_INVALID_ARGUMENT; }
   { std::lock_guard<std::mutex> lock(schema_mutex);
     auto it = schemas.find(id); if (it != schemas.end()) { schema = &it->second->schema; return OB_SUCCESS; } }
+  if (observer::namespace_worker_prototype::worker_catalog_fetch) { return remote_table('i', id, ObString(), schema); }
   if (!GCTX.sql_proxy_) { return OB_NOT_INIT; }
   MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
   Roots root; Value value; int ret = roots(*GCTX.sql_proxy_, database_of(id), root);
@@ -1115,6 +1157,7 @@ int NamespaceForkKernelPrototype::table_id_for_tablet(const ObTabletID &tablet, 
   return OB_SUCCESS;
 }
 int NamespaceForkKernelPrototype::list_schemas(uint64_t db, ObIArray<const ObTableSchema *> &out) {
+  if (observer::namespace_worker_prototype::worker_catalog_fetch) { return OB_NOT_SUPPORTED; }
   MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
   const uint64_t owner = namespace_mode() ? (is_encoded_id(db) ? database_of(db) : 1) : db;
   Roots root; int ret = roots(*GCTX.sql_proxy_, owner, root);
