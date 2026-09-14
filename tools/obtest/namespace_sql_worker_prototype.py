@@ -119,6 +119,10 @@ class WorkerExperiment(LineageExperiment):
                             status=[line for line in status.splitlines() if line.startswith(("VmRSS:", "Threads:"))],
                             memory=[line for line in memory.splitlines() if line.startswith(("Pss:", "Private_Clean:", "Private_Dirty:"))],
                             no_engine_storage_or_network_fds=True)
+                private_kib = sum(int(line.split()[1]) for line in memory.splitlines()
+                                  if line.startswith(("Private_Clean:", "Private_Dirty:")))
+                # Tiny warmed workload: catch cache sizing from host RAM instead of worker budget.
+                assert private_kib < 64 * 1024, (pid, private_kib, "worker private memory exceeds 64 MiB")
             worker_dirs = list((self.base / "run").glob("namespace-worker-*"))
             assert worker_dirs and all(not (p / "store").exists() for p in worker_dirs)
             self.record("PASS", case="namespace_sql_worker_flow", workers_restarted=True,

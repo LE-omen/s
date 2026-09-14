@@ -70,15 +70,39 @@ Unix 的 fd 清理使用 POSIX `fcntl`，不依赖 Linux 专用系统调用；�
 
 最终流程实例为 `/tmp/namespace_fork_PROTOTYPE_sql_worker_v10_28nvgsw3`，公共端口 41231；引擎 PID 3708630，B/C 初始 PID 3709168/3709185，B 重启后 PID 3709260。额外执行在 worker 忙时收到 4023；被杀 worker 的查询和旧代次连接收到 4124。实验进程均已停止，数据已归档。
 
-以下是在本轮查询完成后采样的 Linux `/proc` 数据，单位 MiB，不是负载峰值或容量结论：
+以下是内存修正前、流程查询完成后采样的 Linux `/proc` 数据，单位 MiB，不是负载峰值或容量结论：
 
 | worker | RSS | PSS | 私有页 | 线程 |
 | --- | ---: | ---: | ---: | ---: |
 | B（重启后） | 306.0 | 263.5 | 242.6 | 13 |
 | C | 304.7 | 262.4 | 241.8 | 13 |
 
-RSS 包含共享页，PSS 按共享者分摊，私有页为 Private_Clean + Private_Dirty。当前基础开销仍大，不能把这次流程验证称为低资源方案。512 MiB 是初始化时的 worker 内存预算；256 KiB 只是单个 IPC 帧上限，均不等于总进程内存或总缓冲上限。
+RSS 包含共享页，PSS 按共享者分摊，私有页为 Private_Clean + Private_Dirty。该版本的基础开销异常大，原因及修正见下节。此前把 512 MiB 描述为有效的 worker 内存预算并不准确：原型虽然调用了 `set_memory_budget`，后续配置加载仍将它覆盖成自动预算。256 KiB 只是单个 IPC 帧上限，不等于总进程内存或总缓冲上限。
+
+## 2026-09-14：修正 worker 缓存定容
+
+主要开销是原型用了错误的配置项，不是独立 SQL 进程必须占用约 243 MiB。原型设置的是已被忽略的兼容参数 `memory_limit=512M`；`GMEMCONF.reload_config` 实际读取 `memory_budget`，其默认值 0 表示按宿主机内存自动计算。当前机器上加载后的逻辑预算为 98,684,973,875 字节，约 91.9 GiB。
+
+不连接引擎、不执行查询的 worker 即可复现。GDB 在每个启动步骤采样后定位到 `init_global_kvcache()`：私有脏页从 9,828 KiB 增至 235,540 KiB，单步增加约 220 MiB。KV cache 会按逻辑预算预先分配哈希桶和管理结构；这部分并不是已经缓存的表数据，也不是 IPC 缓冲。
+
+修复仅将 worker 配置改为 `memory_budget=512M`，保留真实 SQL 模块和原 IPC 路径。该值是缓存、分配器等模块的定容预算，不是操作系统硬内存上限，也不表示启动时分配 512 MiB。当前修复二进制 SHA-256：`966272cefcc79ce44fb28916010c8376d4389494bbcb90b87c9a68af904ef02d`。
+
+- [逐步骤诊断](/data/1/tmp/namespace-worker-memory-gdb.log)和[配置读取](/data/1/tmp/namespace-worker-memory-config.log)保留了原始证据。
+- [独立 worker 探针](/data/1/tmp/namespace-worker-memory-probe.py)：空闲私有脏页从约 240 MiB 降至 15.3 MiB；此处没有共享引擎，额外约 42.7 MiB 文件代码页计入 Private_Clean，不能直接与多进程时的私有页相加比较。
+- [真实流程回归](/data/1/tmp/namespace-worker-memory-flow-fixed.log)：PASS。查询后两 worker 私有页为 18.1/17.2 MiB，PSS 为 39.0/37.8 MiB，仍各有 13 个线程。原脚本增加小数据查询后每 worker 私有页小于 64 MiB 的回归断言，捕获这次过量初始化问题；该阈值不代表通用 SQL 工作负载上限。
+- [编译记录](/data/1/tmp/namespace-worker-memory-build.log)：离线 release 编译通过。
+
+总量对照使用[同一测量脚本](/data/1/tmp/namespace-v10-memory-compare.py)，在每个版本内分别关闭/开启 V10 开关。共享进程预算 2 GiB，B 表 98 行、C 表 2 行，每个 namespace 执行 7 类查询各 20 次，包含点查、全表返回、SUM、过滤、排序和 LIMIT/OFFSET；预热后等待 5 秒，再每秒采样一次，共 7 次。两个版本所有查询结果断言均通过。
+
+| 已访问 namespace 数 | 修正前一体化 | 修正前共享进程 + worker | 修正后一体化 | 修正后共享进程 + worker |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 237.6 MiB | 482.0 MiB | 236.5 MiB | 253.9 MiB |
+| 2 | 238.3 MiB | 725.4 MiB | 237.5 MiB | 274.4 MiB |
+
+以上为各进程 PSS 合计的中位数。双 worker 修正后的总量范围为 272.3–275.9 MiB，其中共享进程 PSS 中位数 195.3 MiB，两 worker 各约 39.5 MiB。相对同版一体化增加约 36.8 MiB（15.5%）；每个 worker 私有页约 18.3 MiB。PSS 因共享代码页的分摊会随进程数改变，不宜把单 worker 场景的 PSS 直接乘以 worker 数。
+
+[修正前原始数据](/data/1/tmp/namespace-v10-memory-comparison.json)、[修正后原始数据](/data/1/tmp/namespace-v10-memory-comparison-fixed.json)和[修正后测量日志](/data/1/tmp/namespace-v10-memory-comparison-fixed.log)保留全部采样值。这里测的是小数据查询后的进程驻留内存，不包括未映射文件页缓存及全部内核资源，也不是大查询峰值、长期稳定性或任意 namespace 数量的容量结论。所有实验实例已停止并归档。
 
 ## 下一步
 
-先根据本轮约 242 MiB 私有页、13 线程的结果裁剪 SQL-only 启动，识别必须保留的模块和可按需初始化的内存；随后沿用已跑通的 SQL/扫描边界，把阻塞管道换成现有 Mio 事件循环可管理的通道，补请求标识、取消和慢客户端背压。完整会话迁移和写事务协议另行推进，不以本轮只读结果推导它们已经可用。
+过量缓存定容已修正，仍需评估 worker 的 13 个线程、较大 SQL 工作区和空闲进程退出。沿用已跑通的 SQL/扫描边界，把阻塞管道换成现有 Mio 事件循环可管理的通道，补请求标识、取消和慢客户端背压。完整会话迁移和写事务协议另行推进，不以本轮只读结果推导它们已经可用。

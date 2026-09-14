@@ -27,7 +27,8 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   OB_LOGGER.set_log_level("WARN");
   OB_LOGGER.set_enable_async_log(false);
   const int64_t budget = 512L * 1024 * 1024;
-  config_.memory_limit.set_value("512M");
+  // reload_config derives cache sizing from memory_budget; memory_limit is ignored.
+  config_.memory_budget.set_value("512M");
   config_.cpu_count.set_value("1");
   config_.enable_async_syslog.set_value("false");
   config_._pushdown_storage_level.set_value("0");
