@@ -999,6 +999,9 @@ int check_will_be_having_domain_index_operation(
               share::schema::ObSchemaGetterGuard &schema_guard,
               ObDDLSQLTransaction &trans,
               const share::ObForkTableInfo &fork_table_info);
+  // Throwaway empty-database capture; table materialization is deferred.
+  int fork_database_prototype_(const obcall::ObForkDatabaseArg &arg, obcall::ObDDLRes &res);
+
   // Helper function to fork a single table within a transaction.
   // This is shared by fork_table() and fork_database().
   int fork_single_table_in_trans_(const share::schema::ObTableSchema &src_table_schema,

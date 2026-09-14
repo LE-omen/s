@@ -101,6 +101,8 @@ public:
 
   int init(common::ObISQLClient &sql_proxy);
   void init_for_test() { inited_ = true; }
+  // The throwaway fork prototype uses the normal reload protocol before publishing its handle.
+  int reload_for_test() { return try_update_info(); }
   bool is_inited() const { return inited_; }
   int start();
   void wait();

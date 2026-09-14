@@ -25,6 +25,10 @@
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "storage/ddl/ob_ddl_lock.h"
 #include "storage/tablelock/ob_lock_inner_connection_util.h"
+#include "rootserver/fork_table/namespace_fork_prototype.h"
+#include "share/ob_snapshot_table_proxy.h"
+#include "storage/compaction/ob_freeze_info_mgr.h"
+#include "rootserver/ddl_task/ob_ddl_task_util.h"
 
 namespace oceanbase {
 using namespace common;
@@ -33,6 +37,70 @@ using namespace obcall;
 using namespace storage;
 namespace rootserver {
 
+int ObDDLService::fork_database_prototype_(const ObForkDatabaseArg &arg, ObDDLRes &res)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard schema_guard;
+  const ObDatabaseSchema *source = nullptr;
+  const ObDatabaseSchema *existing = nullptr;
+  ObDatabaseSchema target;
+  ObDDLSQLTransaction trans(schema_service_);
+  ObSnapshotTableProxy snapshots;
+  ObSnapshotInfo pin;
+  int64_t schema_version = 0;
+  int64_t snapshot = 0;
+  auto *freeze_mgr = share::server_service<storage::ObFreezeInfoMgr>();
+  NamespaceForkPrototype::log_work("capture_begin", 0);
+  if (!arg.src_database_name_.prefix_match("__fork_proto_a")) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_FAIL(get_runtime_schema_guard_with_version_in_inner_table(schema_guard))) {
+  } else if (OB_FAIL(schema_guard.get_schema_version(schema_version))) {
+  } else if (OB_FAIL(schema_guard.get_database_schema(arg.src_database_name_, source))) {
+  } else if (OB_ISNULL(source)) {
+    ret = OB_ERR_BAD_DATABASE;
+  } else if (source->is_in_recyclebin() || is_sys_database_id(source->get_database_id())) {
+    ret = OB_NOT_SUPPORTED;
+  } else if (OB_FAIL(schema_guard.get_database_schema(arg.dst_database_name_, existing))) {
+  } else if (existing != nullptr) {
+    ret = OB_DATABASE_EXIST;
+  } else if (OB_ISNULL(freeze_mgr)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(trans.start(&get_sql_proxy(), schema_version))) {
+  } else if (OB_FAIL(ObDDLTaskUtil::calc_snapshot_with_gts(snapshot))) {
+  } else if (OB_FAIL(pin.snapshot_scn_.convert_for_tx(snapshot))) {
+  } else {
+    pin.snapshot_type_ = SNAPSHOT_FOR_MULTI_VERSION;
+    pin.tablet_id_ = 0; // Existing whole-instance MVCC protection, intentionally coarse.
+    pin.schema_version_ = schema_version;
+    pin.comment_ = "PROTOTYPE namespace fork; discard instance after experiment";
+    ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
+    if (OB_FAIL(snapshots.add_snapshot(trans, pin))) {
+    } else if (OB_FAIL(target.assign(*source))) {
+    } else if (OB_FAIL(target.set_database_name(arg.dst_database_name_))) {
+    } else {
+      target.set_database_id(OB_INVALID_ID);
+      ret = ddl_operator.create_database(target, trans, &arg.ddl_stmt_str_);
+    }
+  }
+  if (trans.is_started()) {
+    const int end_ret = trans.end(OB_SUCCESS == ret);
+    if (OB_SUCCESS == ret) { ret = end_ret; }
+  }
+  // An error after commit leaves an unpublished experiment. Do not fabricate a rollback.
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(freeze_mgr->reload_for_test())) {
+  } else if (OB_FAIL(publish_schema())) {
+  } else if (OB_FAIL(NamespaceForkPrototype::publish(source->get_database_id(),
+                          target.get_database_id(), schema_version, snapshot))) {
+  } else {
+    res.schema_id_ = target.get_database_id();
+    LOG_INFO("PROTOTYPE_FORK_CAPTURED", "source_id", source->get_database_id(),
+             "target_id", target.get_database_id(), K(snapshot), K(schema_version));
+    NamespaceForkPrototype::log_work("capture_end", target.get_database_id());
+  }
+  return ret;
+}
+
 int ObDDLService::fork_database(
     const obcall::ObForkDatabaseArg &fork_database_arg, obcall::ObDDLRes &res) {
   int ret = OB_SUCCESS;
@@ -40,6 +108,8 @@ int ObDDLService::fork_database(
   } else if (!fork_database_arg.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arg", K(ret), K(fork_database_arg));
+  } else if (NamespaceForkPrototype::is_target(fork_database_arg.dst_database_name_)) {
+    ret = fork_database_prototype_(fork_database_arg, res);
   } else {
     LOG_INFO("fork database request accepted", "src_db",
              fork_database_arg.src_database_name_, "dst_db",
