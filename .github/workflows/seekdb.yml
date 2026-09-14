@@ -5,8 +5,9 @@ name: SeekDB CI
 on:
   workflow_call:
   workflow_dispatch:
-  issue_comment:
-    types: [created]
+  pull_request_target:
+    branches: [master, develop]
+    types: [labeled, synchronize]
   schedule:
     - cron: '30 9 * * *'
 
@@ -17,13 +18,11 @@ permissions:
 concurrency:
   group: >-
     ${{
-      github.event_name == 'issue_comment' &&
-      github.event.issue.pull_request &&
-      github.event.comment.body == '/ci' &&
-      format('seekdb-ci-pr-{0}', github.event.issue.number) ||
+      github.event_name == 'pull_request_target' &&
+      format('seekdb-ci-pr-{0}', github.event.pull_request.number) ||
       format('seekdb-ci-run-{0}', github.run_id)
     }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
 
 env:
   MYSQLTEST_SLICES: "4"
@@ -43,17 +42,21 @@ jobs:
       ${{
         github.repository == 'oceanbase/seekdb' &&
         (
-          github.event_name != 'issue_comment' ||
-          (github.event.issue.pull_request && github.event.comment.body == '/ci')
+          github.event_name != 'pull_request_target' ||
+          (github.event.action == 'labeled' && github.event.label.name == 'ci:run')
         )
       }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: read
     outputs:
       allowed: ${{ steps.authorize.outputs.allowed }}
       checkout_ref: ${{ steps.authorize.outputs.checkout_ref }}
       checkout_sha: ${{ steps.authorize.outputs.checkout_sha }}
     steps:
-      - name: Authorize actor
+      - name: Resolve CI target
         id: authorize
         uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
@@ -61,11 +64,7 @@ jobs:
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const isPullRequestComment = context.eventName === 'issue_comment';
-            const actor = isPullRequestComment
-              ? context.payload.comment.user.login
-              : process.env.GITHUB_TRIGGERING_ACTOR || context.actor;
-            const writePermissions = new Set(['admin', 'write']);
+            const isPullRequestLabel = context.eventName === 'pull_request_target';
 
             if (context.eventName === 'schedule') {
               core.setOutput('checkout_ref', context.sha);
@@ -75,34 +74,11 @@ jobs:
               return;
             }
 
-            let repositoryPermission = '';
-            try {
-              const response = await github.rest.repos.getCollaboratorPermissionLevel({
-                owner,
-                repo,
-                username: actor,
-              });
-              repositoryPermission = response.data.permission;
-            } catch (error) {
-              if (error.status !== 404) {
-                throw error;
-              }
-              repositoryPermission = 'none';
-            }
-
-            if (!writePermissions.has(repositoryPermission)) {
-              core.setOutput('allowed', 'false');
-              core.setFailed(
-                `@${actor} is not authorized to run SeekDB CI; repository write permission is required (current: ${repositoryPermission || 'none'}).`,
-              );
-              return;
-            }
-
-            if (isPullRequestComment) {
+            if (isPullRequestLabel) {
               const response = await github.rest.pulls.get({
                 owner,
                 repo,
-                pull_number: context.payload.issue.number,
+                pull_number: context.payload.pull_request.number,
               });
               const pullRequest = response.data;
               if (pullRequest.state !== 'open') {
@@ -129,18 +105,34 @@ jobs:
               }
               core.setOutput('checkout_ref', `refs/pull/${pullRequest.number}/merge`);
               core.setOutput('checkout_sha', pullRequest.merge_commit_sha);
+              try {
+                await github.rest.issues.removeLabel({
+                  owner,
+                  repo,
+                  issue_number: pullRequest.number,
+                  name: 'ci:run',
+                });
+              } catch (error) {
+                if (error.status !== 404) {
+                  throw error;
+                }
+              }
             } else {
               core.setOutput('checkout_ref', context.sha);
               core.setOutput('checkout_sha', context.sha);
             }
 
             core.setOutput('allowed', 'true');
-            core.notice(`@${actor} is authorized by repository permission: ${repositoryPermission}.`);
+            core.notice(
+              isPullRequestLabel
+                ? `SeekDB CI accepted for pull request #${context.payload.pull_request.number}.`
+                : 'SeekDB CI accepted.',
+            );
 
   seekdb-status-pending:
     name: set pending status
     needs: seekdb-authorize
-    if: ${{ github.event_name == 'issue_comment' && needs.seekdb-authorize.outputs.allowed == 'true' }}
+    if: ${{ github.event_name == 'pull_request_target' && needs.seekdb-authorize.outputs.allowed == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -233,7 +225,7 @@ jobs:
       - name: Configure local cache paths
         shell: bash
         env:
-          PR_NUMBER: ${{ github.event.issue.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           SOURCE_SHA: ${{ needs.seekdb-authorize.outputs.checkout_sha }}
         run: |
           set -euo pipefail
@@ -332,9 +324,8 @@ jobs:
       - name: Publish PR ccache delta
         if: >-
           ${{ always() &&
-              github.event_name == 'issue_comment' &&
-              github.event.issue.pull_request &&
-              github.event.issue.number != null }}
+              github.event_name == 'pull_request_target' &&
+              github.event.pull_request.number != null }}
         shell: bash
         run: bash .github/script/seekdb/cache.sh publish-pr-ccache
         continue-on-error: true
@@ -537,7 +528,7 @@ jobs:
   seekdb-status-final:
     name: report final status
     needs: [seekdb-authorize, seekdb-status-pending, seekdb-setup, seekdb-mysqltest, seekdb-collect]
-    if: ${{ always() && github.event_name == 'issue_comment' && needs.seekdb-authorize.outputs.allowed == 'true' }}
+    if: ${{ always() && github.event_name == 'pull_request_target' && needs.seekdb-authorize.outputs.allowed == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
