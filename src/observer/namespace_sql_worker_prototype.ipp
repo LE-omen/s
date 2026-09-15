@@ -287,6 +287,10 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         retry.set_current_global_schema_version(version);
         auto &task = result->get_exec_context().get_sql_exec_ctx();
         task.schema_service_ = &schema_service_; task.set_query_begin_schema_version(version);
+        // DML operators open nested SQL through the execution context. Keep
+        // the worker's routed proxy attached so that path uses the same
+        // worker/shared storage bridge instead of observing a null proxy.
+        result->get_exec_context().set_sql_proxy(&sql_proxy_);
         session.set_current_execution_id(sql_engine_.get_execution_id());
         session.reset_plsql_exec_time(); session.reset_plsql_compile_time(); session.set_stmt_type(stmt::T_NONE);
         ret = session.set_session_active(text, started, started, obmysql::COM_QUERY);
