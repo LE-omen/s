@@ -187,7 +187,11 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
           ret = OB_INVALID_ARGUMENT;
         } else {
           ret = session.set_user(user_name, host_name, user_id);
-          if (!ret) { session.set_user_priv_set(OB_PRIV_SELECT | OB_PRIV_INSERT | OB_PRIV_UPDATE | OB_PRIV_DELETE); }
+          if (!ret) {
+            session.set_user_priv_set(user_id == OB_SYS_USER_ID
+                ? OB_PRIV_ALL | OB_PRIV_GRANT
+                : 0);
+          }
         }
       }
       const uint64_t db = session.get_database_id();
