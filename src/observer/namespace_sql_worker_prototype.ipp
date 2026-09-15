@@ -259,7 +259,16 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       context.retry_times_ = retry.get_retry_times();
       auto result = std::make_unique<ObMySQLResultSet>(session, allocator, sql_engine_.get_plan_cache_access_service());
       WorkerPacketSender sender;
-      ret = schema_service_.get_runtime_schema_guard(guard);
+      // The worker has no long-lived observer schema refresh task of its own.
+      // Honor the session DDL fence before taking the per-statement guard;
+      // unlike an unconditional refresh this does not contend on every query.
+      int64_t local_schema_version = 0;
+      const int64_t ddl_schema_version = session.get_last_ddl_schema_version();
+      if (!ret) { ret = schema_service_.get_runtime_refreshed_schema_version(local_schema_version); }
+      if (!ret && ddl_schema_version > local_schema_version) {
+        ret = schema_service_.async_refresh_schema(ddl_schema_version);
+      }
+      if (!ret) { ret = schema_service_.get_runtime_schema_guard(guard); }
       if (!ret) { ret = session.update_query_sensitive_system_variable(guard); }
       if (!ret) { ret = result->init(); }
       int64_t version = 0;
