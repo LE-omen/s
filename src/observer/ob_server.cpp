@@ -403,17 +403,25 @@ class ObSchemaRefreshSchedulerAdapter final
     : public share::schema::ObISchemaRefreshScheduler
 {
 public:
-  explicit ObSchemaRefreshSchedulerAdapter(ObService &service)
-      : service_(service)
+  explicit ObSchemaRefreshSchedulerAdapter(ObService &service,
+                                           share::schema::ObMultiVersionSchemaService &schema)
+      : service_(service), schema_(schema)
   {}
 
   int schedule_refresh_at_least(const int64_t schema_version) override
   {
-    return service_.submit_async_refresh_schema_task(schema_version);
+    int ret = service_.submit_async_refresh_schema_task(schema_version);
+    if (ret == OB_NOT_INIT) {
+      // SQL-only workers do not start the full ObService updater. Refresh the
+      // worker-local schema synchronously from the shared metadata tables.
+      ret = schema_.refresh_and_add_schema(false);
+    }
+    return ret;
   }
 
 private:
   ObService &service_;
+  share::schema::ObMultiVersionSchemaService &schema_;
 };
 
 static int check_need_initialize(const char *base_dir, const char *data_dir, const char *redo_dir, bool &need_initialize)
@@ -2252,7 +2260,7 @@ int ObServer::init_schema()
   } else if (OB_ISNULL(schema_refresh_scheduler_ = OB_NEW(
       ObSchemaRefreshSchedulerAdapter,
       ObModIds::OB_SCHEMA_SERVICE,
-      ob_service_))) {
+      ob_service_, schema_service_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_ERROR("failed to allocate schema refresh scheduler", KR(ret));
   } else if (OB_FAIL(schema_service_.init(
