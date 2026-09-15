@@ -268,7 +268,9 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       if (!ret && ddl_schema_version > local_schema_version) {
         ret = schema_service_.async_refresh_schema(ddl_schema_version);
       }
-      if (!ret) { ret = schema_service_.get_runtime_schema_guard(guard); }
+      // Use the native version-fenced path: it reads the current schema
+      // version from inner tables and refreshes before returning a guard.
+      if (!ret) { ret = schema_service_.get_runtime_schema_guard_with_version_in_inner_table(guard); }
       if (!ret) { ret = session.update_query_sensitive_system_variable(guard); }
       if (!ret) { ret = result->init(); }
       int64_t version = 0;
