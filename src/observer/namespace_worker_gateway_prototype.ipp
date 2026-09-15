@@ -630,12 +630,23 @@ int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&b
   request.number(gateway.get_capability().capability_);
   if ((ret = append_session_state(gateway, request, !internal))) { return ret; }
   bool opened = false;
-  ret = exchange(*owned->channel, ns, request, nullptr, [&](Frame &reply) {
-    if (reply.type() != 'a' || opened) { return OB_INVALID_ARGUMENT; }
-    owned->slot = reply.number(); owned->slot_generation = reply.number();
-    opened = reply.consumed() && owned->slot_generation != 0;
-    return opened ? OB_SUCCESS : OB_INVALID_ARGUMENT;
-  });
+  // A newly spawned worker may still be constructing its native core schema
+  // when the first client session arrives. Retry only the transient schema
+  // visibility errors; protocol/authentication errors remain terminal.
+  for (int attempt = 0; attempt < 8 && !opened; ++attempt) {
+    Frame attempt_request = request;
+    ret = exchange(*owned->channel, ns, std::move(attempt_request), nullptr, [&](Frame &reply) {
+      if (reply.type() != 'a' || opened) { return OB_INVALID_ARGUMENT; }
+      owned->slot = reply.number(); owned->slot_generation = reply.number();
+      opened = reply.consumed() && owned->slot_generation != 0;
+      return opened ? OB_SUCCESS : OB_INVALID_ARGUMENT;
+    });
+    if (!opened && (ret == OB_TABLE_NOT_EXIST || ret == OB_EAGAIN)) {
+      ob_usleep(10 * 1000);
+    } else {
+      break;
+    }
+  }
   if (!ret && !opened) { owned->channel->fail(); ret = OB_INVALID_ARGUMENT; }
   if (!ret) {
     std::lock_guard<std::mutex> guard(owned->channel->bindings_mutex);

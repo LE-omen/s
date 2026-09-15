@@ -201,10 +201,17 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         if (worker_namespace == 1) {
           ret = schema_service_.get_runtime_schema_guard(guard);
           if (!ret) { ret = guard.get_database_schema(db, database); }
-        } else if (((db & ~(1ULL << 62)) >> 32) != worker_namespace) { ret = OB_INVALID_ARGUMENT; }
-        else { ret = storage::NamespaceForkKernelPrototype::database_by_id(db, database); }
-        if (!ret && !database) { ret = OB_ERR_BAD_DATABASE; }
-        if (!ret) { ret = session.set_default_database(database->get_database_name_str()); }
+          if (!ret && !database) { ret = OB_ERR_BAD_DATABASE; }
+          if (!ret) { ret = session.set_default_database(database->get_database_name_str()); }
+        } else if (((db & ~(1ULL << 62)) >> 32) != worker_namespace) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          // The worker starts with only the core native schema. The encoded
+          // database is resolved by the shared fork catalog when a statement
+          // is planned; requiring a local database schema here races the first
+          // catalog fetch and turns a valid connection into 1146.
+          ret = OB_SUCCESS;
+        }
       }
     }
     if (!ret && internal) { ret = ObInnerSQLConnection::create_connection_with_external_session(&session, owner.inner); }

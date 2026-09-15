@@ -13,14 +13,14 @@ using namespace storage;
 int worker_send(const Frame &, bool cleanup = false);
 int worker_read(Frame &);
 bool owns_table(uint64_t ns, uint64_t id) {
-  return ns == 1 ? !NamespaceForkKernelPrototype::is_encoded_id(id)
+  return (is_inner_table(id) || ns == 1) ? !NamespaceForkKernelPrototype::is_encoded_id(id)
       : ((id & ~(1ULL << 62)) >> 32) == ns;
 }
 int storage_schema(uint64_t ns, uint64_t id, ObSchemaGetterGuard &guard, const ObTableSchema *&schema) {
   if (!owns_table(ns, id)) { return OB_INVALID_ARGUMENT; }
   // Namespace 1 is the worker's native catalog. Forked namespaces use the
   // shared immutable catalog overlay, keyed by encoded table ids.
-  if (ns != 1) { return NamespaceForkKernelPrototype::schema_by_id(id, schema); }
+  if (ns != 1 && !is_inner_table(id)) { return NamespaceForkKernelPrototype::schema_by_id(id, schema); }
   int ret = ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(guard);
   return ret ? ret : guard.get_table_schema(id, schema);
 }

@@ -890,7 +890,36 @@ int NamespaceForkKernelPrototype::database_by_id(uint64_t id, const ObDatabaseSc
   if (observer::namespace_worker_prototype::worker_catalog_fetch) {
     { std::lock_guard<std::mutex> lock(schema_mutex);
       auto it = database_schemas.find(id); if (it != database_schemas.end()) { schema = &it->second->schema; return OB_SUCCESS; } }
-    return remote_database('b', id, ObString(), schema);
+    int ret = remote_database('b', id, ObString(), schema);
+    // Worker startup can race the shared catalog refresh immediately after a
+    // fork. The worker already has the source database in its native schema;
+    // use it only as a metadata bootstrap fallback, while table ids/storage
+    // remain governed by the fork catalog and encoded namespace.
+    if (ret != OB_SUCCESS && is_encoded_id(id) && GCTX.schema_service_) {
+      ObSchemaGetterGuard guard;
+      const ObDatabaseSchema *native = nullptr;
+      if (OB_SUCCESS == GCTX.schema_service_->get_runtime_schema_guard(guard)
+          && OB_SUCCESS == guard.get_database_schema(local_of(id), native)) {
+        if (native != nullptr) {
+          std::unique_ptr<DatabaseHolder> holder(new DatabaseHolder());
+          ret = holder->schema.assign(*native);
+          if (ret == OB_SUCCESS) {
+            holder->schema.set_database_id(id);
+            holder->simple.set_database_id(id);
+            holder->simple.set_schema_version(holder->schema.get_schema_version());
+            holder->simple.set_name_case_mode(OB_LOWERCASE_AND_INSENSITIVE);
+            ret = holder->simple.set_database_name(holder->schema.get_database_name_str());
+            if (ret == OB_SUCCESS) {
+              std::lock_guard<std::mutex> lock(schema_mutex);
+              auto &slot = database_schemas[id];
+              if (!slot) { slot = std::move(holder); }
+              schema = &slot->schema;
+            }
+          }
+        }
+      }
+    }
+    return ret;
   }
   schema = nullptr; Roots root; Value value;
   if (!namespace_mode() || !is_encoded_id(id) || !GCTX.sql_proxy_) { return OB_INVALID_ARGUMENT; }
