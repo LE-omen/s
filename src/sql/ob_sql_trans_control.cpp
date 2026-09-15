@@ -498,6 +498,9 @@ int ObSqlTransControl::decide_trans_read_interface_specs(
 int ObSqlTransControl::start_stmt(ObExecContext &exec_ctx)
 {
   int ret = OB_SUCCESS;
+  observer::namespace_worker_prototype::StorageSessionScope worker_storage_scope(
+      observer::namespace_worker_prototype::worker_namespace > 1 ? GET_MY_SESSION(exec_ctx) : nullptr);
+  if (worker_storage_scope.error()) { return worker_storage_scope.error(); }
   data_plane::begin_lock_wait_request();
   ObSQLSessionInfo *session = GET_MY_SESSION(exec_ctx);
   ObPhysicalPlanCtx *plan_ctx = GET_PHY_PLAN_CTX(exec_ctx);

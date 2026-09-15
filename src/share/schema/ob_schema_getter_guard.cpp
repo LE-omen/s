@@ -260,6 +260,14 @@ int ObSchemaGetterGuard::get_schema_version(int64_t &schema_version) const
   // shared catalog's current snapshot instead of running the native
   // schema-version inner SQL against an empty worker schema.
   if (observer::namespace_worker_prototype::worker_namespace != 0) {
+    // Ask the shared catalog for the snapshot version used to plan this
+    // statement.  DML planning needs a concrete version even though the
+    // worker does not materialize __all_ddl_operation locally.
+    if (observer::namespace_worker_prototype::worker_namespace > 1) {
+      const int ret = observer::namespace_worker_prototype::fetch_schema_version(
+          false, false, schema_version);
+      if (ret == OB_SUCCESS && schema_version != OB_INVALID_VERSION) { return ret; }
+    }
     schema_version = OB_INVALID_VERSION;
     return OB_SUCCESS;
   }
