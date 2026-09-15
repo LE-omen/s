@@ -2115,6 +2115,9 @@ int ObDmlCgService::fill_table_dml_param(share::schema::ObSchemaGetterGuard *gua
     ret = OB_SCHEMA_ERROR;
     LOG_WARN("table schema is NULL", K(ret));
   } else if (OB_FAIL(guard->get_schema_version(t_version))) {
+  } else if (observer::namespace_worker_prototype::worker_namespace > 1 &&
+             t_version == OB_INVALID_VERSION &&
+             OB_FAIL(observer::namespace_worker_prototype::fetch_schema_version(false, false, t_version))) {
   } else if (OB_FAIL(das_dml_ctdef.table_param_.build(table_schema,
                                                       t_version,
                                                       das_dml_ctdef.column_ids_))) {
