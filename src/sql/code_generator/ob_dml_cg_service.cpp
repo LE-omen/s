@@ -2114,22 +2114,25 @@ int ObDmlCgService::fill_table_dml_param(share::schema::ObSchemaGetterGuard *gua
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_SCHEMA_ERROR;
     LOG_WARN("table schema is NULL", K(ret));
-  } else if (OB_FAIL(guard->get_schema_version(t_version))) {
-    if (observer::namespace_worker_prototype::worker_namespace > 1) {
+  } else {
+    ret = guard->get_schema_version(t_version);
+    if (ret != OB_SUCCESS && observer::namespace_worker_prototype::worker_namespace > 1) {
       // The table schema version was already resolved from the shared catalog
       // by generate_das_dml_ctdef(). Reuse it when the worker-local guard has
       // no materialized schema-version table.
       t_version = das_dml_ctdef.schema_version_;
       ret = (t_version == OB_INVALID_VERSION) ? ret : OB_SUCCESS;
     }
-  } else if (observer::namespace_worker_prototype::worker_namespace > 1 &&
-             t_version == OB_INVALID_VERSION) {
-    t_version = das_dml_ctdef.schema_version_;
-  } else if (OB_FAIL(das_dml_ctdef.table_param_.build(table_schema,
-                                                      t_version,
-                                                      das_dml_ctdef.column_ids_))) {
-  } else if (OB_FAIL(das_dml_ctdef.table_param_.set_data_table_rowkey_tags(guard,
-                                                                           table_schema))) {
+    if (OB_SUCC(ret) && observer::namespace_worker_prototype::worker_namespace > 1 &&
+        t_version == OB_INVALID_VERSION) {
+      t_version = das_dml_ctdef.schema_version_;
+    }
+    if (OB_SUCC(ret)) {
+      ret = das_dml_ctdef.table_param_.build(table_schema, t_version, das_dml_ctdef.column_ids_);
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(das_dml_ctdef.table_param_.set_data_table_rowkey_tags(guard,
+                                                                                       table_schema))) {
   } else if (table_schema->is_multivalue_index_aux() &&
             OB_FAIL(fill_multivalue_extra_info_on_table_param(guard, table_schema, das_dml_ctdef))) {
     LOG_WARN("fail to set multivalue index extra info on table param", K(ret), K(das_dml_ctdef));
