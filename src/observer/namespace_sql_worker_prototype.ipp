@@ -119,6 +119,8 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   WORKER_STEP(dtl::ObDTLIntermResultManager::server_module_start(mods_dtl_interm_result_manager_));
   WORKER_STEP(ObOptStatMonitorManager::server_module_init(mods_opt_stat_monitor_manager_));
   WORKER_STEP(ObPlanCache::server_module_init(mods_plan_cache_, *this));
+  WORKER_STEP(server_module_init_default(mods_lob_manager_));
+  WORKER_STEP(server_module_start_default(mods_lob_manager_));
   WORKER_STEP(ObPsCache::server_module_init(mods_ps_cache_));
   WORKER_STEP(ObSqlMemoryManager::server_module_init(mods_sql_memory_manager_));
   WORKER_STEP(ObOptStatManager::get_instance().init(&sql_proxy_, &config_));
