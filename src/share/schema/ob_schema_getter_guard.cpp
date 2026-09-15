@@ -77,8 +77,18 @@ int ObSchemaGetterGuard::worker_schema_prototype(char operation, uint64_t id, co
   schema = nullptr;
   if (name.empty() && get_from_local_cache(type, id, schema) == OB_SUCCESS) { return OB_SUCCESS; }
   Frame reply;
-  int ret = worker_catalog_fetch(operation, id, name, reply);
+  int64_t version = OB_INVALID_VERSION;
+  int ret = get_schema_version(version);
+  if (!ret) { ret = worker_catalog_fetch(operation, id, name, version, reply); }
   if (ret || !reply.number()) { return ret ? ret : reply.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT; }
+  ret = decode_worker_schema_prototype(reply, type, schema);
+  return ret ? ret : reply.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT;
+}
+template<typename T>
+int ObSchemaGetterGuard::decode_worker_schema_prototype(observer::namespace_worker_prototype::Frame &reply,
+                                                        ObSchemaType type, const T *&schema)
+{
+  int ret = OB_SUCCESS;
   void *memory = local_allocator_.alloc(sizeof(T));
   if (!memory) { return OB_ALLOCATE_MEMORY_FAILED; }
   T *owned = new (memory) T(&local_allocator_);
@@ -86,8 +96,9 @@ int ObSchemaGetterGuard::worker_schema_prototype(char operation, uint64_t id, co
   const ObSchema *base = owned;
   ObKVCacheHandle handle;
   const uint64_t key = type == TABLE_SCHEMA ? static_cast<const ObTableSchema *>(base)->get_table_id()
-      : static_cast<const ObDatabaseSchema *>(base)->get_database_id();
-  if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
+      : type == DATABASE_SCHEMA ? static_cast<const ObDatabaseSchema *>(base)->get_database_id()
+      : type == USER_SCHEMA ? static_cast<const ObUserInfo *>(base)->get_user_id() : 1;
+  if (reply.ret) { ret = reply.ret; }
   else { ret = put_to_local_cache(type, key, base, handle); }
   if (ret) { owned->~T(); }
   else { schema = owned; }
@@ -95,15 +106,35 @@ int ObSchemaGetterGuard::worker_schema_prototype(char operation, uint64_t id, co
 }
 void ObSchemaGetterGuard::release_worker_schemas_prototype()
 {
+  delete worker_priv_mgr_; worker_priv_mgr_ = nullptr;
   // Remote values belong to this native guard, not a second process-wide cache.
   if (observer::namespace_worker_prototype::worker_namespace == 1) {
     for (auto &object : schema_objs_) {
       if (!object.handle_.is_valid() && object.schema_
-          && (object.schema_type_ == TABLE_SCHEMA || object.schema_type_ == DATABASE_SCHEMA)) {
+          && (object.schema_type_ == TABLE_SCHEMA || object.schema_type_ == DATABASE_SCHEMA
+              || object.schema_type_ == USER_SCHEMA || object.schema_type_ == SYS_VARIABLE_SCHEMA)) {
         object.schema_->~ObSchema(); object.schema_ = nullptr;
       }
     }
   }
+}
+int ObSchemaGetterGuard::get_priv_mgr(const ObPrivMgr *&priv_mgr)
+{
+  priv_mgr = nullptr;
+  if (observer::namespace_worker_prototype::worker_namespace == 1) {
+    if (!worker_priv_mgr_) {
+      int64_t version = OB_INVALID_VERSION;
+      const int ret = get_schema_version(version);
+      if (ret) { return ret; }
+      worker_priv_mgr_ = observer::namespace_worker_prototype::make_remote_priv_mgr(version);
+    }
+    priv_mgr = worker_priv_mgr_;
+    return priv_mgr ? OB_SUCCESS : OB_ALLOCATE_MEMORY_FAILED;
+  }
+  const ObSchemaMgr *mgr = nullptr;
+  const int ret = check_lazy_guard(mgr);
+  if (!ret) { priv_mgr = &mgr->priv_mgr_; }
+  return ret;
 }
 ObSchemaMgrInfo::~ObSchemaMgrInfo()
 {
@@ -200,6 +231,7 @@ int ObSchemaGetterGuard::reset()
     FLOG_WARN("hold too much full schema memory", K(pin_cache_size_), K(lbt()));
   }
   pin_cache_size_ = 0;
+  worker_schema_version_ = OB_INVALID_VERSION;
   
 
   for (int64_t i = 0; i < schema_mgr_infos_.count(); i++) {
@@ -217,6 +249,9 @@ int ObSchemaGetterGuard::reset()
 
 int ObSchemaGetterGuard::get_schema_version(int64_t &schema_version) const
 {
+  if (worker_schema_version_ != OB_INVALID_VERSION) {
+    schema_version = worker_schema_version_; return OB_SUCCESS;
+  }
   int ret = OB_SUCCESS;
   const ObSchemaMgrInfo *schema_mgr_info = NULL;
   if (OB_FAIL(get_schema_mgr_info( schema_mgr_info))) {
@@ -391,6 +426,12 @@ int ObSchemaGetterGuard::get_user_id(const ObString &user_name,
                                      uint64_t &user_id,
                                      const bool is_role /*false*/)
 {
+  if (observer::namespace_worker_prototype::worker_namespace == 1) {
+    const ObUserInfo *user = nullptr;
+    const int ret = get_user_info(user_name, host_name, user);
+    user_id = user ? user->get_user_id() : OB_INVALID_ID;
+    return ret;
+  }
   int ret = OB_SUCCESS;
   UNUSED(is_role);
   const ObSchemaMgr *mgr = NULL;
@@ -1067,6 +1108,15 @@ int ObSchemaGetterGuard::get_user_info(const ObString &user_name,
                                        const ObString &host_name,
                                        const ObUserInfo *&user_info)
 {
+  if (observer::namespace_worker_prototype::worker_namespace == 1) {
+    ObSEArray<const ObUserInfo *, 4> users;
+    user_info = nullptr;
+    const int ret = get_user_info(user_name, users);
+    for (const auto *user : users) {
+      if (user->get_host_name_str() == host_name) { user_info = user; break; }
+    }
+    return ret;
+  }
   int ret = OB_SUCCESS;
   const ObSchemaMgr *mgr = NULL;
   user_info = NULL;
@@ -1096,6 +1146,22 @@ int ObSchemaGetterGuard::get_user_info(const ObString &user_name,
 int ObSchemaGetterGuard::get_user_info(const ObString &user_name,
                                        ObIArray<const ObUserInfo *> &users_info)
 {
+  if (observer::namespace_worker_prototype::worker_namespace == 1) {
+    using namespace observer::namespace_worker_prototype;
+    Frame reply;
+    int64_t version = OB_INVALID_VERSION;
+    int ret = get_schema_version(version);
+    if (!ret) { ret = worker_catalog_fetch('u', 0, user_name, version, reply); }
+    if (ret) { return ret; }
+    const uint64_t count = reply.number();
+    if (reply.ret || count > reply.data.size() / 8) { return OB_INVALID_ARGUMENT; }
+    for (uint64_t i = 0; !ret && i < count; ++i) {
+      const ObUserInfo *user = nullptr;
+      ret = decode_worker_schema_prototype(reply, USER_SCHEMA, user);
+      if (!ret) { ret = users_info.push_back(user); }
+    }
+    return ret ? ret : reply.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT;
+  }
   int ret = OB_SUCCESS;
   const ObSchemaMgr *mgr = NULL;
   if (!check_inner_stat()) {
@@ -1831,12 +1897,12 @@ int ObSchemaGetterGuard::get_session_priv_info(
     ret = OB_USER_NOT_EXIST;
     LOG_WARN("user info is null", KR(ret), K(user_id));
   } else {
-    const ObSchemaMgr *mgr = NULL;
+    const ObPrivMgr *mgr = NULL;
     ObOriginalDBKey db_priv_key(user_info->get_user_id(),
                                 database_name);
     ObPrivSet db_priv_set = OB_PRIV_SET_EMPTY;
-    if (OB_FAIL(check_lazy_guard( mgr))) {
-    } else if (OB_FAIL(mgr->priv_mgr_.get_db_priv_set(db_priv_key, db_priv_set))) {
+    if (OB_FAIL(get_priv_mgr(mgr))) {
+    } else if (OB_FAIL(mgr->get_db_priv_set(db_priv_key, db_priv_set))) {
     } else {
       
       session_priv.user_id_ = user_info->get_user_id();
@@ -1859,15 +1925,15 @@ int ObSchemaGetterGuard::get_column_priv_id(const uint64_t user_id,
     uint64_t &priv_id)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   priv_id = OB_INVALID_ID;
   if (0 == db.length() || 0 == table.length() || 0 == column.length() 
       || OB_INVALID_ID == user_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Invalid arguments", KR(ret));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
   } else {
-    const ObPrivMgr &priv_mgr = mgr->priv_mgr_;
+    const ObPrivMgr &priv_mgr = *mgr;
     if (OB_FAIL(priv_mgr.get_column_priv_id(user_id, db, table, column, priv_id))) {
     }
   }
@@ -1883,14 +1949,14 @@ int ObSchemaGetterGuard::check_db_access(
 {
   int ret = OB_SUCCESS;
   
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
 
   if (!session_priv.is_valid() || 0 == db.length()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Invalid arguments", K(session_priv), KR(ret));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
   } else {
-    const ObPrivMgr &priv_mgr = mgr->priv_mgr_;
+    const ObPrivMgr &priv_mgr = *mgr;
     ObOriginalDBKey db_priv_key(session_priv.user_id_,
                                 db);
     db_priv_set = OB_PRIV_SET_EMPTY;
@@ -1999,9 +2065,9 @@ int ObSchemaGetterGuard::get_db_priv_set(const uint64_t user_id,
                                          ObPrivSet &priv_set)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
-  if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_db_priv_set(
+  const ObPrivMgr *mgr = NULL;
+  if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_db_priv_set(
                      ObOriginalDBKey(user_id, db), priv_set))) {
   }
   return ret;
@@ -2010,10 +2076,10 @@ int ObSchemaGetterGuard::get_db_priv_set(const uint64_t user_id,
 int ObSchemaGetterGuard::get_db_priv_set(const ObOriginalDBKey &db_priv_key, ObPrivSet &priv_set, bool is_pattern)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   
-  if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_db_priv_set(db_priv_key, priv_set, is_pattern))) {
+  if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_db_priv_set(db_priv_key, priv_set, is_pattern))) {
   }
   return ret;
 }
@@ -2022,10 +2088,10 @@ int ObSchemaGetterGuard::get_table_priv_set(const ObTablePrivSortKey &table_priv
         ObPrivSet &priv_set)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   
-  if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_table_priv_set(table_priv_key, priv_set))) {
+  if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_table_priv_set(table_priv_key, priv_set))) {
   }
   return ret;
 }
@@ -2034,10 +2100,10 @@ int ObSchemaGetterGuard::get_routine_priv_set(const ObRoutinePrivSortKey &routin
         ObPrivSet &priv_set)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   
-  if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_routine_priv_set(routine_priv_key, priv_set))) {
+  if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_routine_priv_set(routine_priv_key, priv_set))) {
   }
   return ret;
 }
@@ -2046,11 +2112,11 @@ int ObSchemaGetterGuard::get_column_priv(const ObColumnPrivSortKey &column_priv_
         const ObColumnPriv *&column_priv)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   column_priv = NULL;
   
-  if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_column_priv(column_priv_key, column_priv))) {
+  if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_column_priv(column_priv_key, column_priv))) {
   }
   return ret;
 }
@@ -2060,10 +2126,10 @@ int ObSchemaGetterGuard::get_column_priv_set(const ObColumnPrivSortKey &column_p
 {
   int ret = OB_SUCCESS;
   priv_set = 0;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   
-  if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_column_priv_set(column_priv_key, priv_set))) {
+  if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_column_priv_set(column_priv_key, priv_set))) {
   }
   return ret;
 }
@@ -2073,12 +2139,12 @@ int ObSchemaGetterGuard::get_obj_privs(
     ObPackedObjPriv &obj_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   
   const ObObjPriv *obj_priv = NULL;
   obj_privs = 0;
-  if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_obj_priv(obj_priv_key, obj_priv))) {
+  if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_obj_priv(obj_priv_key, obj_priv))) {
   } else if (obj_priv != NULL) {
     obj_privs = obj_priv->get_obj_privs();
   }
@@ -2101,14 +2167,14 @@ int ObSchemaGetterGuard::get_user_infos_by_id(common::ObIArray<const ObUserInfo 
 int ObSchemaGetterGuard::get_db_priv_by_id(ObIArray<const ObDBPriv *> &db_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   db_privs.reset();
 
   if (!check_inner_stat()) {
     ret = OB_INNER_STAT_ERROR;
     LOG_WARN("inner stat error", KR(ret));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_db_privs_in_runtime(db_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_db_privs_in_runtime(db_privs))) {
   }
 
   return ret;
@@ -2127,14 +2193,14 @@ int ObSchemaGetterGuard::get_column_priv_in_table(const uint64_t user_id,
                                                   ObIArray<const ObColumnPriv *> &column_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   column_privs.reset();
 
   if (!check_inner_stat()) {
     ret = OB_INNER_STAT_ERROR;
     LOG_WARN("inner stat error", KR(ret));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_column_priv_in_table(user_id, db, table, column_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_column_priv_in_table(user_id, db, table, column_privs))) {
   }
 
   return ret;
@@ -2144,7 +2210,7 @@ int ObSchemaGetterGuard::get_db_priv_with_user_id(const uint64_t user_id,
                                                   ObIArray<const ObDBPriv *> &db_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   db_privs.reset();
 
   if (!check_inner_stat()) {
@@ -2153,8 +2219,8 @@ int ObSchemaGetterGuard::get_db_priv_with_user_id(const uint64_t user_id,
   } else if (OB_INVALID_ID == user_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(user_id));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_db_privs_in_user(user_id, db_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_db_privs_in_user(user_id, db_privs))) {
   }
 
   return ret;
@@ -2164,14 +2230,14 @@ int ObSchemaGetterGuard::get_db_priv_with_user_id(const uint64_t user_id,
 int ObSchemaGetterGuard::get_table_priv_by_id(ObIArray<const ObTablePriv *> &table_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   table_privs.reset();
 
   if (!check_inner_stat()) {
     ret = OB_INNER_STAT_ERROR;
     LOG_WARN("inner stat error", KR(ret));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_table_privs_in_runtime(table_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_table_privs_in_runtime(table_privs))) {
   }
 
   return ret;
@@ -2182,7 +2248,7 @@ int ObSchemaGetterGuard::get_table_priv_with_user_id(const uint64_t user_id,
                                                      ObIArray<const ObTablePriv *> &table_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   table_privs.reset();
 
   if (!check_inner_stat()) {
@@ -2191,8 +2257,8 @@ int ObSchemaGetterGuard::get_table_priv_with_user_id(const uint64_t user_id,
   } else if (OB_INVALID_ID == user_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(user_id));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_table_privs_in_user(user_id, table_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_table_privs_in_user(user_id, table_privs))) {
   }
 
   return ret;
@@ -2202,7 +2268,7 @@ int ObSchemaGetterGuard::get_routine_priv_with_user_id(const uint64_t user_id,
                                                       ObIArray<const ObRoutinePriv *> &routine_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   routine_privs.reset();
 
   if (!check_inner_stat()) {
@@ -2211,8 +2277,8 @@ int ObSchemaGetterGuard::get_routine_priv_with_user_id(const uint64_t user_id,
   } else if (OB_INVALID_ID == user_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(user_id));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_routine_privs_in_user( user_id, routine_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_routine_privs_in_user( user_id, routine_privs))) {
   }
 
   return ret;
@@ -2222,7 +2288,7 @@ int ObSchemaGetterGuard::get_column_priv_with_user_id(const uint64_t user_id,
                                                       ObIArray<const ObColumnPriv *> &column_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   column_privs.reset();
 
   if (!check_inner_stat()) {
@@ -2231,8 +2297,8 @@ int ObSchemaGetterGuard::get_column_priv_with_user_id(const uint64_t user_id,
   } else if (OB_INVALID_ID == user_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(user_id));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_column_privs_in_user( user_id, column_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_column_privs_in_user( user_id, column_privs))) {
   }
 
   return ret;
@@ -2242,7 +2308,7 @@ int ObSchemaGetterGuard::get_obj_priv_with_grantee_id(const uint64_t grantee_id,
     ObIArray<const ObObjPriv *> &obj_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   obj_privs.reset();
 
   if (!check_inner_stat()) {
@@ -2251,8 +2317,8 @@ int ObSchemaGetterGuard::get_obj_priv_with_grantee_id(const uint64_t grantee_id,
   } else if (OB_INVALID_ID == grantee_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(grantee_id));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_obj_privs_in_grantee(grantee_id, obj_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_obj_privs_in_grantee(grantee_id, obj_privs))) {
   }
 
   return ret;
@@ -2263,7 +2329,7 @@ int ObSchemaGetterGuard::get_obj_priv_with_grantor_id(const uint64_t grantor_id,
     bool reset_flag)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   if (reset_flag) {
     obj_privs.reset();
   }
@@ -2274,8 +2340,8 @@ int ObSchemaGetterGuard::get_obj_priv_with_grantor_id(const uint64_t grantor_id,
   } else if (OB_INVALID_ID == grantor_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(grantor_id));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_obj_privs_in_grantor(grantor_id,
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_obj_privs_in_grantor(grantor_id,
                      obj_privs, reset_flag))) {
   }
 
@@ -2289,7 +2355,7 @@ int ObSchemaGetterGuard::get_obj_priv_with_obj_id(
     bool reset_flag)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   if (reset_flag) {
     obj_privs.reset();
   }
@@ -2301,8 +2367,8 @@ int ObSchemaGetterGuard::get_obj_priv_with_obj_id(
              || OB_INVALID_ID == obj_type) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(obj_id), K(obj_type));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_obj_privs_in_obj(obj_id, obj_type,
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_obj_privs_in_obj(obj_id, obj_type,
                      obj_privs, reset_flag))) {
   }
 
@@ -2314,7 +2380,7 @@ int ObSchemaGetterGuard::get_obj_privs_in_grantor_ur_obj_id(const ObObjPrivSortK
     common::ObIArray<const ObObjPriv *> &obj_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
 
   if (!check_inner_stat()) {
     ret = OB_INNER_STAT_ERROR;
@@ -2322,8 +2388,8 @@ int ObSchemaGetterGuard::get_obj_privs_in_grantor_ur_obj_id(const ObObjPrivSortK
   } else if (!obj_key.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(obj_key));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_obj_privs_in_grantor_ur_obj_id(obj_key, obj_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_obj_privs_in_grantor_ur_obj_id(obj_key, obj_privs))) {
   }
 
   return ret;
@@ -2333,7 +2399,7 @@ int ObSchemaGetterGuard::get_obj_privs_in_grantor_obj_id(const ObObjPrivSortKey 
     common::ObIArray<const ObObjPriv *> &obj_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
 
   if (!check_inner_stat()) {
     ret = OB_INNER_STAT_ERROR;
@@ -2341,8 +2407,8 @@ int ObSchemaGetterGuard::get_obj_privs_in_grantor_obj_id(const ObObjPrivSortKey 
   } else if (!obj_key.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(obj_key));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_obj_privs_in_grantor_obj_id(obj_key, obj_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_obj_privs_in_grantor_obj_id(obj_key, obj_privs))) {
   }
 
   return ret;
@@ -2370,6 +2436,15 @@ int ObSchemaGetterGuard::get_schema_version(
     int64_t &schema_version,
     uint64_t *schema_belong_db_id)
 {
+  if (observer::namespace_worker_prototype::worker_namespace == 1
+      && (schema_type == USER_SCHEMA || schema_type == SYS_VARIABLE_SCHEMA)) {
+    const ObUserInfo *user = nullptr;
+    const ObSysVariableSchema *variables = nullptr;
+    const int ret = schema_type == USER_SCHEMA ? get_user_info(schema_id, user) : get_sys_variable_schema(variables);
+    schema_version = user ? user->get_schema_version() : variables ? variables->get_schema_version() : OB_INVALID_VERSION;
+    if (schema_belong_db_id) { *schema_belong_db_id = OB_INVALID_ID; }
+    return ret;
+  }
   if (observer::namespace_worker_prototype::worker_namespace == 1
       && (schema_type == TABLE_SCHEMA || schema_type == DATABASE_SCHEMA)) {
     const ObTableSchema *table = nullptr;
@@ -2611,8 +2686,15 @@ int ObSchemaGetterGuard::get_schema(
     } else if (schema_type == DATABASE_SCHEMA) {
       const ObDatabaseSchema *database = nullptr;
       remote_ret = worker_schema_prototype('b', schema_id, ObString(), DATABASE_SCHEMA, database); remote = database;
+    } else if (schema_type == USER_SCHEMA) {
+      const ObUserInfo *user = nullptr;
+      remote_ret = worker_schema_prototype('u', schema_id, ObString(), USER_SCHEMA, user); remote = user;
+    } else if (schema_type == SYS_VARIABLE_SCHEMA) {
+      const ObSysVariableSchema *variables = nullptr;
+      remote_ret = worker_schema_prototype('n', 1, ObString(), SYS_VARIABLE_SCHEMA, variables); remote = variables;
     }
-    if (schema_type == TABLE_SCHEMA || schema_type == DATABASE_SCHEMA) {
+    if (schema_type == TABLE_SCHEMA || schema_type == DATABASE_SCHEMA
+        || schema_type == USER_SCHEMA || schema_type == SYS_VARIABLE_SCHEMA) {
       schema = static_cast<const T *>(remote); return remote_ret;
     }
   }
@@ -4262,7 +4344,7 @@ int ObSchemaGetterGuard::get_sys_priv_with_grantee_id(const uint64_t grantee_id,
     ObSysPriv *&sys_priv)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
 
   if (!check_inner_stat()) {
     ret = OB_INNER_STAT_ERROR;
@@ -4270,8 +4352,8 @@ int ObSchemaGetterGuard::get_sys_priv_with_grantee_id(const uint64_t grantee_id,
   } else if (OB_INVALID_ID == grantee_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(grantee_id));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_sys_priv_in_grantee(grantee_id, sys_priv))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_sys_priv_in_grantee(grantee_id, sys_priv))) {
   }
 
   return ret;

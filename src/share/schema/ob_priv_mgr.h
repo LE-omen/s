@@ -180,7 +180,7 @@ public:
   int add_db_privs(const common::ObIArray<ObDBPriv> &db_privs);
   int add_db_priv(const ObDBPriv &db_priv);
   int del_db_priv(const ObOriginalDBKey &db_priv_key);
-  int get_db_priv(const ObOriginalDBKey &db_priv_key,
+  virtual int get_db_priv(const ObOriginalDBKey &db_priv_key,
                   const ObDBPriv *&db_priv,
                   bool db_is_pattern = false) const;
   int get_db_priv_set(const ObOriginalDBKey &db_priv_key,
@@ -195,7 +195,7 @@ public:
   int add_column_priv(const ObColumnPriv &column_priv);
   int del_column_priv(const ObColumnPrivIdKey &column_priv_key);
 
-  int get_table_priv(const ObTablePrivSortKey &table_priv_key,
+  virtual int get_table_priv(const ObTablePrivSortKey &table_priv_key,
                      const ObTablePriv *&table_priv) const;
   int get_table_priv_set(const ObTablePrivSortKey &table_priv_key,
                          ObPrivSet &priv_set) const;
@@ -203,34 +203,34 @@ public:
   int add_routine_privs(const common::ObIArray<ObRoutinePriv> &routine_privs);
   int add_routine_priv(const ObRoutinePriv &routine_priv);
   int del_routine_priv(const ObRoutinePrivSortKey &routine_priv_key);
-  int get_routine_priv(const ObRoutinePrivSortKey &routine_priv_key,
+  virtual int get_routine_priv(const ObRoutinePrivSortKey &routine_priv_key,
                       const ObRoutinePriv *&routine_priv) const;
 
   int get_routine_priv_set(const ObRoutinePrivSortKey &routine_priv_key,
                           ObPrivSet &priv_set) const;
-  int get_column_priv_in_table(const uint64_t user_id,
+  virtual int get_column_priv_in_table(const uint64_t user_id,
                                  const ObString &db,
                                  const ObString &table,
                                  ObIArray<const ObColumnPriv *> &column_privs) const;
 
-  int get_column_priv_by_id(const uint64_t priv_id,
+  virtual int get_column_priv_by_id(const uint64_t priv_id,
                             const ObColumnPriv *&column_priv) const;
-  int get_column_priv_id(const uint64_t user_id,
+  virtual int get_column_priv_id(const uint64_t user_id,
                         const ObString &db,
                         const ObString &table,
                         const ObString &column,
                         uint64_t &column_priv_id) const;
-  int get_column_priv_in_db(const uint64_t user_id,
+  virtual int get_column_priv_in_db(const uint64_t user_id,
                                  const ObString &db,
                                  ObIArray<const ObColumnPriv *> &column_privs) const;
-  int get_column_priv(const ObColumnPrivSortKey &column_priv_key,
+  virtual int get_column_priv(const ObColumnPrivSortKey &column_priv_key,
                       const ObColumnPriv *&column_priv) const;
   int get_column_priv_set(const ObColumnPrivSortKey &column_priv_key,
                          ObPrivSet &priv_set) const;
-  int table_grant_in_db(const uint64_t user_id,
+  virtual int table_grant_in_db(const uint64_t user_id,
                         const common::ObString &db,
                         bool &is_grant) const;
-  int routine_grant_in_db(const uint64_t user_id,
+  virtual int routine_grant_in_db(const uint64_t user_id,
                           const ObString &db,
                           bool &is_grant) const;
   //obj priv
@@ -238,19 +238,19 @@ public:
   int del_obj_privs(const common::ObIArray<ObObjPrivSortKey> &obj_priv_keys);
   int add_obj_priv(const ObObjPriv &obj_priv);
   int del_obj_priv(const ObObjPrivSortKey &obj_priv);
-  int get_obj_priv(const ObObjPrivSortKey &obj_priv_key,
+  virtual int get_obj_priv(const ObObjPrivSortKey &obj_priv_key,
                    const ObObjPriv *&obj_priv) const;
-  int get_obj_privs_in_ur_and_obj(const ObObjPrivSortKey &obj_key,
+  virtual int get_obj_privs_in_ur_and_obj(const ObObjPrivSortKey &obj_key,
       ObPackedObjPriv &obj_privs) const;
-  int get_obj_privs_in_grantor_ur_obj_id(const ObObjPrivSortKey &obj_key,
+  virtual int get_obj_privs_in_grantor_ur_obj_id(const ObObjPrivSortKey &obj_key,
       common::ObIArray<const ObObjPriv *> &obj_privs) const;
-  int get_obj_privs_in_grantor_obj_id(const ObObjPrivSortKey &obj_key,
+  virtual int get_obj_privs_in_grantor_obj_id(const ObObjPrivSortKey &obj_key,
       common::ObIArray<const ObObjPriv *> &obj_privs) const;
   //sys priv
   int add_sys_privs(const common::ObIArray<ObSysPriv> &sys_privs);
   int add_sys_priv(const ObSysPriv &sys_priv);
   int del_sys_priv(const ObSysPrivKey &db_priv_key);
-  int get_sys_priv(const ObSysPrivKey &sys_priv_key,
+  virtual int get_sys_priv(const ObSysPrivKey &sys_priv_key,
                    const ObSysPriv *&sys_priv) const;
   int get_sys_priv_array(const ObSysPrivKey &sys_priv_key,
                          const ObPackedPrivArray &packed_priv_array) const;
@@ -260,46 +260,46 @@ public:
   int del_obj_mysql_privs(const common::ObIArray<ObObjMysqlPrivSortKey> &obj_mysql_priv_keys);
   int add_obj_mysql_priv(const ObObjMysqlPriv &obj_mysql_priv);
   int del_obj_mysql_priv(const ObObjMysqlPrivSortKey &obj_mysql_priv_key);
-  int get_obj_mysql_priv(const ObObjMysqlPrivSortKey &obj_mysql_priv_key,
+  virtual int get_obj_mysql_priv(const ObObjMysqlPrivSortKey &obj_mysql_priv_key,
                          const ObObjMysqlPriv *&obj_mysql_priv) const;
   int get_obj_mysql_priv_set(const ObObjMysqlPrivSortKey &obj_mysql_priv_key,
                              ObPrivSet &priv_set) const;
   // other
-  int get_db_privs_in_runtime(common::ObIArray<const ObDBPriv *> &db_privs) const;
-  int get_db_privs_in_user(const uint64_t user_id,
+  virtual int get_db_privs_in_runtime(common::ObIArray<const ObDBPriv *> &db_privs) const;
+  virtual int get_db_privs_in_user(const uint64_t user_id,
                            common::ObIArray<const ObDBPriv *> &db_privs) const;
-  int get_table_privs_in_runtime(common::ObIArray<const ObTablePriv *> &table_privs) const;
-  int get_table_privs_in_user(const uint64_t user_id,
+  virtual int get_table_privs_in_runtime(common::ObIArray<const ObTablePriv *> &table_privs) const;
+  virtual int get_table_privs_in_user(const uint64_t user_id,
                               common::ObIArray<const ObTablePriv *> &table_privs) const;
-  int get_routine_privs_in_user(const uint64_t user_id,
+  virtual int get_routine_privs_in_user(const uint64_t user_id,
                                 ObIArray<const ObRoutinePriv *> &routine_privs) const;
 
 
 
-  int get_column_privs_in_user(const uint64_t user_id,
+  virtual int get_column_privs_in_user(const uint64_t user_id,
                                 ObIArray<const ObColumnPriv *> &column_privs) const;
-  int get_obj_privs_in_grantee(const uint64_t grantee_id,
+  virtual int get_obj_privs_in_grantee(const uint64_t grantee_id,
                                common::ObIArray<const ObObjPriv *> &obj_privs) const;
-  int get_obj_privs_in_grantor(const uint64_t grantor_id,
+  virtual int get_obj_privs_in_grantor(const uint64_t grantor_id,
                                common::ObIArray<const ObObjPriv *> &obj_privs,
                                bool reset_flag) const;
-  int get_obj_privs_in_obj(const uint64_t obj_id,
+  virtual int get_obj_privs_in_obj(const uint64_t obj_id,
                                const uint64_t obj_type,
                                common::ObIArray<const ObObjPriv *> &obj_privs,
                                bool reset_flag) const;
-  int get_sys_privs_in_runtime(common::ObIArray<const ObSysPriv *> &sys_privs) const;
-  int get_sys_priv_in_grantee(const uint64_t grantee_id,
+  virtual int get_sys_privs_in_runtime(common::ObIArray<const ObSysPriv *> &sys_privs) const;
+  virtual int get_sys_priv_in_grantee(const uint64_t grantee_id,
                               ObSysPriv *& sys_priv) const;
-  int get_obj_mysql_privs_in_user(const uint64_t user_id,
+  virtual int get_obj_mysql_privs_in_user(const uint64_t user_id,
                                   ObIArray<const ObObjMysqlPriv *> &obj_mysql_privs) const;
-  int get_obj_mysql_privs_in_obj(const ObString &obj_name,
+  virtual int get_obj_mysql_privs_in_obj(const ObString &obj_name,
                                  const uint64_t obj_type,
                                  ObIArray<const ObObjMysqlPriv *> &obj_privs,
                                  bool reset_flag) const;
     
   static const char *get_first_priv_name(ObPrivSet priv_set);
   static const char *get_priv_name(int64_t priv_shift);
-  int get_priv_schema_count(int64_t &priv_scheam_count) const;
+  virtual int get_priv_schema_count(int64_t &priv_scheam_count) const;
   int get_schema_statistics(const ObSchemaType schema_type,
                             ObSchemaStatisticsInfo &schema_info) const;
 private:

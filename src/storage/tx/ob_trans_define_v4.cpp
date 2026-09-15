@@ -362,6 +362,16 @@ OB_SERIALIZE_MEMBER(ObTxParam,
                     lock_timeout_us_,
                     access_mode_,
                     isolation_);
+int ObTxDesc::deserialize_shadow(const char *buf, int64_t len, int64_t &pos)
+{
+  int ret = deserialize(buf, len, pos);
+  if (OB_SUCC(ret) && DATA_CURRENT_VERSION != data_version_) {
+    ret = OB_NOT_SUPPORTED;
+  }
+  if (OB_SUCC(ret)) { flags_.SHADOW_ = true; }
+  return ret;
+}
+
 ObTxDesc::ObTxDesc()
   : trace_info_(),
     data_version_(0),

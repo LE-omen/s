@@ -10,6 +10,7 @@
 #include <vector>
 namespace oceanbase { namespace sql { class ObSQLSessionInfo; } }
 namespace oceanbase { namespace obcall { struct ObAdminSetConfigArg; } }
+namespace oceanbase { namespace share { namespace schema { class ObPrivMgr; } } }
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 constexpr size_t MAX_FRAME = 256 * 1024;
 constexpr size_t MAX_SQL_MESSAGE = 64 * 1024 * 1024;
@@ -65,13 +66,14 @@ struct Frame {
   }
   bool consumed() const { return !ret && pos == static_cast<int64_t>(data.size()); }
 };
-using CatalogFetch = int (*)(char, uint64_t, const common::ObString &, Frame &);
+using CatalogFetch = int (*)(char, uint64_t, const common::ObString &, int64_t, Frame &);
 inline CatalogFetch worker_catalog_fetch = nullptr;
 inline uint64_t worker_namespace = 0;
 inline bool worker_process = false;
 bool bootstrap_enabled();
 int check_sql_execution_role();
 int fetch_schema_version(bool published, bool core_version, int64_t &version);
+share::schema::ObPrivMgr *make_remote_priv_mgr(int64_t version);
 int admin_set_config(obcall::ObAdminSetConfigArg &arg);
 bool enabled();
 struct SessionBinding;

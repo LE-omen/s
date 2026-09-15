@@ -85,19 +85,11 @@ int ObTransService::acquire_tx(const char* buf,
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(tx_desc_mgr_.alloc(tx))) {
-  } else if (OB_FAIL(tx->deserialize(buf, len, pos))) {
+  } else if (OB_FAIL(tx->deserialize_shadow(buf, len, pos))) {
     tx_desc_mgr_.revert(*tx);
     tx = NULL;
     TRANS_LOG(WARN, "desrialize txDesc fail", K(ret),
               K(len),K(pos), K(buf), KPC(this));
-  } else if (OB_UNLIKELY(DATA_CURRENT_VERSION != tx->data_version_)) {
-    ret = OB_NOT_SUPPORTED;
-    TRANS_LOG(WARN, "transaction descriptor data version mismatch", K(ret), KPC(tx),
-              "current_data_version", DATA_CURRENT_VERSION);
-    tx_desc_mgr_.revert(*tx);
-    tx = NULL;
-  } else {
-    tx->flags_.SHADOW_ = true;
   }
   if (tx) {
     REC_TRANS_TRACE_EXT(&tx->get_tlog(), deserialize,

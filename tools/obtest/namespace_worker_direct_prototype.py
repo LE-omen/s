@@ -2,11 +2,15 @@
 """Native client ingress into the namespace worker; shared SQL stays forbidden."""
 import argparse
 import concurrent.futures
+import datetime
+import decimal
 import io
 import os
 import re
 import resource
 import subprocess
+import time
+import traceback
 
 import pymysql
 import mysql.connector
@@ -59,6 +63,141 @@ def protocol_probe(experiment, port):
         experiment.record("direct_connection_reset_verified")
     finally:
         connection.close()
+
+
+def authentication_probe(experiment, port):
+    with connect(port) as root, root.cursor() as cursor:
+        cursor.execute("CREATE USER 'direct_reader'@'%' IDENTIFIED BY 'Direct-test-19!'")
+        cursor.execute("GRANT SELECT ON direct_check.t TO 'direct_reader'@'%'")
+    for user, password in [("direct_reader", "incorrect"), ("missing_reader", "")]:
+        try:
+            pymysql.connect(host="127.0.0.1", port=port, user=user, password=password,
+                            connect_timeout=3, read_timeout=20)
+        except pymysql.MySQLError as error:
+            assert error.args[0] == 1045, error
+        else:
+            raise AssertionError("invalid credentials were accepted")
+    experiment.record("direct_authentication_rejection_verified")
+    with pymysql.connect(host="127.0.0.1", port=port, user="direct_reader", password="Direct-test-19!",
+                         database="direct_check", autocommit=True, connect_timeout=3, read_timeout=20) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT v FROM t WHERE id=1")
+            assert cursor.fetchone() == ("committed",)
+            try:
+                cursor.execute("UPDATE t SET v='unauthorized' WHERE id=1")
+            except pymysql.MySQLError as error:
+                assert error.args[0] == 1142, error
+            else:
+                raise AssertionError("table write without a grant was accepted")
+            with connect(port) as root, root.cursor() as admin:
+                admin.execute("REVOKE SELECT ON direct_check.t FROM 'direct_reader'@'%'")
+            try:
+                cursor.execute("SELECT v FROM t WHERE id=1")
+            except pymysql.MySQLError as error:
+                assert error.args[0] in (1044, 1142), error
+            else:
+                raise AssertionError("revoked table grant remained effective")
+            with connect(port) as root, root.cursor() as admin:
+                admin.execute("GRANT SELECT(v) ON direct_check.t TO 'direct_reader'@'%'")
+            cursor.execute("SELECT v FROM t ORDER BY v")
+            assert cursor.fetchall() == (("committed",), ("second",))
+            try:
+                cursor.execute("SELECT id FROM t")
+            except pymysql.MySQLError as error:
+                assert error.args[0] == 1143, error
+            else:
+                raise AssertionError("column without a grant was readable")
+    experiment.record("direct_table_privileges_verified")
+
+
+def lifecycle_probe(experiment, port):
+    with connect(port) as control, control.cursor() as admin:
+        victim = connect(port)
+        with victim.cursor() as cursor:
+            cursor.execute("BEGIN")
+            cursor.execute("UPDATE direct_check.t SET v='disconnected' WHERE id=1")
+        victim.close()
+        admin.execute("SET ob_query_timeout=3000000")
+        admin.execute("UPDATE direct_check.t SET v='committed' WHERE id=1")
+        experiment.record("direct_disconnect_rollback_unlock_verified")
+        with connect(port) as victim:
+            def interrupted_query():
+                with victim.cursor() as cursor:
+                    try:
+                        cursor.execute("SELECT SLEEP(10)")
+                    except pymysql.MySQLError as error:
+                        assert error.args[0] == 1317, error
+                    else:
+                        raise AssertionError("KILL QUERY did not interrupt SLEEP")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                waiting = pool.submit(interrupted_query)
+                time.sleep(.2)
+                admin.execute(f"KILL QUERY {victim.thread_id()}")
+                waiting.result(timeout=5)
+            with victim.cursor() as cursor:
+                cursor.execute("SELECT 1")
+                assert cursor.fetchone() == (1,)
+        experiment.record("direct_query_cancel_session_reuse_verified")
+        admin.execute("SET GLOBAL autocommit=0")
+        try:
+            with pymysql.connect(host="127.0.0.1", port=port, user="root", autocommit=None,
+                                 connect_timeout=3, read_timeout=20) as fresh:
+                assert not fresh.server_status & 2
+                with fresh.cursor() as cursor:
+                    cursor.execute("SELECT @@autocommit")
+                    assert cursor.fetchone() == (0,)
+        finally:
+            admin.execute("SET GLOBAL autocommit=1")
+        experiment.record("direct_global_variable_greeting_verified")
+
+
+def ddl_probe(experiment, port):
+    with connect(port) as connection, connection.cursor() as cursor:
+        cursor.execute("CREATE DATABASE ddl_check")
+        cursor.execute("USE ddl_check")
+        cursor.execute("CREATE TABLE records(tenant_id INT, id INT, label VARCHAR(64), amount DECIMAL(12,2), "
+                       "created DATE, nullable_value INT NULL, PRIMARY KEY(tenant_id,id))")
+        cursor.execute("INSERT INTO records VALUES(1,1,'first',12.34,'2026-09-15',NULL),(1,2,'second',56.78,'2026-09-14',9)")
+        cursor.execute("SELECT label,amount,created,nullable_value FROM records WHERE tenant_id=1 AND id=1")
+        assert cursor.fetchone() == ("first", decimal.Decimal("12.34"), datetime.date(2026, 9, 15), None)
+        experiment.record("direct_composite_key_types_verified")
+        cursor.execute("SELECT /*+ parallel(2) */ SUM(amount) FROM records")
+        assert cursor.fetchone() == (decimal.Decimal("69.12"),)
+        experiment.record("direct_parallel_scan_verified")
+        parallel_insert = ("INSERT /*+ enable_parallel_dml parallel(2) */ INTO records "
+                           "SELECT tenant_id,id+10,label,amount,created,nullable_value FROM records WHERE id<=2")
+        cursor.execute("BEGIN")
+        cursor.execute(parallel_insert)
+        cursor.execute("ROLLBACK")
+        cursor.execute("SELECT COUNT(*) FROM records")
+        assert cursor.fetchone() == (2,)
+        cursor.execute(parallel_insert)
+        cursor.execute("SELECT COUNT(*),SUM(amount) FROM records")
+        assert cursor.fetchone() == (4, decimal.Decimal("138.24"))
+        cursor.execute("DELETE FROM records WHERE id>10")
+        experiment.record("direct_parallel_dml_verified")
+        cursor.execute("CREATE INDEX records_label ON records(label)")
+        cursor.execute("SELECT id FROM records FORCE INDEX(records_label) WHERE label='second'")
+        assert cursor.fetchall() == ((2,),)
+        cursor.execute("CREATE UNIQUE INDEX records_unique ON records(tenant_id,label)")
+        try:
+            cursor.execute("INSERT INTO records VALUES(1,3,'first',1,'2026-09-15',NULL)")
+        except pymysql.MySQLError as error:
+            assert error.args[0] == 1062, error
+        else:
+            raise AssertionError("unique index did not reject a duplicate")
+        cursor.execute("UPDATE records SET label='changed' WHERE tenant_id=1 AND id=2")
+        cursor.execute("SELECT id FROM records FORCE INDEX(records_label) WHERE label='changed'")
+        assert cursor.fetchall() == ((2,),)
+        experiment.record("direct_indexes_verified")
+        cursor.execute("ALTER TABLE records ADD COLUMN revision INT DEFAULT 7")
+        cursor.execute("SELECT revision FROM records WHERE tenant_id=1 AND id=1")
+        assert cursor.fetchone() == (7,)
+        cursor.execute("DROP INDEX records_label ON records")
+        cursor.execute("DROP INDEX records_unique ON records")
+        cursor.execute("DROP TABLE records")
+        cursor.execute("DROP DATABASE ddl_check")
+        experiment.record("direct_general_ddl_verified")
 
 
 def probe(experiment):
@@ -116,6 +255,15 @@ def probe(experiment):
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(client, range(8)))
     protocol_probe(experiment, port)
+    failures = []
+    for name, check in [("authentication", authentication_probe), ("lifecycle", lifecycle_probe), ("ddl", ddl_probe)]:
+        try:
+            check(experiment, port)
+        except Exception as error:
+            traceback.print_exc()
+            failures.append((name, repr(error)))
+            experiment.record("direct_case_failed", case=name, error=repr(error))
+    assert not failures, failures
     assert "PROTOTYPE_V18_SHARED_SQL_REJECT" not in experiment.engine_log()
     experiment.record("direct_native_ingress_verified", clients=8, transactions=True)
 

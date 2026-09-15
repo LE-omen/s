@@ -658,6 +658,11 @@ int ObMultiVersionSchemaService::get_runtime_schema_guard(
     int64_t runtime_schema_version/* = common::OB_INVALID_VERSION*/,
     const RefreshSchemaMode refresh_schema_mode /* = RefreshSchemaMode::NORMAL */)
 {
+  const bool remote = observer::namespace_worker_prototype::worker_namespace == 1;
+  const int64_t requested_version = runtime_schema_version;
+  // The local bootstrap manager supplies immutable engine definitions. Remote
+  // catalog reads use the shared service's version, including historical guards.
+  if (remote) { runtime_schema_version = OB_INVALID_VERSION; }
   int ret = OB_SUCCESS;
   int64_t latest_local_version = OB_INVALID_VERSION;
   int64_t snapshot_version = OB_INVALID_VERSION;
@@ -705,9 +710,11 @@ int ObMultiVersionSchemaService::get_runtime_schema_guard(
     }
   }
 
-  if (OB_SUCC(ret)) {
-  
-    
+  if (OB_SUCC(ret) && remote) {
+    int64_t version = OB_INVALID_VERSION;
+    ret = observer::namespace_worker_prototype::fetch_schema_version(false, true, version);
+    if (!ret && requested_version > version) { ret = OB_SCHEMA_EAGAIN; }
+    if (!ret) { guard.worker_schema_version_ = requested_version == OB_INVALID_VERSION ? version : requested_version; }
   }
 
   return ret;

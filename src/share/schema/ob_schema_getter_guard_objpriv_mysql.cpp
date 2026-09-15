@@ -32,10 +32,10 @@ int ObSchemaGetterGuard::get_obj_mysql_priv_set(const ObObjMysqlPrivSortKey &obj
                                                 ObPrivSet &priv_set)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   
-  if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_obj_mysql_priv_set(obj_mysql_priv_key, priv_set))) {
+  if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_obj_mysql_priv_set(obj_mysql_priv_key, priv_set))) {
   }
   return ret;
 }
@@ -44,13 +44,13 @@ int ObSchemaGetterGuard::get_obj_mysql_priv_with_user_id(const uint64_t user_id,
                                                          ObIArray<const ObObjMysqlPriv *> &obj_mysql_privs)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   obj_mysql_privs.reset();
   if (OB_INVALID_ID == user_id) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(user_id));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_obj_mysql_privs_in_user( user_id, obj_mysql_privs))) {
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_obj_mysql_privs_in_user( user_id, obj_mysql_privs))) {
   }
   return ret;
 }
@@ -61,7 +61,7 @@ int ObSchemaGetterGuard::get_obj_mysql_priv_with_obj_name(const ObString &obj_na
                                                           bool reset_flag)
 {
   int ret = OB_SUCCESS;
-  const ObSchemaMgr *mgr = NULL;
+  const ObPrivMgr *mgr = NULL;
   if (reset_flag) {
     obj_privs.reset();
   }
@@ -69,8 +69,8 @@ int ObSchemaGetterGuard::get_obj_mysql_priv_with_obj_name(const ObString &obj_na
           || OB_INVALID_ID == obj_type) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arguments", K(obj_name), K(obj_type));
-  } else if (OB_FAIL(check_lazy_guard( mgr))) {
-  } else if (OB_FAIL(mgr->priv_mgr_.get_obj_mysql_privs_in_obj( obj_name, obj_type,
+  } else if (OB_FAIL(get_priv_mgr(mgr))) {
+  } else if (OB_FAIL(mgr->get_obj_mysql_privs_in_obj( obj_name, obj_type,
                   obj_privs, reset_flag))) {
   }
   return ret;

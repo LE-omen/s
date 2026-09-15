@@ -73,3 +73,33 @@
 - 本轮回归通过：严格空目录 bootstrap 和崩溃重启 `/data/1/tmp/namespace-v19-native-bootstrap-regression.log`；同 session 嵌套 SQL、取消及 worker 死亡回滚 `/data/1/tmp/namespace-v19-native-nested-regression.log`；IPC 句柄复用、取消及并发 `/data/1/tmp/namespace-v19-native-handles-regression.log`。这些验证不代表真实权限、通用 DDL 或 namespace 多 worker 全部完成。
 
 以上都是目标 1～3 的剩余工作，不是可省略的后续建议。内存优化、完整 namespace fork 对象覆盖和跨平台部署验收继续维持原边界。
+
+### 统一元数据读取（进行中）
+
+- 原生直连入口及前述回归已提交为 `b3f2949b6`。
+- worker 的 schema guard 现在记录共享端的快照版本，表、库、用户及系统变量读取携带该版本。共享端使用原生历史版本接口，若返回版本不同则报 `OB_SCHEMA_EAGAIN`，避免混用版本；仍需 DDL 并发、历史版本及计划失效验收。
+- 用户密码、锁定状态和系统变量已从共享端按 guard 生命周期读取，不新增进程级元数据缓存。
+- 握手在 session 创建前读取全局 autocommit。公共元数据接口为没有 SQL session 的调用使用临时路由，覆盖原生握手和后台读取。当前为同步 RPC，后续入口性能验收需覆盖这一点。
+- 构建 `/data/1/tmp/namespace-v19-metadata-no-session-build.log` 通过。`/data/1/tmp/namespace-v19-direct-metadata-no-session.log` 已通过原直连矩阵、真实用户创建、错误密码/不存在用户拒绝；随后在表级授权用户切库时报 1044，确认权限读取仍在使用 worker 启动时的本地权限表。
+- 正在统一原生 `ObPrivMgr` 读取接口：共享端执行原生查找，worker 按 guard 生命周期持有返回值，原生权限判断及错误处理仍在 worker。权限用例覆盖只读授权、拒绝写入、撤权即时生效和列授权；通用 DDL 用例已补复合主键、decimal/date/NULL、普通/唯一索引和 schema 修改，尚未全部通过。
+- `ObPrivMgr` 的 30 个底层读取接口已接入远程适配，原生权限聚合逻辑继续复用。构建 `/data/1/tmp/namespace-v19-privilege-reader-build2.log` 通过。
+- `/data/1/tmp/namespace-v19-direct-privileges-ddl.log` 已通过真实用户表级只读授权、拒绝写入、已有连接撤权即时生效、列授权，以及直连断连回滚解锁、KILL QUERY 后连接复用、全局 autocommit 修改后的新连接握手。
+- 通用表最初在 DECIMAL 读取时报 4016。`/data/1/tmp/namespace-v19-direct-column-diagnosis.log` 验证同一表字符串/date/NULL 均可读取，仅 DECIMAL 失败；扫描和重复键返回代码直接取原始列类型，遗漏精度与小数位。已改用原生读写计划的完整列描述，构建 `/data/1/tmp/namespace-v19-native-column-types-build.log` 通过，完整矩阵重新验证中。
+- `/data/1/tmp/namespace-v19-direct-native-columns.log` 已通过复合主键、字符串、DECIMAL、DATE 和 NULL 读写，随后 CREATE INDEX 返回 -4002。
+- 分阶段调试确认 CREATE INDEX 的参数、加锁、schema 生成及版本分配、schema 持久化和 tablet 创建均成功；索引任务插入因 trace ID 为空失败。`/data/1/tmp/namespace-v19-index-trace-stack.log` 显示任务已初始化但 trace 四个字均为 0。共享 runtime 的 `OB_TASK` 不会像 MySQL 请求自动建立 trace，上轮存储调度拆分遗漏了这项上下文。
+- 公共 worker 存储请求现携带 trace ID，共享任务使用原生 `ObTraceIdGuard` 在调用期间恢复；没有 SQL trace 的后台元数据读取和本地清理建立独立 trace。修复覆盖两个请求方向，未修改原生索引任务规则。构建 `/data/1/tmp/namespace-v19-storage-trace-build.log` 通过。
+- `/data/1/tmp/namespace-v19-direct-storage-trace.log` 原有协议、权限、事务和类型用例通过，CREATE INDEX 转为等待阶段超时。`/data/1/tmp/namespace-v19-index-progress-worker.log` 发现 IPC 线程均等待任务队列锁；嵌套任务的最后 session 引用可能在重新加锁后销毁，销毁又发起 RPC 并重入同一等待循环。现把嵌套任务销毁移至加锁之前，构建 `/data/1/tmp/namespace-v19-nested-owner-build.log` 通过；尚需长时间并发销毁回归。
+- `/data/1/tmp/namespace-v19-index-progress2-probe.log` 确认索引任务已经持久化并进入状态 3（REDEFINITION），用户等待却立即报超时。worker 跳过完整 `ObServer::start()`，`stop_` 仍为构造时的 true；原生 DDL 等待认为服务已停机。worker 启动/停止现同步发布原生运行状态，构建 `/data/1/tmp/namespace-v19-serving-state-build.log` 通过。
+- 修复运行状态后，原有直连矩阵仍通过；CREATE INDEX 进入原生回填而非立即超时。`/data/1/tmp/namespace-v19-index-backfill-sql.log` 捕获实际回填语句为带 `enable_parallel_dml` / `use_px` 的 INSERT … SELECT，内部写返回 -4006 并被原生任务重试，尚未解决。
+- `/data/1/tmp/namespace-v19-backfill-phase-stack.log` 另外捕获到协作式嵌套任务在深层 SQL 栈上构造 `RequestWorker` 时栈溢出。公共任务执行入口现复用 `SMART_CALL_LARGE`，在必要时使用原生栈扩展；构建 `/data/1/tmp/namespace-v19-nested-stack-build.log` 通过，回填阶段继续定位中。
+- 诊断时额外发现：引用不存在列触发原生外部符号查找后，worker 会等待永远未更新的 `sys_package_ready_`。这是运行时状态尚未统一的另一处，需通过已有本地管理/元数据服务接通，不能简单置 true；尚未修复。
+- `/data/1/tmp/namespace-v19-backfill-filtered-stack.log` 将回填的 -4006 定位到原生 `ObPxCoordOp::inner_open`：worker 漏掉了中断管理和 PX 数据通道/调度依赖。已补齐原生 interrupt、shared timer、DTL、Dfc、PX pools、DTL intermediate result manager 的组合启动；构建 `/data/1/tmp/namespace-v19-px-runtime-timer-build.log` 通过。
+- `/data/1/tmp/namespace-v19-direct-px-runtime.log` 继续通过原有协议、权限、事务和通用类型用例，CREATE INDEX 进入 PX 后返回 -4007。归档 worker 输出确认 `get_tx_exec_result`、`add_tx_exec_result`、`merge_tx_state` 仍是未接通的事务服务接口。
+- 正在接通这组原生事务状态操作：PX 私有描述符按原生 shadow 语义解码和释放，worker 内复用原生描述符汇总方法，主事务的执行结果由共享端原生事务服务接收。编译及索引回归尚未完成，仍需检查 PX 线程的独立存储路由和写状态回传。
+- 事务状态适配构建 `/data/1/tmp/namespace-v19-px-tx-state-build2.log` 通过，`/data/1/tmp/namespace-v19-ddl-tx-state.log` 已越过未支持接口，CREATE INDEX 改为 -4016。`/data/1/tmp/namespace-v19-px-sqc-stack.log` 和 `/data/1/tmp/namespace-v19-direct-insert2-stack.log` 定位到 `ObDirectInsertOrchestrator::start`，尚未进入实际 PX 扫描任务。原生 `ObIndependentDag::basic_init` 要求存储 DAG scheduler，worker 没有该服务；应把 DirectInsert 会话/写入接口接入共享存储，而非在 worker 启动另一套存储组件。
+- 增加用户 `parallel(2)` 聚合查询回归，先独立收齐 PX 执行链路。`/data/1/tmp/namespace-v19-parallel-route-stack.log` 捕获到 DAS 范围估算服务指针为空导致 worker 崩溃；现通过原生 `ObIRangeService` 远程执行范围估算/切分，边界只传 tablet/range 值，返回 rowkey 使用调用方 allocator，未增加进程级对象缓存。构建 `/data/1/tmp/namespace-v19-range-service-build2.log` 通过。
+- `/data/1/tmp/namespace-v19-parallel-task-stack.log` 随后定位到实际 PX 扫描缺少存储路由。扫描、事务和 DML 公共接口现按执行 session 绑定路由；首次使用 PX session 时，共享端通过原生 `acquire_tx(serialized)` 导入 shadow 描述符。清理 shadow 只释放副本，不回滚主事务；未绑定路由的存储请求直接返回错误，不发送无效请求标签。
+- 构建 `/data/1/tmp/namespace-v19-px-session-routes-build.log` 通过。`/data/1/tmp/namespace-v19-parallel-session-routes.log` 已通过复合主键及类型读取、两路 PX 聚合（`direct_parallel_scan_verified`），随后 CREATE INDEX 仍在 DirectInsert 准备阶段失败。并行 DML 提交/回滚及完整原生客户端矩阵正在回归，DirectInsert 远程适配尚未实现。
+- `/data/1/tmp/namespace-v19-direct-parallel-matrix.log` 已通过原有协议、权限、会话、事务与通用类型用例，以及 PX 查询、PX INSERT … SELECT 的显式回滚和自动提交；共享 SQL 拒绝计数为 0。矩阵仅在 CREATE INDEX 的 DirectInsert 准备阶段失败，仍不代表目标 1～3 完成。
+- 冷启动通过，但 `/data/1/tmp/namespace-v19-px-bootstrap-regression.log` 的崩溃重启返回 `OB_SCHEMA_EAGAIN`。定向诊断 `/data/1/tmp/namespace-v19-restart-diagnosis.log` 对应共享日志显示请求版本 1、刷新版本 1，却取得持久化 baseline 版本：将当前 core 版本作为显式历史版本请求，触发了原生 baseline 提升。元数据和权限读取现统一通过 `catalog_schema_guard`：当前版本用原生无版本参数入口，历史版本保持原生历史入口，取得后仍严格比对版本；诊断日志已移除。构建及恢复回归进行中。
+- 恢复修复构建 `/data/1/tmp/namespace-v19-recovery-catalog-guard-build.log` 通过。严格空目录 bootstrap 和崩溃重启 `/data/1/tmp/namespace-v19-px-bootstrap-regression2.log`、同 session 多层嵌套 SQL/取消/worker 死亡回滚 `/data/1/tmp/namespace-v19-px-nested-regression.log`、IPC 句柄与取消并发 `/data/1/tmp/namespace-v19-px-handles-regression.log` 全部通过。下一项仍是 DirectInsert 远程接口以及通用索引/DDL 验收；1～3 尚未完成。

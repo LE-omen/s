@@ -115,7 +115,7 @@ std::map<uint64_t, std::unique_ptr<DatabaseHolder>> database_schemas;
 int remote_database(char op, uint64_t id, const ObString &name, const ObDatabaseSchema *&schema) {
   using namespace observer::namespace_worker_prototype;
   schema = nullptr; Frame reply;
-  int ret = worker_catalog_fetch(op, id, name, reply);
+  int ret = worker_catalog_fetch(op, id, name, OB_INVALID_VERSION, reply);
   if (ret || reply.number() == 0) { return ret ? ret : reply.ret; }
   std::unique_ptr<DatabaseHolder> holder(new DatabaseHolder());
   reply.read(holder->schema);
@@ -132,7 +132,7 @@ int remote_database(char op, uint64_t id, const ObString &name, const ObDatabase
 int remote_table(char op, uint64_t id, const ObString &name, const ObTableSchema *&schema) {
   using namespace observer::namespace_worker_prototype;
   schema = nullptr; Frame reply;
-  int ret = worker_catalog_fetch(op, id, name, reply);
+  int ret = worker_catalog_fetch(op, id, name, OB_INVALID_VERSION, reply);
   if (ret || reply.number() == 0) { return ret ? ret : reply.ret; }
   std::unique_ptr<SchemaHolder> holder(new SchemaHolder());
   reply.read(holder->schema);

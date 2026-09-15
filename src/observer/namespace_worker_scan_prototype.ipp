@@ -144,10 +144,18 @@ struct EngineScan {
       if (ret == OB_ITER_END) { ret = OB_SUCCESS; end = true; break; }
       if (ret) { break; }
       if (!row || row->get_column_count() != param.column_ids_.count()) { ret = OB_ERR_UNEXPECTED; break; }
+      const auto &projector = table.get_output_projector();
+      const auto &descriptors = table.get_read_info().get_columns_desc();
+      if (projector.count() != row->get_column_count()) { ret = OB_ERR_UNEXPECTED; break; }
       for (int64_t i = 0; !ret && i < row->get_column_count(); ++i) {
         ObObj value;
-        ret = row->storage_datums_[i].to_obj_enhance(value,
-            schema->get_column_schema(param.column_ids_.at(i))->get_meta_type());
+        const int64_t index = projector.at(i);
+        if (index < 0 || index >= descriptors.count() || descriptors.at(index).col_id_ != param.column_ids_.at(i)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          // Native descriptors include decimal precision/scale and LOB flags.
+          ret = row->storage_datums_[i].to_obj_enhance(value, descriptors.at(index).col_type_);
+        }
         if (!ret) { rows.append(value); }
       }
       if (ret) { break; }
@@ -306,7 +314,8 @@ public:
   }
 private:
   int exchange(const Frame &request, Frame &reply) {
-    int ret = worker_send(request, request.type() == 'X');
+    StorageSessionScope scope(param.op_ ? param.op_->get_eval_ctx().exec_ctx_.get_my_session() : nullptr);
+    int ret = scope.error() ? scope.error() : worker_send(request, request.type() == 'X');
     if (!ret) { ret = worker_read(reply); }
     if (!ret && reply.type() != 's') { ret = OB_INVALID_ARGUMENT; }
     if (!ret) { ret = static_cast<int>(reply.number()); }

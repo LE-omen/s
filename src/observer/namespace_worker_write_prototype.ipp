@@ -140,7 +140,12 @@ struct EngineWrite {
           if (!row || row->get_column_count() != updated_columns.count() || count >= 32) { ret = OB_SIZE_OVERFLOW; break; }
           for (int64_t i = 0; !ret && i < updated_columns.count(); ++i) {
             ObObj cell;
-            ret = row->storage_datums_[i].to_obj_enhance(cell, schema->get_column_schema(updated_columns.at(i))->get_meta_type());
+            const auto &descriptors = plan.get_col_descs();
+            const ObColDesc *column = nullptr;
+            for (int64_t j = 0; !column && j < descriptors.count(); ++j) {
+              if (descriptors.at(j).col_id_ == updated_columns.at(i)) { column = &descriptors.at(j); }
+            }
+            ret = column ? row->storage_datums_[i].to_obj_enhance(cell, column->col_type_) : OB_INVALID_ARGUMENT;
             if (!ret) { values.append(cell); ret = values.ret; }
           }
           ++count;
@@ -182,7 +187,7 @@ struct EngineWrites {
     writes.clear();
     if (tx) {
       auto *service = query_transaction_service();
-      const bool rollback = tx->is_in_tx() && !tx->is_tx_end();
+      const bool rollback = !tx->is_shadow() && tx->is_in_tx() && !tx->is_tx_end();
       if (rollback) { service->rollback_tx(*tx); }
       service->release_tx(*tx);
       tx = nullptr;
@@ -196,12 +201,16 @@ struct EngineWrites {
     const uint64_t txid = request.number();
     int ret = request.ret;
     Frame values;
+    if (!ret && request.type() == 'T' && operation == 't') {
+      if (tx) { ret = OB_INIT_TWICE; }
+      else { ret = service->acquire_tx(request.data.data(), request.data.size(), request.pos, tx); }
+    }
     if (!ret && !tx && request.type() == 'T' && (operation == 'A' || operation == 'S')) {
       ret = service->acquire_tx(tx, sid);
     }
     if (!ret && (!tx || static_cast<uint64_t>(tx->get_tx_id().get_id()) != txid)) { ret = OB_INVALID_ARGUMENT; }
     if (!ret && request.type() == 'T') {
-      if (operation == 'A') {
+      if (operation == 'A' || operation == 't') {
         if (!request.consumed()) { ret = OB_INVALID_ARGUMENT; }
       } else if (operation == 'V') {
         if (!request.consumed() || !writes.empty()) { ret = OB_INVALID_ARGUMENT; }
@@ -263,6 +272,10 @@ struct EngineWrites {
         else if (operation == 'L') { ret = service->rollback_to_explicit_savepoint(*tx, name, deadline); }
         else if (operation == 'D') { ret = service->release_explicit_savepoint(*tx, name); }
         else { ret = service->create_stash_savepoint(*tx, name); }
+      } else if (operation == 'a') {
+        ObTxExecResult result; request.read(result);
+        if (!request.consumed()) { ret = OB_INVALID_ARGUMENT; }
+        else { ret = service->add_tx_exec_result(*tx, result); }
       } else if (operation == 'E') {
         ObTxExecResult result;
         if (!request.consumed()) { ret = OB_INVALID_ARGUMENT; }
@@ -304,6 +317,11 @@ struct EngineWrites {
 // transaction, or allocate a storage context in the worker. Engine owns all
 // authoritative transaction state; this view is refreshed by transaction RPC.
 int tx_rpc(char operation, ObTxDesc &tx, Frame &request, Frame &reply) {
+  auto *session = THIS_WORKER.get_session();
+  // A PX task owns a deserialized session. Explicit inner-SQL scopes can also
+  // run while THIS_WORKER still names their caller, so require pointer identity.
+  StorageSessionScope scope(session && session->get_tx_desc() == &tx ? session : nullptr);
+  if (scope.error()) { return scope.error(); }
   Frame message('T'); message.number(operation); message.number(tx.get_tx_id().get_id());
   message.data.insert(message.data.end(), request.data.begin() + Frame::HEADER_SIZE, request.data.end());
   message.ret = request.ret;
@@ -329,8 +347,12 @@ public:
                          transaction::ObTxDesc *&tx) override {
     if (tx) { return OB_INVALID_ARGUMENT; }
     auto owned = std::make_unique<ObTxDesc>();
-    int ret = owned->deserialize(buf, len, pos);
-    if (!ret) { tx = owned.release(); }
+    int ret = owned->deserialize_shadow(buf, len, pos);
+    if (!ret) {
+      // Native PX deserialization creates a private execution-state copy. Its
+      // release must never terminate the coordinator's storage transaction.
+      tx = owned.release();
+    }
     return ret; }
   int start_tx(transaction::ObTxDesc &tx,
                        const transaction::ObTxParam &tx_param) override {
@@ -350,7 +372,7 @@ public:
   }
   int release_tx(transaction::ObTxDesc &tx) override {
     int ret = OB_SUCCESS;
-    if (worker_request) {
+    if (worker_request && !tx.is_shadow()) {
       Frame request('T'), reply; request.number('V'); request.number(tx.get_tx_id().get_id());
       ret = write_rpc(request, reply);
       if (!ret && !reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
@@ -416,13 +438,25 @@ public:
                                      const common::ObString &name) override {
     Frame request, reply; request.string(name); return tx_rpc('K', tx, request, reply); }
   int merge_tx_state(transaction::ObTxDesc &to,
-                             const transaction::ObTxDesc &from) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX merge_tx_state\n"); return OB_NOT_SUPPORTED; }
+                             const transaction::ObTxDesc &from) override {
+    if (to.get_tx_id() != from.get_tx_id()) { return OB_INVALID_ARGUMENT; }
+    // These are the same descriptor operations used by ObTransService. Task
+    // copies aggregate locally; add_tx_exec_result publishes to the owner.
+    return to.merge_exec_info_with(from);
+  }
   int get_tx_exec_result(transaction::ObTxDesc &tx,
-                                 transaction::ObTxExecResult &exec_info) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX get_tx_exec_result\n"); return OB_NOT_SUPPORTED; }
+                                 transaction::ObTxExecResult &exec_info) override {
+    return tx.is_shadow() ? tx.get_inc_exec_info(exec_info) : collect_tx_exec_result(tx, exec_info);
+  }
   int add_tx_exec_result(transaction::ObTxDesc &tx,
-                                 const transaction::ObTxExecResult &exec_info) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX add_tx_exec_result\n"); return OB_NOT_SUPPORTED; }
+                                 const transaction::ObTxExecResult &exec_info) override {
+    if (tx.is_shadow()) { return tx.add_exec_info(exec_info); }
+    Frame request, reply; request.append(exec_info);
+    return tx_rpc('a', tx, request, reply);
+  }
   int collect_tx_exec_result(transaction::ObTxDesc &tx,
                                      transaction::ObTxExecResult &result) override {
+    if (tx.is_shadow()) { return tx.get_inc_exec_info(result); }
     Frame request, reply; int ret = tx_rpc('E', tx, request, reply);
     if (!ret) { reply.read(result); if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; } }
     return ret; }
@@ -441,13 +475,15 @@ public:
 struct RemoteExecution final : public ObIDmlExecutionState {
   uint64_t handle = 0, txid = 0;
   ObTxDesc *tx = nullptr; // Borrowed query view; never sent across IPC.
+  sql::ObSQLSessionInfo *session = nullptr;
   int64_t deadline = 0;
   std::vector<ObObjMeta> types;
   std::vector<uint64_t> columns;
   void destroy() override {
     if (handle) {
+      StorageSessionScope scope(session);
       Frame request('W'), reply; request.number('X'); request.number(txid); request.number(handle);
-      int ret = write_rpc(request, reply);
+      int ret = scope.error() ? scope.error() : write_rpc(request, reply);
       // Native revert_store_ctx merges write state into the engine descriptor
       // only when its write context is released. Refresh after that point so
       // SQL autocommit sees the completed write, including partial failures.
@@ -501,6 +537,9 @@ public:
     const auto &columns = table_plan.get_col_descs();
     if (!write_context.is_valid() || columns.empty() || columns.count() > OB_MAX_COLUMN_NUMBER || !write_spec.tz_info_) { return OB_NOT_SUPPORTED; }
     auto prepared = std::make_unique<RemoteExecution>();
+    prepared->session = THIS_WORKER.get_session();
+    StorageSessionScope scope(prepared->session);
+    if (scope.error()) { return scope.error(); }
     auto &tx = *static_cast<ObTxDesc *>(write_context.native_handle());
     prepared->tx = &tx;
     prepared->txid = tx.get_tx_id().get_id(); prepared->deadline = write_spec.timeout_;
@@ -556,6 +595,8 @@ public:
     auto *state = static_cast<RemoteExecution *>(execution_state(execution));
     if (!state || !row_iter || (column_ids && column_ids->count() != static_cast<int64_t>(state->columns.size()))
         || state->txid != static_cast<uint64_t>(tx_desc.get_tx_id().get_id())) { return OB_INVALID_ARGUMENT; }
+    StorageSessionScope scope(state->session);
+    if (scope.error()) { return scope.error(); }
     const int64_t width = state->columns.size();
     for (int64_t i = 0; column_ids && i < width; ++i) {
       if (column_ids->at(i) != state->columns[i]) { return OB_INVALID_ARGUMENT; }

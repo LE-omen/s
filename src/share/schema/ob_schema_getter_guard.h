@@ -31,6 +31,7 @@
 
 namespace oceanbase
 {
+namespace observer { namespace namespace_worker_prototype { struct Frame; } }
 namespace lib
 {
 class Worker;
@@ -362,6 +363,8 @@ public:
                             const uint64_t user_id,
                             const ObString &database_name,
                             ObSessionPrivInfo &session_priv);
+  // A read-only privilege view with this guard's version and lifetime.
+  int get_priv_mgr(const ObPrivMgr *&priv_mgr);
   int get_user_infos_by_id(common::ObIArray<const ObUserInfo *> &user_infos);
   int get_db_priv_by_id(common::ObIArray<const ObDBPriv *> &db_privs);
   int get_column_priv_in_table(const uint64_t user_id,
@@ -695,6 +698,9 @@ private:
   template<typename T>
   int worker_schema_prototype(char operation, uint64_t id, const common::ObString &name,
                               ObSchemaType type, const T *&schema);
+  template<typename T>
+  int decode_worker_schema_prototype(observer::namespace_worker_prototype::Frame &reply,
+                                      ObSchemaType type, const T *&schema);
   void release_worker_schemas_prototype();
   template<typename T>
   int put_to_local_cache(
@@ -750,6 +756,9 @@ private:
   SchemaGuardType schema_guard_type_;
   bool is_inited_;
   int64_t pin_cache_size_;
+  // One remote snapshot for every metadata lookup made through this guard.
+  int64_t worker_schema_version_ = common::OB_INVALID_VERSION;
+  ObPrivMgr *worker_priv_mgr_ = nullptr;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSchemaGetterGuard);
 };

@@ -10,6 +10,7 @@
 #include "sql/engine/ob_physical_plan.h"
 #include "sql/das/ob_das_context.h"
 #include "sql/das/ob_data_access_service.h"
+#include "sql/dtl/ob_dtl_interm_result_manager.h"
 #include <memory>
 #include "sql/resolver/cmd/ob_variable_set_stmt.h"
 #include "sql/resolver/ddl/ob_use_database_stmt.h"
@@ -71,6 +72,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   WORKER_STEP(GMEMCONF.reload_config(config_));
   WORKER_STEP(init_pre_setting());
   WORKER_STEP(init_global_context());
+  WORKER_STEP(init_interrupt());
   WORKER_STEP(ObTimerService::get_instance().start());
   WORKER_STEP(init_config_module(""));
   WORKER_STEP(init_tz_info_mgr());
@@ -91,6 +93,10 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   WORKER_STEP(server_module_new_default(mods_srs_service_));
   WORKER_STEP(server_module_new_default(mods_opt_stat_monitor_manager_));
   WORKER_STEP(server_module_new_default(mods_data_access_service_));
+  WORKER_STEP(server_module_new_default(mods_shared_timer_));
+  WORKER_STEP(dtl::ObDfc::server_module_new(mods_dfc_));
+  WORKER_STEP(server_module_new_default(mods_px_pools_));
+  WORKER_STEP(server_module_new_default(mods_dtl_interm_result_manager_));
   WORKER_STEP(storage::ObLobManager::server_module_new(mods_lob_manager_));
   bind_server_service<ObSQLSessionMgr>(&session_mgr_);
   bind_server_service<ObVTIterCreator>(&vt_data_service_.get_vt_iter_factory().get_vt_iter_creator());
@@ -99,6 +105,17 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   bind_server_service<ObSqlMemoryManager>(mods_sql_memory_manager_);
   bind_server_service<ObOptStatMonitorManager>(mods_opt_stat_monitor_manager_);
   bind_server_service<ObDataAccessService>(mods_data_access_service_);
+  bind_server_service<share::ObISharedTimer>(mods_shared_timer_);
+  bind_server_service<dtl::ObDfc>(mods_dfc_);
+  bind_server_service<omt::ObPxPools>(mods_px_pools_);
+  bind_server_service<dtl::ObDTLIntermResultManager>(mods_dtl_interm_result_manager_);
+  WORKER_STEP(omt::ObSharedTimer::server_module_init(mods_shared_timer_));
+  WORKER_STEP(omt::ObSharedTimer::server_module_start(mods_shared_timer_));
+  WORKER_STEP(DTL.init());
+  WORKER_STEP(dtl::ObDfc::server_module_init(mods_dfc_));
+  WORKER_STEP(omt::ObPxPools::server_module_init(mods_px_pools_));
+  WORKER_STEP(dtl::ObDTLIntermResultManager::server_module_init(mods_dtl_interm_result_manager_));
+  WORKER_STEP(dtl::ObDTLIntermResultManager::server_module_start(mods_dtl_interm_result_manager_));
   WORKER_STEP(ObOptStatMonitorManager::server_module_init(mods_opt_stat_monitor_manager_));
   WORKER_STEP(ObPlanCache::server_module_init(mods_plan_cache_, *this));
   WORKER_STEP(ObPsCache::server_module_init(mods_ps_cache_));
@@ -117,10 +134,12 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   RemoteTransactionService remote_transactions;
   RemoteDmlService remote_dml;
   RemoteWriteContext remote_write_context;
+  RemoteRangeService remote_ranges;
   {
     bind_server_service<ObITabletScan>(&remote_scan);
     bind_server_service<ObIVirtualTableScan>(&remote_scan);
     bind_server_service<data_plane::ObITransactionService>(&remote_transactions);
+    bind_server_service<data_plane::ObIRangeService>(&remote_ranges);
     bind_server_service<data_plane::ObIDmlService>(&remote_dml);
     bind_server_service<data_plane::ObIWriteContextService>(&remote_write_context);
     char *end = nullptr;
@@ -338,7 +357,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         (unsigned long long)request->tag.slot, (unsigned long long)request->tag.generation, result);
     if (worker_send_wire(std::move(done))) { std::_Exit(1); }
   };
-  auto run_job = [&](Job &job) {
+  auto execute_job = [&](Job &job) -> int {
     lib::Worker *previous_worker = &THIS_WORKER;
     PendingRequest *previous_request = worker_request;
     RequestWorker request_worker;
@@ -354,7 +373,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         SessionBinding *binding = nullptr;
         result = begin_direct_request(1, binding);
         Frame schema;
-        if (!result) { result = fetch_catalog('d', worker_namespace, ObString::make_string("oceanbase"), schema); }
+        if (!result) { result = fetch_catalog('d', worker_namespace, ObString::make_string("oceanbase"), OB_INVALID_VERSION, schema); }
         const int finish_ret = finish_direct_request();
         if (!result) { result = finish_ret; }
         close_session(binding);
@@ -407,6 +426,13 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       complete(job.request, result, job.owner.get());
     worker_request = previous_request;
     lib::Worker::set_worker_to_thread_local(previous_worker);
+    return OB_SUCCESS;
+  };
+  auto run_job = [&](Job &job) {
+    // A cooperative nested job can enter from deep inside native SQL. Reuse
+    // native stack extension before constructing another request context.
+    const int error = SMART_CALL_LARGE(execute_job(job));
+    if (error) { complete(job.request, error, job.owner.get()); }
   };
   PrototypeThreads executors(concurrency, [&] {
     lib::set_thread_name("NsSQLExecute");
@@ -427,10 +453,14 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
             return job.input.type() == 'a' || job.input.type() == 'I';
           });
           if (internal != jobs.end()) {
-            Job nested = std::move(*internal); jobs.erase(internal);
-            lock.unlock();
-            if (depth >= 8) { complete(nested.request, OB_SIZE_OVERFLOW, nested.owner.get()); }
-            else { ++depth; run_job(nested); --depth; }
+            {
+              Job nested = std::move(*internal); jobs.erase(internal);
+              lock.unlock();
+              if (depth >= 8) { complete(nested.request, OB_SIZE_OVERFLOW, nested.owner.get()); }
+              else { ++depth; run_job(nested); --depth; }
+              // Releasing the last session owner can issue storage RPCs and
+              // reenter this wait loop. Keep destruction outside jobs_mutex.
+            }
             lock.lock();
           } else if (draining || waiting.deadline == INT64_MAX) {
             jobs_changed.wait(lock);
@@ -470,6 +500,11 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   }
   Frame ready('Y'); ready.number(worker_namespace);
   if (direct_listener) { ready.number(obmysql::get_sql_nio_bound_tcp_port()); }
+  // Publish the same native serving state as ObServer::start(). SQL executors
+  // use it to distinguish an asynchronous DDL wait from server shutdown.
+  prepare_stop_ = false;
+  stop_ = false;
+  has_stopped_ = false;
   ret = worker_send_wire(ready);
   while (!ret) {
     Frame input;
@@ -554,6 +589,8 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     }
     jobs_changed.notify_all();
   }
+  prepare_stop_ = true;
+  stop_ = true;
   requests.fail();
   worker_storage_routes.fail();
   // The worker is a process lifetime boundary. Stop it before unwinding the
@@ -561,6 +598,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   if (direct_listener) { std::_Exit(ret == OB_SUCCESS ? 0 : 1); }
   { std::lock_guard<std::mutex> guard(jobs_mutex); stopping = true; }
   jobs_changed.notify_all(); executors.stop(); executors.wait();
+  has_stopped_ = true;
 
 #undef WORKER_STEP
   return ret;

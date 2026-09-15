@@ -19,7 +19,9 @@ int namespace_proto_worker_write(const char *, size_t);
 #include "observer/namespace_worker_multiplex_prototype.ipp"
 #include "observer/namespace_worker_scan_prototype.ipp"
 #include "observer/namespace_worker_write_prototype.ipp"
+#include "observer/namespace_worker_range_prototype.ipp"
 #include "observer/namespace_worker_commands_prototype.ipp"
+#include "observer/namespace_worker_privileges_prototype.ipp"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 using namespace common;
 using namespace share::schema;
@@ -51,7 +53,8 @@ int admin_set_config(obcall::ObAdminSetConfigArg &arg) {
 }
 bool is_storage_request(char type) {
   return type == 'd' || type == 'b' || type == 't' || type == 'i' || type == 'j' || type == 'k'
-      || type == 'O' || type == 'F' || type == 'X' || type == 'M' || type == 'T' || type == 'W';
+      || type == 'u' || type == 'n' || type == 'p'
+      || type == 'O' || type == 'F' || type == 'X' || type == 'M' || type == 'T' || type == 'W' || type == 'G';
 }
 // One admitted storage RPC at a time per SQL request. Native request workers
 // execute it; the pipe reader only submits the task. No per-session thread.
@@ -82,7 +85,15 @@ struct StorageDispatch : std::enable_shared_from_this<StorageDispatch> {
       ~Processor() { if (!finished) { owner->finish(); } }
       int run() override {
         std::lock_guard<std::mutex> guard(owner->execution_mutex);
-        const int ret = owner->process(input);
+        ObCurTraceId::TraceId trace;
+        if (is_storage_request(input.type()) || (input.tag().slot & WORKER_REQUEST)) {
+          input.read(trace);
+        }
+        // Background metadata and local cleanup can start without a SQL trace.
+        // Native DDL task admission requires a valid request identity as well.
+        if (!trace.is_valid()) { trace.init(GCTX.self_addr()); }
+        ObTraceIdGuard trace_guard(trace);
+        const int ret = input.ret ? input.ret : owner->process(input);
         owner->finish(); finished = true;
         return ret;
       }
@@ -233,13 +244,34 @@ int apply_session_state(sql::ObSQLSessionInfo &session, Frame &frame) {
   }
   return ret ? ret : frame.ret;
 }
+int catalog_schema_guard(int64_t version, ObSchemaGetterGuard &guard) {
+  auto &service = ObMultiVersionSchemaService::get_instance();
+  int64_t current = OB_INVALID_VERSION;
+  int ret = service.get_runtime_refreshed_schema_version(current, false);
+  // A current guard must use the native current-version entry. During recovery
+  // that is the core schema; the historical entry promotes it to the durable
+  // baseline before full schema is available. Validate again after acquisition
+  // so a concurrent refresh cannot silently change this request's snapshot.
+  if (!ret) { ret = service.get_runtime_schema_guard(guard, version == current ? OB_INVALID_VERSION : version); }
+  int64_t actual = OB_INVALID_VERSION;
+  if (!ret) { ret = guard.get_schema_version(actual); }
+  if (!ret && version != OB_INVALID_VERSION && actual != version) { ret = OB_SCHEMA_EAGAIN; }
+  return ret;
+}
 int catalog(uint64_t ns, Frame &request, Frame &reply) {
   int ret = OB_SUCCESS;
   const uint64_t id = request.number();
   const ObString name = request.string();
+  const int64_t snapshot_version = static_cast<int64_t>(request.number());
+  if (request.type() == 'p') {
+    if (!request.consumed() || ns != 1 || id != 1) {
+      reply = Frame('c'); reply.number(OB_INVALID_ARGUMENT); return reply.ret;
+    }
+    return process_privilege_read(snapshot_version, name, reply);
+  }
   if (request.type() == 'k') {
     int64_t version = OB_INVALID_VERSION;
-    if (!request.consumed() || ns != 1 || id > 1
+    if (!request.consumed() || ns != 1 || id > 1 || snapshot_version != OB_INVALID_VERSION
         || (!name.empty() && name != "published")) { ret = OB_INVALID_ARGUMENT; }
     else {
       auto &service = ObMultiVersionSchemaService::get_instance();
@@ -250,14 +282,27 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   }
   const ObDatabaseSchema *database = nullptr;
   const ObTableSchema *table = nullptr;
+  const ObUserInfo *user = nullptr;
+  const ObSysVariableSchema *variables = nullptr;
   const uint64_t owner = (id & ~(1ULL << 62)) >> 32;
   ObSchemaGetterGuard guard;
   if (ns == 1 && request.consumed() && (request.type() == 'd' || owns_table(ns, id))) {
-    ret = ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(guard);
+    ret = catalog_schema_guard(snapshot_version, guard);
     if (!ret && request.type() == 'd') { ret = guard.get_database_schema(name, database); }
     else if (!ret && request.type() == 'b') { ret = guard.get_database_schema(id, database); }
     else if (!ret && (request.type() == 't' || request.type() == 'j')) { ret = guard.get_table_schema(id, name, request.type() == 'j', table); }
     else if (!ret && request.type() == 'i') { ret = guard.get_table_schema(id, table); }
+    else if (!ret && request.type() == 'n') { ret = id == 1 ? guard.get_sys_variable_schema(variables) : OB_INVALID_ARGUMENT; }
+    else if (!ret && request.type() == 'u') {
+      if (id) { ret = name.empty() ? guard.get_user_info(id, user) : OB_INVALID_ARGUMENT; }
+      else {
+        ObSEArray<const ObUserInfo *, 4> users;
+        ret = name.empty() ? guard.get_user_schemas_in_runtime(users) : guard.get_user_info(name, users);
+        reply = Frame('c'); reply.number(ret); reply.number(users.count());
+        for (const auto *item : users) { if (!ret) { reply.append(*item); } }
+        return reply.ret;
+      }
+    }
   } else if (!request.consumed() || (request.type() == 'd' ? id != ns : owner != ns)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (request.type() == 'd') {
@@ -269,17 +314,24 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   } else if (request.type() == 'i') {
     ret = NamespaceForkKernelPrototype::schema_by_id(id, table);
   } else { ret = OB_NOT_SUPPORTED; }
-  reply = Frame('c'); reply.number(ret); reply.number(database || table ? 1 : 0);
+  reply = Frame('c'); reply.number(ret); reply.number(database || table || user || variables ? 1 : 0);
   if (!ret && database) { reply.append(*database); }
   if (!ret && table) { reply.append(*table); }
+  if (!ret && user) { reply.append(*user); }
+  if (!ret && variables) { reply.append(*variables); }
   return reply.ret;
 }
 int serve_storage(uint64_t ns, ReadScans *scans, EngineWrites *writes, int state, Frame &input, Frame &result) {
     int ret = OB_SUCCESS;
-    if (input.type() == 'd' || input.type() == 'b' || input.type() == 't' || input.type() == 'i' || input.type() == 'j' || input.type() == 'k') {
+    if (input.type() == 'd' || input.type() == 'b' || input.type() == 't' || input.type() == 'i' || input.type() == 'j' || input.type() == 'k'
+        || input.type() == 'u' || input.type() == 'n' || input.type() == 'p') {
       result = Frame('c');
       if (state) { result.number(state); }
       else { ret = catalog(ns, input, result); }
+    } else if (input.type() == 'G') {
+      result = Frame('g');
+      if (state) { result.number(state); }
+      else { ret = process_ranges(ns, input, result); }
     } else if (scans && (input.type() == 'O' || input.type() == 'F' || input.type() == 'X')) {
       result = Frame('s');
       if (state && input.type() != 'X') { result.number(state); }
@@ -656,15 +708,20 @@ int worker_read_wire(Frame &frame) {
 }
 int worker_send(const Frame &frame, bool cleanup) {
   if (frame.ret) { return frame.ret; }
-  if (!worker_request) { return worker_send_wire(frame); }
+  if (!worker_request) {
+    return is_storage_request(frame.type()) ? OB_ERR_UNEXPECTED : worker_send_wire(frame);
+  }
   const int ret = worker_request->take_credit(cleanup);
   if (ret) { return ret; }
   Frame output = frame;
-  if (worker_request->tag.slot & WORKER_REQUEST) {
-    // Native query deadlines accompany each storage call. The connection route
-    // itself survives multiple commands and does not retain an old deadline.
+  if (is_storage_request(frame.type()) || (worker_request->tag.slot & WORKER_REQUEST)) {
+    // Request context follows each storage call, across both routing directions.
+    // Connection routes survive commands and must not retain old query context.
     output = Frame(frame.type(), frame.limit);
-    output.number(THIS_WORKER.get_timeout_ts());
+    output.append(*ObCurTraceId::get_trace_id());
+    if (worker_request->tag.slot & WORKER_REQUEST) {
+      output.number(THIS_WORKER.get_timeout_ts());
+    }
     output.data.insert(output.data.end(), frame.data.begin() + Frame::HEADER_SIZE, frame.data.end());
     if (output.data.size() > output.limit) { output.ret = OB_SIZE_OVERFLOW; }
   }
@@ -722,8 +779,20 @@ StorageSessionScope::StorageSessionScope(sql::ObSQLSessionInfo *session, bool cr
       && (!worker_request || worker_request->sql_session != session)
       && (create || session->namespace_storage_binding())) {
     switched_ = true;
+    const bool created = !session->namespace_storage_binding();
     error_ = begin_direct_request(session->get_server_sid(), session->namespace_storage_binding(), true);
     if (!error_) { worker_request->sql_session = session; }
+    if (!error_ && created && session->get_tx_desc() && session->get_tx_desc()->is_shadow()) {
+      // Import the native transaction execution copy once for this PX session.
+      // The shared service gives it native shadow ownership, never a new tx.
+      Frame request, reply; request.append(*session->get_tx_desc());
+      error_ = tx_rpc('t', *session->get_tx_desc(), request, reply);
+      if (!error_ && !reply.consumed()) { error_ = OB_INVALID_ARGUMENT; }
+      if (error_) {
+        close_session(session->namespace_storage_binding());
+        session->namespace_storage_binding() = nullptr;
+      }
+    }
   }
 }
 StorageSessionScope::~StorageSessionScope() {
@@ -735,17 +804,29 @@ void StorageSessionScope::close(SessionBinding *&binding) {
     close_session(binding); binding = nullptr;
   }
 }
-int fetch_catalog(char type, uint64_t id, const ObString &name, Frame &reply) {
-  Frame request(type); request.number(id); request.string(name);
-  int ret = worker_send(request);
+int fetch_catalog(char type, uint64_t id, const ObString &name, int64_t version, Frame &reply) {
+  // Greeting construction and native background tasks read metadata before a
+  // SQL session exists. Give those calls a short-lived independent route.
+  SessionBinding *temporary = nullptr;
+  const int64_t previous_timeout = THIS_WORKER.get_timeout_ts();
+  int ret = OB_SUCCESS;
+  if (!worker_request) {
+    THIS_WORKER.set_timeout_ts(previous_timeout > 0 ? previous_timeout : INT64_MAX);
+    ret = begin_direct_request(0, temporary, true);
+  }
+  Frame request(type); request.number(id); request.string(name); request.number(version);
+  if (!ret) { ret = worker_send(request); }
   if (!ret) { ret = worker_read(reply); }
   if (!ret && reply.type() != 'c') { ret = OB_INVALID_ARGUMENT; }
   if (!ret) { ret = static_cast<int>(reply.number()); }
+  close_session(temporary);
+  THIS_WORKER.set_timeout_ts(previous_timeout);
   return ret ? ret : reply.ret;
 }
 int fetch_schema_version(bool published, bool core_version, int64_t &version) {
   Frame reply;
-  int ret = fetch_catalog('k', core_version, published ? ObString::make_string("published") : ObString(), reply);
+  int ret = fetch_catalog('k', core_version, published ? ObString::make_string("published") : ObString(),
+      OB_INVALID_VERSION, reply);
   if (!ret) { version = static_cast<int64_t>(reply.number()); }
   return ret ? ret : reply.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT;
 }
