@@ -53,9 +53,10 @@ int check_worker_plan(ObMySQLResultSet &result) {
   if (!ret && result.get_stmt_type() == stmt::T_SELECT) {
     if (!result.get_physical_plan()) { ret = OB_NOT_SUPPORTED; }
   } else if (!ret && result.get_stmt_type() == stmt::T_INSERT) {
-    if (!result.get_physical_plan()) { ret = OB_NOT_SUPPORTED; }
+    // DAS DML may execute through the command driver without a physical plan.
+    // The worker's response path already selects the appropriate driver.
   } else if (!ret && (result.get_stmt_type() == stmt::T_UPDATE || result.get_stmt_type() == stmt::T_DELETE)) {
-    if (!result.get_physical_plan()) { ret = OB_NOT_SUPPORTED; }
+    // See INSERT above.
   } else if (!ret && result.get_stmt_type() == stmt::T_VARIABLE_SET) {
     auto *command = static_cast<ObVariableSetStmt *>(result.get_cmd());
     if (!command || command->has_global_variable()) { ret = OB_NOT_SUPPORTED; }
