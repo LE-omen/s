@@ -996,6 +996,13 @@ int ObSchemaGetterGuard::get_database_schema(
                                              const uint64_t database_id,
                                              const ObDatabaseSchema *&database_schema)
 {
+  if (observer::namespace_worker_prototype::worker_namespace > 1
+      && database_id != OB_SYS_DATABASE_ID
+      && !storage::NamespaceForkKernelPrototype::is_encoded_id(database_id)) {
+    const uint64_t encoded_db = (1ULL << 62)
+        | (observer::namespace_worker_prototype::worker_namespace << 32) | database_id;
+    return storage::NamespaceForkKernelPrototype::database_by_id(encoded_db, database_schema);
+  }
   if (storage::NamespaceForkKernelPrototype::namespace_mode()
       && storage::NamespaceForkKernelPrototype::is_encoded_id(database_id)) {
     return storage::NamespaceForkKernelPrototype::database_by_id(database_id, database_schema);
@@ -1021,7 +1028,13 @@ int ObSchemaGetterGuard::get_database_schema(
                                              const uint64_t database_id,
                                              const ObSimpleDatabaseSchema *&database_schema)
 {
-  if (observer::namespace_worker_prototype::worker_namespace == 1) {
+  if (observer::namespace_worker_prototype::worker_namespace > 1
+      && database_id != OB_SYS_DATABASE_ID
+      && !storage::NamespaceForkKernelPrototype::is_encoded_id(database_id)) {
+    const uint64_t encoded_db = (1ULL << 62)
+        | (observer::namespace_worker_prototype::worker_namespace << 32) | database_id;
+    return storage::NamespaceForkKernelPrototype::database_by_id(encoded_db, database_schema);
+  } else if (observer::namespace_worker_prototype::worker_namespace == 1) {
     const ObDatabaseSchema *full = nullptr;
     int ret = get_database_schema(database_id, full);
     database_schema = nullptr;
