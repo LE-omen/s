@@ -1077,6 +1077,13 @@ int ObSchemaGetterGuard::get_table_schema(
     const uint64_t table_id,
     const ObTableSchema *&table_schema)
 {
+  if (observer::namespace_worker_prototype::worker_namespace > 1
+      && !storage::NamespaceForkKernelPrototype::is_encoded_id(table_id)
+      && !is_inner_table(table_id)) {
+    const uint64_t encoded_table = (1ULL << 62)
+        | (observer::namespace_worker_prototype::worker_namespace << 32) | table_id;
+    return storage::NamespaceForkKernelPrototype::schema_by_id(encoded_table, table_schema);
+  }
   if (storage::NamespaceForkKernelPrototype::is_encoded_id(table_id)) {
     return storage::NamespaceForkKernelPrototype::schema_by_id(table_id, table_schema);
   }
