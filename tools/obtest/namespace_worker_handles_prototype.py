@@ -81,6 +81,7 @@ def run(binary):
             return [reply for reply in command(query_payload(handle, sql), expected) if reply[:1] == b"R"]
 
         try:
+            send((0, 0), b"B" + numbers(1, 9) + b"127.0.0.1")
             assert receive() == ((0, 0), b"Y" + numbers(2))
             first = open_session(100)
             query(first, "SET @x=17")

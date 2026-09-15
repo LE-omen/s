@@ -54,6 +54,7 @@ public:
   explicit ObServerRuntimeController();
 
   int init(logservice::ObServerLogBlockMgr &log_block_mgr);
+  int init_sql_worker_runtime();
 
   int start();
   void stop();

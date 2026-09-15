@@ -357,8 +357,10 @@ class ObInnerSQLSessionGuard
 public:
   ObInnerSQLSessionGuard(sql::ObSQLSessionInfo *session);
   ~ObInnerSQLSessionGuard();
+  int error() const { return storage_scope_.error(); }
 private:
   sql::ObSQLSessionInfo *last_session_;
+  namespace_worker_prototype::StorageSessionScope storage_scope_;
 };
 
 } // end of namespace observer

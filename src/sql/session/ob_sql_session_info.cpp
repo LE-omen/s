@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_SESSION
 
 #include <new>
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "data_plane/memtable/ob_btree_iter_cache_api.h"
 #include "data_plane/transaction/ob_i_read_timestamp_service.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -469,6 +470,7 @@ bool ObSQLSessionInfo::is_sqlstat_enabled()
 
 void ObSQLSessionInfo::destroy(bool skip_sys_var)
 {
+  observer::namespace_worker_prototype::StorageSessionScope storage_scope(this, false);
   if (is_inited_) {
     int ret = OB_SUCCESS;
     // The deserialized session should not do end_trans etc cleanup work
@@ -539,6 +541,7 @@ void ObSQLSessionInfo::destroy(bool skip_sys_var)
     reset(skip_sys_var);
     is_inited_ = false;
   }
+  storage_scope.close(namespace_storage_binding_);
 }
 
 int ObSQLSessionInfo::close_ps_stmt(

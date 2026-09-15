@@ -49,7 +49,7 @@ int ObMPInitDB::deserialize()
 
 int ObMPInitDB::process()
 {
-  if (get_conn() && get_conn()->namespace_worker_binding_) {
+  if (!namespace_worker_prototype::worker_process && get_conn() && get_conn()->namespace_worker_binding_) {
     ObSQLSessionInfo *session = nullptr;
     int ret = get_session(session);
     if (!ret && !session) { ret = OB_ERR_SESSION_INTERRUPTED; }

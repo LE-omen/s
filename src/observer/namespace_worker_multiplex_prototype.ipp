@@ -16,6 +16,7 @@ struct PendingRequest;
 thread_local std::function<void(PendingRequest &, bool, bool)> worker_wait;
 struct PendingRequest {
   RequestTag tag;
+  sql::ObSQLSessionInfo *sql_session = nullptr; // Worker-local owner; never sent over IPC.
   std::mutex mutex;
   std::condition_variable changed;
   std::optional<Frame> incoming, terminal;
@@ -101,6 +102,8 @@ struct RequestRoutes {
   std::vector<uint64_t> free;
   size_t active = 0;
   bool closed = false;
+  const uint64_t origin;
+  explicit RequestRoutes(uint64_t request_origin = 0) : origin(request_origin) {}
   std::shared_ptr<PendingRequest> allocate(bool control) {
     std::unique_lock<std::mutex> guard(mutex);
     auto available = [&] {
@@ -115,15 +118,16 @@ struct RequestRoutes {
     if (free.empty()) { index = slots.size(); slots.emplace_back(); }
     else { index = free.back(); free.pop_back(); }
     auto &slot = slots[index];
-    slot.request = std::make_shared<PendingRequest>(RequestTag{index, ++slot.generation});
+    slot.request = std::make_shared<PendingRequest>(RequestTag{origin | index, ++slot.generation});
     ++active;
     return slot.request;
   }
   std::shared_ptr<PendingRequest> accept(RequestTag tag) {
     std::lock_guard<std::mutex> guard(mutex);
-    if (closed || tag.slot >= MAX_REQUESTS || !tag.generation) { return {}; }
-    if (slots.size() <= tag.slot) { slots.resize(tag.slot + 1); }
-    auto &slot = slots[tag.slot];
+    const uint64_t index = tag.slot & ~WORKER_REQUEST;
+    if (closed || (tag.slot & WORKER_REQUEST) != origin || index >= MAX_REQUESTS || !tag.generation) { return {}; }
+    if (slots.size() <= index) { slots.resize(index + 1); }
+    auto &slot = slots[index];
     if (slot.request || tag.generation <= slot.generation) { return {}; }
     slot.generation = tag.generation;
     ++active;
@@ -131,15 +135,18 @@ struct RequestRoutes {
   }
   std::shared_ptr<PendingRequest> find(RequestTag tag) {
     std::lock_guard<std::mutex> guard(mutex);
-    return tag.slot < slots.size() && slots[tag.slot].generation == tag.generation
-        ? slots[tag.slot].request : nullptr;
+    const uint64_t index = tag.slot & ~WORKER_REQUEST;
+    return (tag.slot & WORKER_REQUEST) == origin && index < slots.size() && slots[index].generation == tag.generation
+        ? slots[index].request : nullptr;
   }
   void release(RequestTag tag, bool reuse = false) {
     std::lock_guard<std::mutex> guard(mutex);
-    if (tag.slot < slots.size() && slots[tag.slot].generation == tag.generation && slots[tag.slot].request) {
-      slots[tag.slot].request.reset();
+    const uint64_t index = tag.slot & ~WORKER_REQUEST;
+    if ((tag.slot & WORKER_REQUEST) == origin && index < slots.size()
+        && slots[index].generation == tag.generation && slots[index].request) {
+      slots[index].request.reset();
       --active;
-      if (reuse && tag.generation != UINT64_MAX) { free.push_back(tag.slot); }
+      if (reuse && tag.generation != UINT64_MAX) { free.push_back(index); }
       changed.notify_one();
     }
   }
@@ -157,4 +164,5 @@ public:
   void run1() override { body(); }
 };
 thread_local PendingRequest *worker_request = nullptr;
+RequestRoutes worker_storage_routes{WORKER_REQUEST};
 } } }

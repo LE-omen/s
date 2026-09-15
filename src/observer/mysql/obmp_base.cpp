@@ -93,6 +93,11 @@ int ObMPBase::setup_packet_sender()
 int ObMPBase::before_process()
 {
   int ret = OB_SUCCESS;
+  if (namespace_worker_prototype::worker_process && get_conn()) {
+    THIS_WORKER.set_timeout_ts(INT64_MAX);
+    ret = namespace_worker_prototype::begin_direct_request(get_conn()->sessid_, get_conn()->namespace_worker_binding_);
+    if (ret) { send_error_packet(ret, nullptr); return ret; }
+  }
   if (get_conn() && get_conn()->namespace_worker_id_ != 0) {
     const auto cmd = static_cast<const obmysql::ObMySQLRawPacket &>(req_->get_packet()).get_cmd();
     if (cmd != obmysql::COM_QUERY && cmd != obmysql::COM_QUIT && cmd != obmysql::COM_PING
@@ -152,6 +157,7 @@ void ObMPBase::cleanup()
     // stage the final packet and let Rust reuse the request pool.
     end_trans_cb->allow_request_completion();
   }
+  (void)namespace_worker_prototype::finish_direct_request();
 }
 
 int ObMPBase::handoff_async_request(ObSqlEndTransCb &end_trans_cb)
@@ -278,6 +284,7 @@ int ObMPBase::create_session(ObSMConnection *conn, ObSQLSessionInfo *&sess_info)
     LOG_ERROR("get connection fail", K(ret));
   } else {
     if (OB_FAIL(OBSERVER.get_sql_session_mgr().create_session(conn, sess_info))) {
+    } else if (OB_FAIL(namespace_worker_prototype::bind_direct_session(conn->namespace_worker_binding_, *sess_info))) {
     } else {
       conn->is_sess_alloc_.store(true, std::memory_order_release);
       sess_info->set_user_session();

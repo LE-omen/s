@@ -742,6 +742,8 @@ int ObInnerSQLConnection::query(sqlclient::ObIExecutor &executor,
                                 ObInnerSQLResult &res,
                                 ObVirtualTableIteratorFactory *vt_iter_factory)
 {
+  ObInnerSQLSessionGuard session_guard(&get_session());
+  if (session_guard.error()) { return session_guard.error(); }
   int ret = OB_SUCCESS;
   ObExecRecord exec_record;
   ObExecTimestamp exec_timestamp;
@@ -1532,7 +1534,7 @@ ObInnerSqlWaitGuard::ObInnerSqlWaitGuard(const bool is_inner_session,
 }
 
 ObInnerSQLSessionGuard::ObInnerSQLSessionGuard(sql::ObSQLSessionInfo *session)
-  : last_session_(NULL)
+  : last_session_(NULL), storage_scope_(session)
 {
   last_session_ = THIS_WORKER.get_session();
   THIS_WORKER.set_session(session);

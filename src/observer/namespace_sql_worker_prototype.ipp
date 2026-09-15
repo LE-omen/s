@@ -14,16 +14,26 @@
 #include "sql/resolver/cmd/ob_variable_set_stmt.h"
 #include "sql/resolver/ddl/ob_use_database_stmt.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
+#include "rpc/obmysql/ob_sql_nio_server.h"
 #include "observer/namespace_worker_sql_request_prototype.ipp"
 
 namespace oceanbase { namespace observer {
 int ObServer::namespace_sql_worker_prototype(const char *query)
 {
   namespace_worker_prototype::worker_process = true;
+  scramble_rand_.init(static_cast<uint64_t>(start_time_), static_cast<uint64_t>(start_time_ / 2));
   using namespace sql;
   using namespace common;
   using namespace share;
   int ret = OB_SUCCESS;
+  namespace_worker_prototype::Frame bootstrap;
+  ret = namespace_worker_prototype::worker_read_wire(bootstrap);
+  if (ret || bootstrap.type() != 'B') { return ret ? ret : OB_INVALID_ARGUMENT; }
+  const uint64_t logical_port = bootstrap.number();
+  const ObString logical_ip = bootstrap.string();
+  const std::string logical_host(logical_ip.ptr(), logical_ip.length());
+  if (!bootstrap.consumed() || logical_port == 0 || logical_port > UINT16_MAX
+      || !self_addr_.set_ip_addr(logical_host.c_str(), static_cast<int>(logical_port))) { return OB_INVALID_ARGUMENT; }
   namespace_worker_prototype::RemoteTabletScan remote_scan;
   int64_t concurrency = 2;
   if (const char *value = std::getenv("SEEKDB_NAMESPACE_SQL_WORKER_THREADS")) {
@@ -45,7 +55,9 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   config_._pushdown_storage_level.set_value("0");
   config_._rowsets_max_rows.set_value("32");
   config_.enable_sql_operator_dump.set_value("false");
-  self_addr_.set_ip_addr("127.0.0.1", 1);
+  // Client endpoints differ; these processes execute on one logical storage
+  // server. Native transaction routing compares this identity with its owner.
+  config_.self_addr_ = self_addr_;
   lib::update_mini_mode(budget, concurrency);
   set_memory_budget(budget);
   g_bootstrap_server_runtime.init();
@@ -92,9 +104,10 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   WORKER_STEP(ObPsCache::server_module_init(mods_ps_cache_));
   WORKER_STEP(ObSqlMemoryManager::server_module_init(mods_sql_memory_manager_));
   WORKER_STEP(ObOptStatManager::get_instance().init(&sql_proxy_, &config_));
+  namespace_worker_prototype::RemoteRootCommands remote_commands;
   WORKER_STEP(sql_engine_.init(&ObOptStatManager::get_instance(), &remote_scan,
       self_addr_, *mods_plan_cache_, *mods_ps_cache_, pl_engine_, *this, *this,
-      local_management_service_, ob_service_, *this, *this, *this,
+      remote_commands, ob_service_, *this, *this, *this,
       *mods_srs_service_, *mods_lob_manager_));
   gctx_.status_ = SS_SERVING;
   g_server_modules_ready = OB_SUCC(ret);
@@ -331,10 +344,23 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     RequestWorker request_worker;
     lib::Worker::set_worker_to_thread_local(&request_worker);
       worker_request = job.request.get();
+      worker_request->sql_session = job.owner ? &job.owner->session : nullptr;
       THIS_WORKER.set_timeout_ts(job.request->deadline);
       Frame &input = job.input;
       int result = OB_SUCCESS;
-      if (input.type() == 'A' || input.type() == 'a') {
+      if (input.type() == 'H') {
+        // Exercise a worker-originated route with no gateway SQL exchange
+        // serving its storage frames. Used by the direct-ingress regression.
+        SessionBinding *binding = nullptr;
+        result = begin_direct_request(1, binding);
+        Frame schema;
+        if (!result) { result = fetch_catalog('d', worker_namespace, ObString::make_string("oceanbase"), schema); }
+        const int finish_ret = finish_direct_request();
+        if (!result) { result = finish_ret; }
+        close_session(binding);
+        worker_request = job.request.get();
+        fprintf(stderr, "PROTOTYPE_V19_DIRECT_STORAGE_PROBE ns=%llu ret=%d\n", (unsigned long long)worker_namespace, result);
+      } else if (input.type() == 'A' || input.type() == 'a') {
         const uint64_t sid = input.number(), capabilities = input.number();
         auto owner = std::make_shared<SessionOwner>();
         result = input.ret || sid == 0 || sid > UINT32_MAX || capabilities > UINT32_MAX
@@ -429,11 +455,34 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   });
   if ((ret = executors.start())) { return ret; }
   fprintf(stderr, "PROTOTYPE_V12_EXECUTORS count=%lld max_requests=%zu\n", (long long)concurrency, MAX_REQUESTS);
-  Frame ready('Y'); ready.number(worker_namespace); ret = worker_send_wire(ready);
+  const bool direct_listener = std::getenv("SEEKDB_NAMESPACE_SQL_WORKER_LISTEN") != nullptr;
+  if (direct_listener) {
+    WORKER_STEP(server_runtime_controller_.init_sql_worker_runtime());
+    bind_server_service<omt::ObServerRuntimeController>(&server_runtime_controller_);
+    WORKER_STEP(conn_res_mgr_.init(schema_service_, server_gtimer_));
+    session_mgr_.bind_lifecycle_services(*mods_ps_cache_, debug_sync_broadcaster_, conn_res_mgr_);
+    WORKER_STEP(server_gtimer_.schedule(session_mgr_, ObSQLSessionMgr::SCHEDULE_PERIOD, true));
+    config_.mysql_port_mode.set_value("random");
+    config_.sql_net_thread_count.set_value("1");
+    WORKER_STEP(net_frame_.init());
+    WORKER_STEP(net_frame_.start());
+    if (ret) { std::_Exit(1); }
+  }
+  Frame ready('Y'); ready.number(worker_namespace);
+  if (direct_listener) { ready.number(obmysql::get_sql_nio_bound_tcp_port()); }
+  ret = worker_send_wire(ready);
   while (!ret) {
     Frame input;
     if ((ret = worker_read_wire(input))) { break; }
     const RequestTag tag = input.tag();
+    if (tag.slot & WORKER_REQUEST) {
+      auto request = worker_storage_routes.find(tag);
+      if (!request || (input.type() != 'K' && input.type() != 'l' && input.type() != 'c'
+          && input.type() != 's' && input.type() != 'w' && input.type() != 'g')) { ret = OB_INVALID_ARGUMENT; break; }
+      ret = request->post(std::move(input));
+      if (worker_namespace == 1) { std::lock_guard<std::mutex> guard(jobs_mutex); jobs_changed.notify_all(); }
+      continue;
+    }
     if (input.ret || !tag.generation || tag.slot >= MAX_REQUESTS) { ret = OB_INVALID_ARGUMENT; break; }
     if (input.type() == 'Z') {
       const int reason = static_cast<int>(input.number());
@@ -489,7 +538,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         // destroy the old session until that query has finished using it.
         owner.reset(); complete(request, result); continue;
       }
-    } else if (input.type() != 'A' && input.type() != 'a') { result = OB_NOT_SUPPORTED; }
+    } else if (input.type() != 'A' && input.type() != 'a' && input.type() != 'H') { result = OB_NOT_SUPPORTED; }
     if (!result && owner) {
       const int64_t saved = input.pos;
       const uint64_t deadline = input.number();
@@ -506,6 +555,10 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     jobs_changed.notify_all();
   }
   requests.fail();
+  worker_storage_routes.fail();
+  // The worker is a process lifetime boundary. Stop it before unwinding the
+  // SQL/storage adapters that its native network tasks can still reference.
+  if (direct_listener) { std::_Exit(ret == OB_SUCCESS ? 0 : 1); }
   { std::lock_guard<std::mutex> guard(jobs_mutex); stopping = true; }
   jobs_changed.notify_all(); executors.stop(); executors.wait();
 

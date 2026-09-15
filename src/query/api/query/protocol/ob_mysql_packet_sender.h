@@ -193,6 +193,9 @@ protected:
   bool response_disabled_;
   int64_t query_receive_ts_;
   ObSMConnection *conn_;
+  // Query cleanup may release its borrowed session after finishing the network
+  // request, when conn_ has already been cleared. This is not an owned lease.
+  sql::ObSQLSessionInfo *borrowed_session_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObMPPacketSender);
 };

@@ -1197,6 +1197,10 @@ int NamespaceForkKernelPrototype::check_ddl(const ObSimpleTableSchemaV2 &schema,
   if (lifetime_mode() && trans && source_drop_trans.load() == trans) { return OB_SUCCESS; }
   if (!enabled() || !schema.is_user_table()) { return OB_SUCCESS; }
   if (is_encoded_id(schema.get_table_id())) { return OB_NOT_SUPPORTED; }
+  if (namespace_mode()) {
+    bool ready = false; const int ret = namespace_registry_ready(ready);
+    if (ret != OB_SUCCESS || !ready) { return ret; }
+  }
   ObSchemaGetterGuard guard; const ObDatabaseSchema *db = nullptr;
   int ret = GSCHEMASERVICE.get_runtime_schema_guard(guard);
   if (ret != OB_SUCCESS) { return ret; }

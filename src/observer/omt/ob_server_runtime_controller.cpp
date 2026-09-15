@@ -795,6 +795,27 @@ int ObServerRuntimeController::get_runtime(
   return get_runtime_unsafe(runtime);
 }
 
+int ObServerRuntimeController::init_sql_worker_runtime()
+{
+  if (is_inited_ || runtime_) { return OB_INIT_TWICE; }
+  runtime_ = OB_NEW(ObServerRuntime, "SQLRuntime");
+  if (!runtime_) { return OB_ALLOCATE_MEMORY_FAILED; }
+  const int ret = runtime_->ObServerRuntimeState::init();
+  if (!ret) {
+    // SQL modules have already been composed by the worker. Reuse the native
+    // scheduler without constructing storage modules or a second cache graph.
+    runtime_->set_queue_limit(GCONF.server_task_queue_size);
+    runtime_->set_min_cpu(share::server_runtime()->min_cpu());
+    runtime_->set_max_cpu(share::server_runtime()->max_cpu());
+    runtime_->set_memory_size(share::server_runtime()->memory_size());
+    runtime_->set_role(share::server_role());
+    share::g_server_runtime = runtime_;
+    is_inited_ = true;
+    runtime_active_ = true;
+  }
+  return ret;
+}
+
 int ObServerRuntimeController::lock_runtime(
   ObServerRuntime *&runtime) const
 {

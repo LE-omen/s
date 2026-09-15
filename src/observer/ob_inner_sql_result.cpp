@@ -134,7 +134,8 @@ int ObInnerSQLResult::open()
     ObInnerSQLSessionGuard sess_guard(&session_);
     bool is_select = ObStmt::is_select_stmt(result_set_->get_stmt_type());
     WITH_CONTEXT(mem_context_) {
-      if (opened_) {
+      if (OB_FAIL(sess_guard.error())) {
+      } else if (opened_) {
         ret = OB_INIT_TWICE;
         LOG_WARN("result set already open", K(ret));
       } else if (OB_FAIL(result_set_->open())) {
@@ -198,7 +199,8 @@ int ObInnerSQLResult::inner_close()
   ObInnerSqlWaitGuard guard(is_inner_session(), &session_);
 
   WITH_CONTEXT(mem_context_) {
-    if (OB_FAIL(result_set_->close())) {
+    if (OB_FAIL(sess_guard.error())) {
+    } else if (OB_FAIL(result_set_->close())) {
       result_set_->refresh_location_cache_by_errno(true, ret);
       LOG_WARN("result set close failed", K(ret));
     }
@@ -226,7 +228,8 @@ int ObInnerSQLResult::next()
     SQL_INFO_GUARD(session_.get_current_query_string(), session_.get_cur_sql_id());
     ObInnerSQLSessionGuard sess_guard(&session_);
     WITH_CONTEXT(mem_context_) {
-      if (OB_FAIL(result_set_->get_next_row(row_))) {
+      if (OB_FAIL(sess_guard.error())) {
+      } else if (OB_FAIL(result_set_->get_next_row(row_))) {
         if (OB_ITER_END != ret) {
           result_set_->refresh_location_cache_by_errno(true, ret);
           LOG_WARN("get next row failed", K(ret));

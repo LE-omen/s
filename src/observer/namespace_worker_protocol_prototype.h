@@ -14,6 +14,7 @@ namespace oceanbase { namespace observer { namespace namespace_worker_prototype 
 constexpr size_t MAX_FRAME = 256 * 1024;
 constexpr size_t MAX_SQL_MESSAGE = 64 * 1024 * 1024;
 struct RequestTag { uint64_t slot = 0, generation = 0; };
+constexpr uint64_t WORKER_REQUEST = 1ULL << 63;
 struct Frame {
   static constexpr int64_t HEADER_SIZE = 17; // type + request slot + generation
   std::vector<char> data;
@@ -70,9 +71,29 @@ inline uint64_t worker_namespace = 0;
 inline bool worker_process = false;
 bool bootstrap_enabled();
 int check_sql_execution_role();
+int fetch_schema_version(bool published, bool core_version, int64_t &version);
 int admin_set_config(obcall::ObAdminSetConfigArg &arg);
 bool enabled();
 struct SessionBinding;
+struct PendingRequest;
+// Native inner SQL can switch sessions while keeping the same execution stack.
+// Keep its storage route with that session and restore the caller on return.
+class StorageSessionScope {
+public:
+  explicit StorageSessionScope(sql::ObSQLSessionInfo *session, bool create = true);
+  ~StorageSessionScope();
+  int error() const { return error_; }
+  void close(SessionBinding *&binding);
+private:
+  PendingRequest *previous_;
+  bool switched_ = false;
+  int error_ = common::OB_SUCCESS;
+  StorageSessionScope(const StorageSessionScope &) = delete;
+  StorageSessionScope &operator=(const StorageSessionScope &) = delete;
+};
+int begin_direct_request(uint32_t sid, SessionBinding *&binding, bool internal = false);
+int finish_direct_request();
+int bind_direct_session(SessionBinding *binding, sql::ObSQLSessionInfo &session);
 int open_session(uint64_t namespace_id, sql::ObSQLSessionInfo &gateway, SessionBinding *&binding, bool internal = false);
 sql::ObSQLSessionInfo *bound_session(SessionBinding *binding);
 int append_session_state(sql::ObSQLSessionInfo &session, Frame &frame);

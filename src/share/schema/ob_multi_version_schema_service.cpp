@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SHARE_SCHEMA
 #include "ob_multi_version_schema_service.h"
 #include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/schema/ob_schema_publish_signal.h"
 #include "share/rc/ob_context.h"  // CREATE_WITH_TEMP_ENTITY_P/RESOURCE_OWNER(previously hidden behind a transitive include)
@@ -2295,6 +2296,9 @@ int ObMultiVersionSchemaService::get_runtime_refreshed_schema_version(
     int64_t &schema_version,
     const bool core_version) const
 {
+  if (observer::namespace_worker_prototype::worker_namespace == 1) {
+    return observer::namespace_worker_prototype::fetch_schema_version(false, core_version, schema_version);
+  }
   int ret = OB_SUCCESS;
   int64_t refreshed_schema_version = OB_INVALID_VERSION;
   {
@@ -2311,6 +2315,9 @@ int ObMultiVersionSchemaService::get_published_schema_version(
     int64_t &schema_version,
     const bool core_schema_version) const
 {
+  if (observer::namespace_worker_prototype::worker_namespace == 1) {
+    return observer::namespace_worker_prototype::fetch_schema_version(true, core_schema_version, schema_version);
+  }
   int ret = OB_SUCCESS;
   int64_t published_schema_version = OB_INVALID_VERSION;
   {

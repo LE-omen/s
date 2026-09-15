@@ -148,18 +148,23 @@ ObThWorker::Status ObThWorker::check_wait()
 inline void ObThWorker::process_request(rpc::ObRequest &req)
 {
   // reset retry flags
-  can_retry_ = true;
+  auto *lock_wait = share::server_service<memtable::ObLockWaitMgr>();
+  // A SQL-only runtime has no local storage lock-wait manager. Storage RPCs
+  // finish their wait remotely; local SQL retries remain in the native driver.
+  can_retry_ = lock_wait != nullptr;
   need_retry_ = false;
 
   bool need_wait_lock = false;
   int ret = OB_SUCCESS;
   set_req_flag(&req);
 
-  ::oceanbase::share::server_service<::oceanbase::memtable::ObLockWaitMgr>()->setup(req.get_lock_wait_node(), req.get_receive_timestamp());
-  memtable::advance_tlocal_request_lock_wait_stat(rpc::RequestLockWaitStat::RequestStat::EXECUTE);
+  if (lock_wait) {
+    lock_wait->setup(req.get_lock_wait_node(), req.get_receive_timestamp());
+    memtable::advance_tlocal_request_lock_wait_stat(rpc::RequestLockWaitStat::RequestStat::EXECUTE);
+  }
   if (OB_FAIL(procor_.process(req))) {
   }
-  bool wait_succ = ::oceanbase::share::server_service<::oceanbase::memtable::ObLockWaitMgr>()->post_process(need_retry_, need_wait_lock);
+  bool wait_succ = lock_wait && lock_wait->post_process(need_retry_, need_wait_lock);
   if (OB_LIKELY(wait_succ)) {
     need_retry_ = false;
   }

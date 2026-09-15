@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX SQL_EXE
 
 #include "ob_sql_trans_control.h"
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "data_plane/tablelock/ob_table_lock.h"
 #include "data_plane/transaction/ob_deadlock.h"
 #include "data_plane/transaction/ob_lock_wait_stat.h"
@@ -119,6 +120,8 @@ int ObSqlTransControl::explicit_start_trans(ObSQLSessionInfo *session,
                                             const bool read_only,
                                             const ObString hint)
 {
+  observer::namespace_worker_prototype::StorageSessionScope storage_scope(session);
+  if (storage_scope.error()) { return storage_scope.error(); }
   int ret = OB_SUCCESS;
   data_plane::ObITransactionService *txs = NULL;
   
@@ -209,6 +212,8 @@ int ObSqlTransControl::end_trans(ObSQLSessionInfo *session,
                                  bool reset_trans_variable,
                                  const ObString hint)
 {
+  observer::namespace_worker_prototype::StorageSessionScope storage_scope(session);
+  if (storage_scope.error()) { return storage_scope.error(); }
   int ret = OB_SUCCESS;
   bool sync = false;
   int64_t tx_id = 0;

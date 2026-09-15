@@ -231,18 +231,18 @@ int ObMPConnect::process()
       LOG_ERROR("null session", K(ret), K(session));
     } else if (OB_FAIL(verify_identify(*conn, *session))) {
     } else if (OB_FAIL(update_charset_sys_vars(*conn, *session))) {
-    } else if (namespace_worker_prototype::enabled()
+    } else if (!namespace_worker_prototype::worker_process && namespace_worker_prototype::enabled()
                && (namespace_worker_prototype::bootstrap_enabled() || storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id()))
                && session->get_user_id() != OB_SYS_USER_ID) {
       ret = OB_NOT_SUPPORTED;
-    } else if (namespace_worker_prototype::enabled()
+    } else if (!namespace_worker_prototype::worker_process && namespace_worker_prototype::enabled()
                && (namespace_worker_prototype::bootstrap_enabled() || storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id()))
                && OB_FAIL(namespace_worker_prototype::open_session(
                    storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id())
                        ? (session->get_database_id() & ~(1ULL << 62)) >> 32 : 1,
                    *session, conn->namespace_worker_binding_))) {
     } else {
-      if (namespace_worker_prototype::enabled()
+      if (!namespace_worker_prototype::worker_process && namespace_worker_prototype::enabled()
           && (namespace_worker_prototype::bootstrap_enabled() || storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id()))) {
         conn->namespace_worker_id_ = storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id())
             ? (session->get_database_id() & ~(1ULL << 62)) >> 32 : 1;

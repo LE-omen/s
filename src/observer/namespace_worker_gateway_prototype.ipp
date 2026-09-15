@@ -19,6 +19,7 @@ int namespace_proto_worker_write(const char *, size_t);
 #include "observer/namespace_worker_multiplex_prototype.ipp"
 #include "observer/namespace_worker_scan_prototype.ipp"
 #include "observer/namespace_worker_write_prototype.ipp"
+#include "observer/namespace_worker_commands_prototype.ipp"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 using namespace common;
 using namespace share::schema;
@@ -49,7 +50,7 @@ int admin_set_config(obcall::ObAdminSetConfigArg &arg) {
   return ret;
 }
 bool is_storage_request(char type) {
-  return type == 'd' || type == 'b' || type == 't' || type == 'i' || type == 'j'
+  return type == 'd' || type == 'b' || type == 't' || type == 'i' || type == 'j' || type == 'k'
       || type == 'O' || type == 'F' || type == 'X' || type == 'M' || type == 'T' || type == 'W';
 }
 // One admitted storage RPC at a time per SQL request. Native request workers
@@ -107,12 +108,18 @@ struct StorageDispatch : std::enable_shared_from_this<StorageDispatch> {
     return ret;
   }
 };
-struct Channel {
+struct Channel;
+int receive_direct_storage(Channel &channel, Frame input);
+void stop_direct_storage(Channel &channel);
+struct Channel : std::enable_shared_from_this<Channel> {
   void *handle = nullptr;
   uint64_t generation = 0;
   uint32_t pid = 0;
+  uint32_t client_port = 0;
   std::atomic<bool> closed{false};
   RequestRoutes routes;
+  RequestRoutes storage_routes{WORKER_REQUEST};
+  uint64_t namespace_id = 0;
   std::mutex bindings_mutex;
   SessionBinding *bindings = nullptr;
   ~Channel() { fail(); namespace_proto_stop(handle); }
@@ -136,6 +143,10 @@ struct Channel {
     if (channel.closed) { return; }
     if (!data || size < Frame::HEADER_SIZE) { channel.fail(); return; }
     Frame frame; frame.data.assign(data, data + size);
+    if (frame.tag().slot & WORKER_REQUEST) {
+      if (receive_direct_storage(channel, std::move(frame))) { channel.fail(); }
+      return;
+    }
     auto request = channel.routes.find(frame.tag());
     // The Rust pipe reader only dispatches. It never waits for a request's
     // consumer, executes storage work, or calls a client's packet sender.
@@ -156,6 +167,7 @@ struct SessionBinding {
   uint64_t ns = 0, slot = 0, slot_generation = 0;
   sql::ObSQLSessionInfo *gateway = nullptr;
   bool internal = false;
+  std::shared_ptr<PendingRequest> direct_request;
   std::unique_ptr<EngineWrites> writes;
   SessionBinding *previous = nullptr, *next = nullptr;
   bool linked = false;
@@ -171,6 +183,7 @@ struct SessionBinding {
 };
 void Channel::fail() {
   if (!closed.exchange(true)) {
+    stop_direct_storage(*this);
     routes.fail(); namespace_proto_interrupt(handle);
     // Shutdown only schedules native connection teardown. The IPC reader does
     // not wait for a session lock, execute rollback, or run another SQL engine.
@@ -224,6 +237,17 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   int ret = OB_SUCCESS;
   const uint64_t id = request.number();
   const ObString name = request.string();
+  if (request.type() == 'k') {
+    int64_t version = OB_INVALID_VERSION;
+    if (!request.consumed() || ns != 1 || id > 1
+        || (!name.empty() && name != "published")) { ret = OB_INVALID_ARGUMENT; }
+    else {
+      auto &service = ObMultiVersionSchemaService::get_instance();
+      ret = name.empty() ? service.get_runtime_refreshed_schema_version(version, id != 0)
+          : service.get_published_schema_version(version, id != 0);
+    }
+    reply = Frame('c'); reply.number(ret); reply.number(version); return reply.ret;
+  }
   const ObDatabaseSchema *database = nullptr;
   const ObTableSchema *table = nullptr;
   const uint64_t owner = (id & ~(1ULL << 62)) >> 32;
@@ -249,6 +273,138 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   if (!ret && database) { reply.append(*database); }
   if (!ret && table) { reply.append(*table); }
   return reply.ret;
+}
+int serve_storage(uint64_t ns, ReadScans *scans, EngineWrites *writes, int state, Frame &input, Frame &result) {
+    int ret = OB_SUCCESS;
+    if (input.type() == 'd' || input.type() == 'b' || input.type() == 't' || input.type() == 'i' || input.type() == 'j' || input.type() == 'k') {
+      result = Frame('c');
+      if (state) { result.number(state); }
+      else { ret = catalog(ns, input, result); }
+    } else if (scans && (input.type() == 'O' || input.type() == 'F' || input.type() == 'X')) {
+      result = Frame('s');
+      if (state && input.type() != 'X') { result.number(state); }
+      else { ret = scans->process(input, result, writes ? writes->tx : nullptr, writes ? &writes->session : nullptr); }
+    } else if (input.type() == 'M') {
+      result = Frame('g');
+      const uint64_t operation = input.number();
+      if (operation == 2) {
+        if (state) { result.number(state); }
+        else { ret = process_root_command(ns, input, result); }
+        return ret;
+      }
+      obcall::ObAdminSetConfigArg arg;
+      input.read(arg);
+      int command_ret = state ? state : ns != 1 || operation != 1 ? OB_NOT_SUPPORTED
+          : !input.consumed() || !arg.is_valid() ? OB_INVALID_ARGUMENT : OB_SUCCESS;
+      if (!command_ret) { command_ret = ObServer::get_instance().get_local_management_service().admin_set_config(arg); }
+      result.number(command_ret);
+    } else if (writes && (input.type() == 'T' || input.type() == 'W')) {
+      result = Frame('w');
+      if (state && !cleanup_write(input)) { result.number(state); }
+      else { ret = writes->process(input, result); }
+    } else { ret = OB_INVALID_ARGUMENT; }
+    return ret;
+}
+// A direct client has one storage context for its connection lifetime. This is
+// the native transaction/session metadata required by storage, without a second
+// network connection, SQL plan cache, or protocol session in the shared process.
+struct DirectStorageContext {
+  ObArenaAllocator allocator{ObMemAttr("NsStorageSess")};
+  sql::ObSQLSessionInfo session;
+  std::unique_ptr<EngineWrites> writes;
+  ReadScans scans;
+  std::weak_ptr<Channel> channel;
+  RequestTag tag;
+  uint64_t ns;
+  bool initialized = false;
+  DirectStorageContext(std::shared_ptr<Channel> owner, RequestTag request)
+      : scans(owner->namespace_id), channel(owner), tag(request), ns(owner->namespace_id) {}
+  int process(Frame &input) {
+    auto owner = channel.lock();
+    if (!owner) { return OB_CONNECT_ERROR; }
+    Frame result('l');
+    int ret = OB_SUCCESS;
+    bool closing = false;
+    const int64_t timeout = static_cast<int64_t>(input.number());
+    if (input.ret || timeout <= 0) { return OB_INVALID_ARGUMENT; }
+    const int64_t old_timeout = THIS_WORKER.get_timeout_ts();
+    auto *old_session = THIS_WORKER.get_session();
+    THIS_WORKER.set_timeout_ts(timeout);
+    THIS_WORKER.set_session(initialized ? &session : nullptr);
+    if (input.type() == 'L') {
+      const uint64_t sid = input.number();
+      const uint64_t internal = input.number();
+      if (initialized || !input.consumed() || internal > 1 || (!sid && !internal) || sid > UINT32_MAX) { ret = OB_INVALID_ARGUMENT; }
+      else { ret = session.test_init(1, static_cast<uint32_t>(sid), &allocator); }
+      if (!ret) { ret = session.load_default_sys_variable(false, false); }
+      if (!ret) { writes = std::make_unique<EngineWrites>(ns, session); initialized = true; }
+      result.number(ret);
+    } else if (!initialized) {
+      ret = OB_NOT_INIT;
+    } else if (input.type() == 'e' || input.type() == 'v') {
+      closing = input.type() == 'v';
+      ret = input.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT;
+      if (!ret) {
+        scans.scans.clear(); session.reset_reserved_snapshot_version();
+        if (closing) { writes.reset(); initialized = false; }
+        else { ret = writes->check_finished(); }
+      }
+      result.number(ret);
+    } else {
+      ret = serve_storage(ns, &scans, writes.get(), OB_SUCCESS, input, result);
+    }
+    THIS_WORKER.set_session(old_session);
+    THIS_WORKER.set_timeout_ts(old_timeout);
+    if (!ret) {
+      Frame credit('K'); credit.tag(tag);
+      ret = owner->send(credit);
+    }
+    result.tag(tag);
+    if (closing) { owner->storage_routes.release(tag); }
+    if (!ret) { ret = owner->send(result); }
+    if (ret) { owner->fail(); }
+    return ret;
+  }
+};
+int receive_direct_storage(Channel &channel, Frame input) {
+  auto request = channel.storage_routes.find(input.tag());
+  if (input.type() == 'L') {
+    if (request) { return OB_INVALID_ARGUMENT; }
+    request = channel.storage_routes.accept(input.tag());
+    if (!request) { return OB_SIZE_OVERFLOW; }
+    auto state = std::make_shared<DirectStorageContext>(channel.shared_from_this(), input.tag());
+    auto dispatch = std::make_shared<StorageDispatch>();
+    dispatch->process = [state](Frame &frame) { return state->process(frame); };
+    request->dispatch_storage = [dispatch](Frame frame) { return dispatch->submit(std::move(frame)); };
+  }
+  if (!request || !request->dispatch_storage) { return OB_INVALID_ARGUMENT; }
+  return request->dispatch_storage(std::move(input));
+}
+void stop_direct_storage(Channel &channel) {
+  // Move the route owners to a native task. Destruction rolls back idle
+  // transactions and releases scans off the IPC reader. An executing RPC keeps
+  // its own reference until it finishes; no cross-thread owner destruction.
+  std::vector<std::shared_ptr<PendingRequest>> detached;
+  {
+    std::lock_guard<std::mutex> guard(channel.storage_routes.mutex);
+    channel.storage_routes.closed = true;
+    for (auto &slot : channel.storage_routes.slots) {
+      if (slot.request) {
+        slot.request->fail(OB_CONNECT_ERROR);
+        detached.push_back(std::move(slot.request));
+      }
+    }
+  }
+  if (!detached.empty()) {
+    auto cleanup = std::make_shared<StorageDispatch>();
+    cleanup->process = [owners = std::move(detached)](Frame &) mutable {
+      owners.clear(); return OB_SUCCESS;
+    };
+    // During normal channel failure the shared runtime is still running.
+    // Shutdown ordering keeps storage alive until outstanding tasks drain.
+    const int ret = cleanup->submit(Frame());
+    if (ret) { fprintf(stderr, "PROTOTYPE_V19_STORAGE_CLEANUP_SUBMIT ret=%d\n", ret); }
+  }
 }
 // SQL results retain credit-based streaming. Storage RPCs execute independently
 // through the native shared runtime, including while the result consumer sleeps.
@@ -294,30 +450,7 @@ struct Exchange {
     THIS_WORKER.set_timeout_ts(pending->deadline);
     THIS_WORKER.set_session(writes ? &writes->session : nullptr);
     Frame result;
-    const int state = cancelled.load();
-    int ret = OB_SUCCESS;
-    if (input.type() == 'd' || input.type() == 'b' || input.type() == 't' || input.type() == 'i' || input.type() == 'j') {
-      result = Frame('c');
-      if (state) { result.number(state); }
-      else { ret = catalog(ns, input, result); }
-    } else if (scans && (input.type() == 'O' || input.type() == 'F' || input.type() == 'X')) {
-      result = Frame('s');
-      if (state && input.type() != 'X') { result.number(state); }
-      else { ret = scans->process(input, result, writes ? writes->tx : nullptr, writes ? &writes->session : nullptr); }
-    } else if (input.type() == 'M') {
-      result = Frame('g');
-      const uint64_t operation = input.number();
-      obcall::ObAdminSetConfigArg arg;
-      input.read(arg);
-      int command_ret = state ? state : ns != 1 || operation != 1 ? OB_NOT_SUPPORTED
-          : !input.consumed() || !arg.is_valid() ? OB_INVALID_ARGUMENT : OB_SUCCESS;
-      if (!command_ret) { command_ret = ObServer::get_instance().get_local_management_service().admin_set_config(arg); }
-      result.number(command_ret);
-    } else if (writes && (input.type() == 'T' || input.type() == 'W')) {
-      result = Frame('w');
-      if (state && !cleanup_write(input)) { result.number(state); }
-      else { ret = writes->process(input, result); }
-    } else { ret = OB_INVALID_ARGUMENT; }
+    int ret = serve_storage(ns, scans, writes, cancelled.load(), input, result);
     THIS_WORKER.set_session(saved_session);
     THIS_WORKER.set_timeout_ts(saved_timeout);
     result.tag(pending->tag);
@@ -382,18 +515,34 @@ int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&b
     }
     if (!child->current || child->current->closed) {
       auto channel = std::make_shared<Channel>();
+      channel->namespace_id = ns;
       { std::lock_guard<std::mutex> lock(children_mutex); channel->generation = ++next_generation; }
       channel->handle = namespace_proto_spawn(ns, channel->generation, &channel->pid);
-      Frame ready;
-      if (!channel->handle || channel->receive(ready) || ready.type() != 'Y' || ready.number() != ns || !ready.consumed()) {
+      Frame bootstrap('B');
+      char logical_ip[OB_IP_STR_BUFF] = {};
+      const auto &logical_address = ObServer::get_instance().get_self();
+      if (!channel->handle || !logical_address.ip_to_string(logical_ip, sizeof(logical_ip))) {
         channel->fail(); return OB_CONNECT_ERROR;
       }
+      bootstrap.number(logical_address.get_port()); bootstrap.string(ObString::make_string(logical_ip));
+      if (channel->send(bootstrap)) { return OB_CONNECT_ERROR; }
+      Frame ready;
+      if (!channel->handle || channel->receive(ready) || ready.type() != 'Y' || ready.number() != ns) {
+        channel->fail(); return OB_CONNECT_ERROR;
+      }
+      const uint64_t client_port = ready.consumed() ? 0 : ready.number();
+      if (!ready.consumed() || client_port > UINT16_MAX) { channel->fail(); return OB_INVALID_ARGUMENT; }
+      channel->client_port = static_cast<uint32_t>(client_port);
       if (namespace_proto_dispatch(channel->handle, Channel::receive_frame, channel.get())) {
         channel->fail(); return OB_CONNECT_ERROR;
       }
       child->current = channel;
-      fprintf(stderr, "PROTOTYPE_V10_WORKER_READY ns=%llu generation=%llu pid=%u\n",
-          (unsigned long long)ns, (unsigned long long)channel->generation, channel->pid);
+      if (std::getenv("SEEKDB_NAMESPACE_SQL_WORKER_DIRECT_PROBE")) {
+        ret = exchange(*channel, ns, Frame('H'), nullptr, [](Frame &) { return OB_INVALID_ARGUMENT; });
+        if (ret) { channel->fail(); return ret; }
+      }
+      fprintf(stderr, "PROTOTYPE_V10_WORKER_READY ns=%llu generation=%llu pid=%u port=%u\n",
+          (unsigned long long)ns, (unsigned long long)channel->generation, channel->pid, channel->client_port);
     }
     owned->channel = child->current;
   }
@@ -428,6 +577,18 @@ int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&b
 void close_session(SessionBinding *binding) {
   std::unique_ptr<SessionBinding> owned(binding);
   if (!owned) { return; }
+  if (owned->direct_request) {
+    auto *previous = worker_request;
+    worker_request = owned->direct_request.get();
+    worker_request->deadline = INT64_MAX;
+    if (owned->gateway) { share::server_service<sql::ObSQLSessionMgr>()->disconnect_session(*owned->gateway); }
+    Frame request('v'), reply;
+    int ret = worker_send(request, true);
+    if (!ret) { ret = worker_read(reply); }
+    worker_storage_routes.release(worker_request->tag, true);
+    worker_request = previous == owned->direct_request.get() ? nullptr : previous;
+    return;
+  }
   auto close = [&] {
     // Disconnect runs independently of the query task. Wait before destroying
     // either its bound transaction or the binding borrowed by that task.
@@ -494,16 +655,85 @@ int worker_read_wire(Frame &frame) {
   return ret ? OB_CONNECT_ERROR : frame.data.size() >= Frame::HEADER_SIZE ? OB_SUCCESS : OB_INVALID_ARGUMENT;
 }
 int worker_send(const Frame &frame, bool cleanup) {
+  if (frame.ret) { return frame.ret; }
   if (!worker_request) { return worker_send_wire(frame); }
   const int ret = worker_request->take_credit(cleanup);
   if (ret) { return ret; }
-  Frame output = frame; output.tag(worker_request->tag);
+  Frame output = frame;
+  if (worker_request->tag.slot & WORKER_REQUEST) {
+    // Native query deadlines accompany each storage call. The connection route
+    // itself survives multiple commands and does not retain an old deadline.
+    output = Frame(frame.type(), frame.limit);
+    output.number(THIS_WORKER.get_timeout_ts());
+    output.data.insert(output.data.end(), frame.data.begin() + Frame::HEADER_SIZE, frame.data.end());
+    if (output.data.size() > output.limit) { output.ret = OB_SIZE_OVERFLOW; }
+  }
+  output.tag(worker_request->tag);
   return worker_send_wire(std::move(output));
 }
 int worker_read(Frame &frame) {
   // Once an RPC is sent, consume its reply even after cancellation so cleanup
   // cannot mistake an earlier operation's reply for its own.
   return worker_request ? worker_request->take(frame, true) : OB_ERR_UNEXPECTED;
+}
+int begin_direct_request(uint32_t sid, SessionBinding *&binding, bool internal) {
+  if (!worker_process) { return OB_SUCCESS; }
+  if (binding) {
+    if (!binding->direct_request) { return OB_INVALID_ARGUMENT; }
+    worker_request = binding->direct_request.get();
+    worker_request->cancelled = OB_SUCCESS;
+    worker_request->deadline = INT64_MAX;
+    return OB_SUCCESS;
+  }
+  auto owner = std::make_unique<SessionBinding>();
+  owner->direct_request = worker_storage_routes.allocate(false);
+  if (!owner->direct_request) { return OB_EAGAIN; }
+  worker_request = owner->direct_request.get();
+  Frame request('L'), reply; request.number(sid); request.number(internal);
+  int ret = worker_send(request);
+  if (!ret) { ret = worker_read(reply); }
+  if (!ret) { ret = reply.type() == 'l' ? static_cast<int>(reply.number()) : OB_INVALID_ARGUMENT; }
+  if (!ret && !reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
+  if (ret) {
+    worker_storage_routes.release(worker_request->tag, true);
+    worker_request = nullptr;
+  } else { binding = owner.release(); }
+  return ret;
+}
+int finish_direct_request() {
+  if (!worker_request || !(worker_request->tag.slot & WORKER_REQUEST)) { return OB_SUCCESS; }
+  Frame request('e'), reply;
+  int ret = worker_send(request, true);
+  if (!ret) { ret = worker_read(reply); }
+  if (!ret) { ret = reply.type() == 'l' ? static_cast<int>(reply.number()) : OB_INVALID_ARGUMENT; }
+  if (!ret && !reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
+  worker_request = nullptr;
+  return ret;
+}
+int bind_direct_session(SessionBinding *binding, sql::ObSQLSessionInfo &session) {
+  if (!worker_process || !binding || !binding->direct_request) { return OB_SUCCESS; }
+  if (binding->gateway) { share::server_service<sql::ObSQLSessionMgr>()->revert_session(binding->gateway); binding->gateway = nullptr; }
+  binding->direct_request->sql_session = &session;
+  return share::server_service<sql::ObSQLSessionMgr>()->get_session(session.get_server_sid(), binding->gateway);
+}
+StorageSessionScope::StorageSessionScope(sql::ObSQLSessionInfo *session, bool create)
+    : previous_(worker_request) {
+  if (worker_process && worker_namespace && session
+      && (!worker_request || worker_request->sql_session != session)
+      && (create || session->namespace_storage_binding())) {
+    switched_ = true;
+    error_ = begin_direct_request(session->get_server_sid(), session->namespace_storage_binding(), true);
+    if (!error_) { worker_request->sql_session = session; }
+  }
+}
+StorageSessionScope::~StorageSessionScope() {
+  if (switched_) { worker_request = previous_; }
+}
+void StorageSessionScope::close(SessionBinding *&binding) {
+  if (binding) {
+    if (previous_ == binding->direct_request.get()) { previous_ = nullptr; }
+    close_session(binding); binding = nullptr;
+  }
 }
 int fetch_catalog(char type, uint64_t id, const ObString &name, Frame &reply) {
   Frame request(type); request.number(id); request.string(name);
@@ -512,5 +742,11 @@ int fetch_catalog(char type, uint64_t id, const ObString &name, Frame &reply) {
   if (!ret && reply.type() != 'c') { ret = OB_INVALID_ARGUMENT; }
   if (!ret) { ret = static_cast<int>(reply.number()); }
   return ret ? ret : reply.ret;
+}
+int fetch_schema_version(bool published, bool core_version, int64_t &version) {
+  Frame reply;
+  int ret = fetch_catalog('k', core_version, published ? ObString::make_string("published") : ObString(), reply);
+  if (!ret) { version = static_cast<int64_t>(reply.number()); }
+  return ret ? ret : reply.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT;
 }
 } } }

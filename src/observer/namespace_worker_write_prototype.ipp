@@ -4,6 +4,7 @@
 #include "data_plane/access/ob_dml_table_plan.h"
 #include "data_plane/blocksstable/ob_datum_row_iterator.h"
 #include "data_plane/transaction/ob_i_transaction_service.h"
+#include "data_plane/transaction/ob_i_tx_callback.h"
 #include "storage/tx/ob_trans_define_v4.h"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 using namespace data_plane;
@@ -340,7 +341,13 @@ public:
                         int64_t expire_ts) override { Frame request, reply; request.number(expire_ts); return tx_rpc('C', tx, request, reply); }
   int submit_commit_tx(transaction::ObTxDesc &tx,
                                int64_t expire_ts,
-                               transaction::ObITxCallback &callback) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX submit_commit_tx\n"); return OB_NOT_SUPPORTED; }
+                               transaction::ObITxCallback &callback) override {
+    // Native callbacks support completion before submit returns. Commit stays
+    // authoritative in storage; only then release the native SQL response.
+    const int ret = commit_tx(tx, expire_ts);
+    if (!ret) { callback.callback(OB_SUCCESS); }
+    return ret;
+  }
   int release_tx(transaction::ObTxDesc &tx) override {
     int ret = OB_SUCCESS;
     if (worker_request) {
