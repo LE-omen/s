@@ -245,7 +245,16 @@ int append_session_state(sql::ObSQLSessionInfo &session, Frame &frame, bool iden
 int apply_session_state(sql::ObSQLSessionInfo &session, Frame &frame) {
   const uint64_t db = frame.number(); const ObString name = frame.string();
   int ret = frame.ret;
-  if (!ret) { ret = session.set_default_database(name); session.set_database_id(db); }
+  if (!ret) {
+    ObString logical_name = name;
+    const ObDatabaseSchema *database = nullptr;
+    if (NamespaceForkKernelPrototype::is_namespace_address(name)
+        && NamespaceForkKernelPrototype::database_by_address(name, database) == OB_SUCCESS
+        && database != nullptr) {
+      logical_name = database->get_database_name_str();
+    }
+    ret = session.set_default_database(logical_name); session.set_database_id(db);
+  }
   for (auto id : state_vars) {
     const uint64_t value = frame.number();
     if (!ret) { ret = frame.ret ? frame.ret : session.update_sys_variable(id, static_cast<int64_t>(value)); }
