@@ -1253,7 +1253,9 @@ int ObSchemaGetterGuard::get_simple_table_schema(
     const bool with_hidden_flag/*false*/,
     const bool is_built_in_index/*false*/)
 {
-  if (observer::namespace_worker_prototype::worker_namespace == 1) {
+  const bool fork_user_database = observer::namespace_worker_prototype::worker_namespace > 1
+      && storage::NamespaceForkKernelPrototype::is_encoded_id(database_id);
+  if (observer::namespace_worker_prototype::worker_namespace == 1 || fork_user_database) {
     const ObTableSchema *full = nullptr;
     int ret = worker_schema_prototype(is_index ? 'j' : 't', database_id, table_name, TABLE_SCHEMA, full);
     simple_table_schema = full;
