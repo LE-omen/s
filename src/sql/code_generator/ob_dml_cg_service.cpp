@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_CG
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "ob_dml_cg_service.h"
 #include "sql/code_generator/ob_static_engine_cg.h"
 #include "sql/engine/ob_physical_plan.h"
@@ -68,27 +69,32 @@ int ObDmlCgService::generate_insert_ctdef(ObLogDelUpd &op,
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(ret));
   } else if (OB_FAIL(convert_insert_new_row_exprs(index_dml_info, new_row))) {
+    fprintf(stderr, "PROTOTYPE_DEBUG_DML_CG new_row=%d\\n", ret);
   } else if (OB_FAIL(generate_dml_base_ctdef(op, index_dml_info,
                                              ins_ctdef,
                                              dml_event,
                                              old_row,
                                              new_row))) {
+    fprintf(stderr, "PROTOTYPE_DEBUG_DML_CG base=%d\\n", ret);
   } else if (index_dml_info.is_primary_index_ //generate column infos
       && OB_FAIL(add_all_column_infos(op,
                                       index_dml_info.column_exprs_,
-                                      ins_ctdef.is_table_without_pk_,
-                                      ins_ctdef.column_infos_))) {
+                                                 ins_ctdef.is_table_without_pk_,
+                                                 ins_ctdef.column_infos_))) {
+    fprintf(stderr, "PROTOTYPE_DEBUG_DML_CG columns=%d\\n", ret);
     LOG_WARN("add column info failed", K(ret), K(index_dml_info.column_exprs_));
   } else if (OB_FAIL(generate_das_ins_ctdef(op,
                                             index_dml_info.ref_table_id_,
                                             index_dml_info,
                                             ins_ctdef.das_ctdef_,
                                             new_row))) {
+    fprintf(stderr, "PROTOTYPE_DEBUG_DML_CG das=%d\\n", ret);
   } else if (OB_FAIL(generate_related_ins_ctdef(op,
                                                 index_dml_info.related_index_ids_,
                                                 index_dml_info,
                                                 new_row,
                                                 ins_ctdef.related_ctdefs_))) {
+    fprintf(stderr, "PROTOTYPE_DEBUG_DML_CG related=%d\\n", ret);
   }
   // generate for replace into and insert_up fetch conflict rowkey
   if (OB_SUCC(ret) && op.get_stmt()->is_insert_stmt() &&
@@ -1774,6 +1780,10 @@ int ObDmlCgService::get_table_schema_version(const ObLogicalOperator &op,
       if (OB_FAIL(schema_guard->get_schema_version(TABLE_SCHEMA, table_id, schema_version))) {
       }
     }
+  }
+  if (OB_SUCC(ret) && observer::namespace_worker_prototype::worker_namespace > 1 &&
+      schema_version == OB_INVALID_VERSION) {
+    ret = observer::namespace_worker_prototype::fetch_schema_version(false, false, schema_version);
   }
   return ret;
 }
