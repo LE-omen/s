@@ -79,6 +79,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   WORKER_STEP(server_module_new_default(mods_data_access_service_));
   WORKER_STEP(storage::ObLobManager::server_module_new(mods_lob_manager_));
   bind_server_service<ObSQLSessionMgr>(&session_mgr_);
+  bind_server_service<ObVTIterCreator>(&vt_data_service_.get_vt_iter_factory().get_vt_iter_creator());
   bind_server_service<ObPlanCache>(mods_plan_cache_);
   bind_server_service<ObPsCache>(mods_ps_cache_);
   bind_server_service<ObSqlMemoryManager>(mods_sql_memory_manager_);

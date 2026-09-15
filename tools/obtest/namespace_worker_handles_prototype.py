@@ -71,9 +71,9 @@ def run(binary):
             return b"Q" + numbers(*handle, time.time_ns()//1000 + int(timeout*1000000), len(text)) + text
 
         def open_session(sid):
-            # Invalid default DB avoids catalog requests. Seven protocol scalars:
-            # client/connection/results charset, connection/DB collation, mode, timeout.
-            reply, = command(b"A" + numbers(sid, 0, (1<<64)-1, 0, 45, 45, 45, 45, 45, 0, 30000000))
+            # Invalid default DB avoids catalog requests. Eight protocol scalars:
+            # client/connection/results charset, connection/DB collation, mode, timeout, autocommit.
+            reply, = command(b"A" + numbers(sid, 0, (1<<64)-1, 0, 45, 45, 45, 45, 45, 0, 30000000, 1))
             assert reply[:1] == b"a" and len(reply) == 17
             return struct.unpack("<QQ", reply[1:])
 
@@ -143,9 +143,11 @@ def run(binary):
             reused = replacement
             query(reused, "SET @x=17")
 
-            def finish_cancel(tag, reason=-4012):
+            def finish_cancel(tag, reason=-4012, rpc_reply=None):
                 started = time.monotonic()
                 send(tag, b"Z" + numbers((1<<64)+reason))
+                if rpc_reply is not None:
+                    send(tag, rpc_reply)
                 while True:
                     actual, reply = receive()
                     assert actual == tag, (actual, tag, base)
@@ -174,13 +176,13 @@ def run(binary):
             assert not select.select([proc.stdout], [], [], .2)[0]
             finish_cancel((4,2))  # wakes the credit wait; D needs no credit
 
-            # A worker blocked on a catalog RPC is also cancellable without a
-            # reply from storage. No fake catalog is needed for this probe.
+            # A sent RPC is drained before cleanup. The gateway rejects the
+            # outstanding catalog request with the cancellation error.
             send((4,3), query_payload(reused, "USE missing_db"))
             tag, reply = receive()
             assert tag == (4,3) and reply[:1] in (b"d",b"b",b"t",b"i"), (tag,reply,base)
             send(tag, b"K")
-            finish_cancel(tag)
+            finish_cancel(tag, rpc_reply=b"c" + numbers((1<<64)-4012))
 
             # Fill both execution threads; cancellation of the queued third
             # query must complete before either running SQL finishes.

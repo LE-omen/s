@@ -365,9 +365,15 @@ int save_roots(ObISQLClient &sql, uint64_t db, const Roots &root) {
   return ret == OB_SUCCESS ? write_sql(sql, q) : ret;
 }
 bool supported(const ObTableSchema &s) {
+  for (int64_t i = 0; i < s.get_foreign_key_infos().count(); ++i) {
+    const auto &fk = s.get_foreign_key_infos().at(i);
+    if (fk.is_parent_table_mock_ || fk.parent_table_id_ >= (1ULL << 32)
+        || fk.child_table_id_ >= (1ULL << 32)
+        || fk.fk_ref_type_ != FK_REF_TYPE_PRIMARY_KEY) { return false; }
+  }
   const auto *id = s.get_column_schema("id"), *v = s.get_column_schema("v");
   return s.get_table_type() == USER_TABLE && !s.is_partitioned_table() && s.get_index_tid_count() == 0
-      && !s.has_lob_aux_table() && s.get_foreign_key_infos().empty() && s.get_trigger_list().empty()
+      && !s.has_lob_aux_table() && s.get_trigger_list().empty()
       && !s.has_generated_column() && s.get_autoinc_column_id() == 0 && s.get_column_count() == 2
       && s.get_rowkey_column_num() == 1 && id && v && id->is_rowkey_column()
       && ob_is_integer_type(id->get_data_type()) && ob_is_integer_type(v->get_data_type());
@@ -386,6 +392,13 @@ int schema_from_value(uint64_t db, const Value &value, const ObTableSchema *&sch
   if (pos != int64_t(data.size()) || !supported(*copy)) { return OB_NOT_SUPPORTED; }
   copy->set_database_id(NamespaceForkKernelPrototype::namespace_mode() ? encoded(db, copy->get_database_id()) : db);
   copy->set_table_id(id); copy->set_tablet_id(ObTabletID(encoded(db, tablet)));
+  for (int64_t i = 0; i < copy->get_foreign_key_infos().count(); ++i) {
+    auto &fk = copy->get_foreign_key_infos().at(i);
+    fk.table_id_ = id;
+    fk.child_table_id_ = encoded(db, fk.child_table_id_);
+    fk.parent_table_id_ = encoded(db, fk.parent_table_id_);
+    if (fk.ref_cst_id_ != OB_INVALID_ID) { fk.ref_cst_id_ = encoded(db, fk.ref_cst_id_); }
+  }
   for (int64_t i = 0; i < copy->get_column_count(); ++i) {
     const_cast<ObColumnSchemaV2 *>(copy->get_column_schema_by_idx(i))->set_table_id(id);
   }

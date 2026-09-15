@@ -40,7 +40,7 @@ struct PendingRequest {
   }
   int post(Frame frame) {
     std::lock_guard<std::mutex> guard(mutex);
-    if (error || cancelled.load()) { return common::OB_SUCCESS; }
+    if (error) { return common::OB_SUCCESS; }
     if (frame.type() == 'K') {
       if (credit || !frame.consumed()) { return common::OB_INVALID_ARGUMENT; }
       credit = true;
@@ -66,22 +66,22 @@ struct PendingRequest {
     auto &slot = incoming ? incoming : terminal;
     frame = std::move(*slot); slot.reset(); return common::OB_SUCCESS;
   }
-  int take_credit() {
+  int take_credit(bool draining = false) {
     std::unique_lock<std::mutex> guard(mutex);
     if (!credit && !error && !reported_wait) {
       reported_wait = true;
       fprintf(stderr, "PROTOTYPE_V12_CREDIT_WAIT request=%llu generation=%llu\n",
           (unsigned long long)tag.slot, (unsigned long long)tag.generation);
     }
-    auto ready = [&] { return error || credit || cancelled.load(); };
-    if (deadline == INT64_MAX) {
+    auto ready = [&] { return error || credit || (!draining && cancelled.load()); };
+    if (draining || deadline == INT64_MAX) {
       changed.wait(guard, ready);
     } else if (!changed.wait_until(guard,
         std::chrono::system_clock::time_point(std::chrono::microseconds(deadline)), ready)) {
       return common::OB_TIMEOUT;
     }
     if (error) { return error; }
-    const int state = status();
+    const int state = draining ? common::OB_SUCCESS : status();
     if (state) { return state; }
     credit = false; return common::OB_SUCCESS;
   }

@@ -10,8 +10,15 @@ using namespace data_plane;
 using namespace transaction;
 using namespace blocksstable;
 
+bool cleanup_write(Frame &request) {
+  const int64_t position = request.pos;
+  const uint64_t op = request.number();
+  request.pos = position;
+  return (request.type() == 'W' && op == 'X')
+      || (request.type() == 'T' && (op == 'B' || op == 'R' || op == 'U' || op == 'E' || op == 'V'));
+}
 int write_rpc(Frame &request, Frame &reply) {
-  int ret = worker_send(request);
+  int ret = worker_send(request, cleanup_write(request));
   if (!ret) { ret = worker_read(reply); }
   if (!ret && reply.type() != 'w') { ret = OB_INVALID_ARGUMENT; }
   if (!ret) { ret = static_cast<int>(reply.number()); }
@@ -128,30 +135,33 @@ struct EngineWrite {
   }
 };
 
-// ponytail: one autocommit statement per request; explicit transactions need a
-// session-owned engine transaction. No transaction map or background collector.
+// The existing gateway session owns the real descriptor. Its native disconnect
+// handling can interrupt it; no extra transaction registry or cleanup thread.
 struct EngineWrites {
   uint64_t ns;
   sql::ObSQLSessionInfo &session;
   uint32_t sid;
-  ObTxDesc *tx = nullptr;
+  ObTxDesc *&tx;
   uint64_t sequence = 0;
-  std::unique_ptr<EngineWrite> write;
-  explicit EngineWrites(uint64_t namespace_id, sql::ObSQLSessionInfo &s) : ns(namespace_id), session(s), sid(s.get_server_sid()) {}
+  std::map<uint64_t, std::unique_ptr<EngineWrite>> writes;
+  explicit EngineWrites(uint64_t namespace_id, sql::ObSQLSessionInfo &s)
+      : ns(namespace_id), session(s), sid(s.get_server_sid()), tx(s.get_tx_desc()) {}
   int check_finished() const {
-    return write || (tx && tx->is_in_tx() && !tx->is_tx_end()) ? OB_ERR_UNEXPECTED : OB_SUCCESS;
+    return writes.empty() ? OB_SUCCESS : OB_ERR_UNEXPECTED;
   }
-  ~EngineWrites() {
+  void reset() {
     session.reset_reserved_snapshot_version();
-    write.reset();
+    writes.clear();
     if (tx) {
       auto *service = query_transaction_service();
       const bool rollback = tx->is_in_tx() && !tx->is_tx_end();
       if (rollback) { service->rollback_tx(*tx); }
       service->release_tx(*tx);
+      tx = nullptr;
       fprintf(stderr, "PROTOTYPE_V14_TX_RELEASED session=%u rollback=%d\n", sid, rollback);
     }
   }
+  ~EngineWrites() { reset(); }
   int process(Frame &request, Frame &reply) {
     auto *service = query_transaction_service();
     const uint64_t operation = request.number();
@@ -165,40 +175,66 @@ struct EngineWrites {
     if (!ret && request.type() == 'T') {
       if (operation == 'A') {
         if (!request.consumed()) { ret = OB_INVALID_ARGUMENT; }
+      } else if (operation == 'V') {
+        if (!request.consumed() || !writes.empty()) { ret = OB_INVALID_ARGUMENT; }
+        else { reset(); }
+      } else if (operation == 'H') {
+        ObTxParam param; request.read(param);
+        if (!request.consumed() || !param.is_valid()) { ret = OB_INVALID_ARGUMENT; }
+        else { ret = service->start_tx(*tx, param); }
       } else if (operation == 'S' || operation == 'N' || operation == 'U') {
-        if (!request.consumed() || write) { ret = OB_INVALID_ARGUMENT; }
+        if (!request.consumed() || (operation != 'S' && !writes.empty())) { ret = OB_INVALID_ARGUMENT; }
         else if (operation == 'S') { ret = service->prepare_tx_for_statement(*tx); }
         else if (operation == 'N') { ret = service->prepare_tx_for_autocommit_retry(*tx); }
         else { ret = service->reuse_tx(*tx); }
       } else if (operation == 'P') {
         ObTxParam param; ObTxSEQ savepoint;
         request.read(param); const bool release = request.number() != 0;
-        if (!request.consumed() || !param.is_valid() || param.isolation_ != ObTxIsolationLevel::RC) { ret = OB_NOT_SUPPORTED; }
+        if (!request.consumed() || !param.is_valid()) { ret = OB_INVALID_ARGUMENT; }
         else { ret = service->create_implicit_savepoint(*tx, param, savepoint, release); }
         values.append(savepoint);
       } else if (operation == 'G') {
         auto isolation = static_cast<ObTxIsolationLevel>(request.number());
         const int64_t deadline = request.number();
         ObTxReadSnapshot snapshot;
-        if (!request.consumed() || isolation != ObTxIsolationLevel::RC) { ret = OB_NOT_SUPPORTED; }
+        if (!request.consumed()) { ret = OB_INVALID_ARGUMENT; }
         else { ret = service->get_read_snapshot(*tx, isolation, std::min(deadline, THIS_WORKER.get_timeout_ts()), snapshot); }
-        if (!ret) { session.set_reserved_snapshot_version(snapshot.core_.version_); }
+        if (!ret && (!session.get_reserved_snapshot_version().is_valid()
+            || snapshot.core_.version_ < session.get_reserved_snapshot_version())) {
+          session.set_reserved_snapshot_version(snapshot.core_.version_);
+        }
         values.append(snapshot);
       } else if (operation == 'C') {
         const int64_t deadline = request.number();
-        if (!request.consumed() || write) { ret = OB_INVALID_ARGUMENT; }
+        if (!request.consumed() || !writes.empty()) { ret = OB_INVALID_ARGUMENT; }
         else { ret = service->commit_tx(*tx, std::min(deadline, THIS_WORKER.get_timeout_ts())); }
         fprintf(stderr, "PROTOTYPE_V14_COMMIT session=%u tx=%llu ret=%d\n", sid, (unsigned long long)txid, ret);
       } else if (operation == 'R') {
         if (!request.consumed()) { ret = OB_INVALID_ARGUMENT; }
-        else { write.reset(); ret = service->rollback_tx(*tx); }
+        else if (!writes.empty()) { ret = OB_ERR_UNEXPECTED; }
+        else { ret = service->rollback_tx(*tx); }
       } else if (operation == 'B') {
         ObTxSEQ savepoint; request.read(savepoint);
         const int64_t deadline = request.number();
         const bool touched = request.number() != 0;
         auto policy = static_cast<ObTxCleanPolicy>(request.number());
         if (!request.consumed() || (policy != FAST_ROLLBACK && policy != ROLLBACK && policy != KEEP)) { ret = OB_INVALID_ARGUMENT; }
-        else { write.reset(); ret = service->rollback_to_implicit_savepoint(*tx, savepoint, deadline, touched, policy); }
+        else { ret = service->rollback_to_implicit_savepoint(*tx, savepoint, deadline, touched, policy); }
+      } else if (operation == 'J' || operation == 'I') {
+        ObTxSEQ savepoint;
+        const int16_t branch = operation == 'J' ? request.number() : 0;
+        if (!request.consumed()) { ret = OB_INVALID_ARGUMENT; }
+        else if (operation == 'J') { ret = service->create_branch_savepoint(*tx, branch, savepoint); }
+        else { ret = service->create_in_txn_implicit_savepoint(*tx, savepoint); }
+        values.append(savepoint);
+      } else if (operation == 'F' || operation == 'L' || operation == 'D' || operation == 'K') {
+        const ObString name = request.string();
+        const int64_t deadline = operation == 'L' ? request.number() : 0;
+        if (!request.consumed()) { ret = OB_INVALID_ARGUMENT; }
+        else if (operation == 'F') { ret = service->create_explicit_savepoint(*tx, name); }
+        else if (operation == 'L') { ret = service->rollback_to_explicit_savepoint(*tx, name, deadline); }
+        else if (operation == 'D') { ret = service->release_explicit_savepoint(*tx, name); }
+        else { ret = service->create_stash_savepoint(*tx, name); }
       } else if (operation == 'E') {
         ObTxExecResult result;
         if (!request.consumed()) { ret = OB_INVALID_ARGUMENT; }
@@ -207,23 +243,24 @@ struct EngineWrites {
       } else { ret = OB_NOT_SUPPORTED; }
     } else if (!ret && request.type() == 'W') {
       if (operation == 'P') {
-        if (write) { ret = OB_NOT_SUPPORTED; }
+        if (writes.size() >= 32) { ret = OB_SIZE_OVERFLOW; }
         auto prepared = std::make_unique<EngineWrite>();
         if (!ret) { ret = prepared->prepare(ns, *tx, request); }
-        if (!ret) { write = std::move(prepared); values.number(++sequence); }
+        if (!ret) { writes.emplace(++sequence, std::move(prepared)); values.number(sequence); }
       } else {
         const uint64_t handle = request.number();
-        if (request.ret || !write || handle != sequence) { ret = OB_INVALID_ARGUMENT; }
-        else if (operation == 'X' && request.consumed()) { write.reset(); }
+        auto it = writes.find(handle);
+        if (request.ret || it == writes.end()) { ret = OB_INVALID_ARGUMENT; }
+        else if (operation == 'X' && request.consumed()) { writes.erase(it); }
         else if (operation == 'I' || operation == 'U' || operation == 'D' || operation == 'L') {
           int64_t affected = 0;
-          ret = write->batch(operation, *tx, request, affected); values.number(affected);
+          ret = it->second->batch(operation, *tx, request, affected); values.number(affected);
         } else { ret = OB_INVALID_ARGUMENT; }
       }
     }
     reply = Frame('w'); reply.number(ret);
     if (!ret) {
-      if (request.type() == 'T' || (request.type() == 'W' && operation == 'X')) { reply.append(*tx); }
+      if ((request.type() == 'T' && operation != 'V') || (request.type() == 'W' && operation == 'X')) { reply.append(*tx); }
       reply.data.insert(reply.data.end(), values.data.begin() + Frame::HEADER_SIZE, values.data.end());
       if (values.ret) { reply.ret = values.ret; }
     }
@@ -267,7 +304,8 @@ public:
     if (!ret) { tx = owned.release(); }
     return ret; }
   int start_tx(transaction::ObTxDesc &tx,
-                       const transaction::ObTxParam &tx_param) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX start_tx\n"); return OB_NOT_SUPPORTED; }
+                       const transaction::ObTxParam &tx_param) override {
+    Frame request, reply; request.append(tx_param); return tx_rpc('H', tx, request, reply); }
   int abort_tx(transaction::ObTxDesc &tx, int cause) override { return rollback_tx(tx); }
   int rollback_tx(transaction::ObTxDesc &tx) override { Frame request, reply; return tx_rpc('R', tx, request, reply); }
   int commit_tx(transaction::ObTxDesc &tx,
@@ -275,7 +313,14 @@ public:
   int submit_commit_tx(transaction::ObTxDesc &tx,
                                int64_t expire_ts,
                                transaction::ObITxCallback &callback) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX submit_commit_tx\n"); return OB_NOT_SUPPORTED; }
-  int release_tx(transaction::ObTxDesc &tx) override { delete &tx; return OB_SUCCESS; }
+  int release_tx(transaction::ObTxDesc &tx) override {
+    int ret = OB_SUCCESS;
+    if (worker_request) {
+      Frame request('T'), reply; request.number('V'); request.number(tx.get_tx_id().get_id());
+      ret = write_rpc(request, reply);
+      if (!ret && !reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
+    }
+    delete &tx; return ret; }
   int reuse_tx(transaction::ObTxDesc &tx) override { Frame request, reply; return tx_rpc('U', tx, request, reply); }
   int prepare_tx_for_statement(transaction::ObTxDesc &tx) override { Frame request, reply; return tx_rpc('S', tx, request, reply); }
   int prepare_tx_for_autocommit_retry(transaction::ObTxDesc &tx) override { Frame request, reply; return tx_rpc('N', tx, request, reply); }
@@ -304,11 +349,18 @@ public:
     return ret; }
   int create_branch_savepoint(transaction::ObTxDesc &tx,
                                       int16_t branch,
-                                      transaction::ObTxSEQ &savepoint) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX create_branch_savepoint\n"); return OB_NOT_SUPPORTED; }
+                                      transaction::ObTxSEQ &savepoint) override {
+    Frame request, reply; request.number(branch); int ret = tx_rpc('J', tx, request, reply);
+    if (!ret) { reply.read(savepoint); if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; } }
+    return ret; }
   int create_in_txn_implicit_savepoint(transaction::ObTxDesc &tx,
-                                               transaction::ObTxSEQ &savepoint) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX create_in_txn_implicit_savepoint\n"); return OB_NOT_SUPPORTED; }
+                                               transaction::ObTxSEQ &savepoint) override {
+    Frame request, reply; int ret = tx_rpc('I', tx, request, reply);
+    if (!ret) { reply.read(savepoint); if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; } }
+    return ret; }
   int create_explicit_savepoint(transaction::ObTxDesc &tx,
-                                        const common::ObString &savepoint) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX create_explicit_savepoint\n"); return OB_NOT_SUPPORTED; }
+                                        const common::ObString &savepoint) override {
+    Frame request, reply; request.string(savepoint); return tx_rpc('F', tx, request, reply); }
   int rollback_to_implicit_savepoint(
       transaction::ObTxDesc &tx,
       transaction::ObTxSEQ savepoint,
@@ -320,11 +372,14 @@ public:
     return tx_rpc('B', tx, request, reply); }
   int rollback_to_explicit_savepoint(transaction::ObTxDesc &tx,
                                              const common::ObString &savepoint,
-                                             int64_t expire_ts) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX rollback_to_explicit_savepoint\n"); return OB_NOT_SUPPORTED; }
+                                             int64_t expire_ts) override {
+    Frame request, reply; request.string(savepoint); request.number(expire_ts); return tx_rpc('L', tx, request, reply); }
   int release_explicit_savepoint(transaction::ObTxDesc &tx,
-                                         const common::ObString &savepoint) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX release_explicit_savepoint\n"); return OB_NOT_SUPPORTED; }
+                                         const common::ObString &savepoint) override {
+    Frame request, reply; request.string(savepoint); return tx_rpc('D', tx, request, reply); }
   int create_stash_savepoint(transaction::ObTxDesc &tx,
-                                     const common::ObString &name) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX create_stash_savepoint\n"); return OB_NOT_SUPPORTED; }
+                                     const common::ObString &name) override {
+    Frame request, reply; request.string(name); return tx_rpc('K', tx, request, reply); }
   int merge_tx_state(transaction::ObTxDesc &to,
                              const transaction::ObTxDesc &from) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_TX merge_tx_state\n"); return OB_NOT_SUPPORTED; }
   int get_tx_exec_result(transaction::ObTxDesc &tx,

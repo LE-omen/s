@@ -11,7 +11,7 @@ int check_worker_sql(const ObString &text, sql::ObSQLSessionInfo &info, ObIAlloc
   using namespace sql;
   auto *session = &info;
   int ret = OB_SUCCESS;
-  // Reject commands outside the SELECT/session/simple autocommit DML slice.
+  // Admission policy only; native drivers own statement and transaction semantics.
   ObParser parser(allocator, session->get_sql_mode(), session->get_charsets4parser());
   ObSEArray<ObString, 2> statements;
   ObMPParseStat parse_stat;
@@ -24,7 +24,9 @@ int check_worker_sql(const ObString &text, sql::ObSQLSessionInfo &info, ObIAlloc
     if (node && node->type_ == T_STMT_LIST && node->num_child_ == 1) { node = node->children_[0]; }
     if (!node || (node->type_ != T_SELECT && node->type_ != T_INSERT && node->type_ != T_UPDATE
                   && node->type_ != T_DELETE && node->type_ != T_VARIABLE_SET
-                  && node->type_ != T_USE_DATABASE)) { ret = OB_NOT_SUPPORTED; }
+                  && node->type_ != T_USE_DATABASE && node->type_ != T_BEGIN && node->type_ != T_COMMIT
+                  && node->type_ != T_ROLLBACK && node->type_ != T_CREATE_SAVEPOINT
+                  && node->type_ != T_ROLLBACK_SAVEPOINT && node->type_ != T_RELEASE_SAVEPOINT)) { ret = OB_NOT_SUPPORTED; }
     if (!ret && node->type_ == T_INSERT && (node->num_child_ != 4 || node->children_[3])) { ret = OB_NOT_SUPPORTED; }
     // IGNORE needs additional savepoint operations; keep it outside this slice.
     if (!ret && node->type_ == T_UPDATE && (node->num_child_ != 11 || node->children_[8])) { ret = OB_NOT_SUPPORTED; }
@@ -47,9 +49,9 @@ int check_worker_plan(ObMySQLResultSet &result) {
   using namespace sql;
   int ret = OB_SUCCESS;
   if (!ret && result.get_stmt_type() == stmt::T_SELECT) {
-    if (!result.get_physical_plan() || !result.get_physical_plan()->is_plain_select()) { ret = OB_NOT_SUPPORTED; }
+    if (!result.get_physical_plan()) { ret = OB_NOT_SUPPORTED; }
   } else if (!ret && result.get_stmt_type() == stmt::T_INSERT) {
-    if (!result.get_physical_plan() || !result.get_physical_plan()->is_plain_insert()) { ret = OB_NOT_SUPPORTED; }
+    if (!result.get_physical_plan()) { ret = OB_NOT_SUPPORTED; }
   } else if (!ret && (result.get_stmt_type() == stmt::T_UPDATE || result.get_stmt_type() == stmt::T_DELETE)) {
     if (!result.get_physical_plan()) { ret = OB_NOT_SUPPORTED; }
   } else if (!ret && result.get_stmt_type() == stmt::T_VARIABLE_SET) {
@@ -61,15 +63,22 @@ int check_worker_plan(ObMySQLResultSet &result) {
       if (!ret && !node.set_names_stmt_) {
         if (node.set_scope_ != ObSetVar::SET_SCOPE_SESSION
             || (node.value_expr_ && node.value_expr_->has_flag(CNT_SUB_QUERY))) { ret = OB_NOT_SUPPORTED; }
-        // Keep explicit transactions and global/storage-affecting SET outside this slice.
+        // Global/storage configuration still belongs to shared server administration.
         if (node.is_system_variable_ && node.variable_name_.case_compare("sql_mode") != 0
             && node.variable_name_.case_compare("ob_query_timeout") != 0
+            && node.variable_name_.case_compare("autocommit") != 0
+            && node.variable_name_.case_compare("transaction_isolation") != 0
+            && node.variable_name_.case_compare("tx_isolation") != 0
             && node.variable_name_.case_compare("character_set_client") != 0
             && node.variable_name_.case_compare("character_set_connection") != 0
             && node.variable_name_.case_compare("character_set_results") != 0
             && node.variable_name_.case_compare("collation_connection") != 0) { ret = OB_NOT_SUPPORTED; }
       }
     }
+  } else if (!ret && (result.get_stmt_type() == stmt::T_START_TRANS
+      || result.get_stmt_type() == stmt::T_END_TRANS || result.get_stmt_type() == stmt::T_CREATE_SAVEPOINT
+      || result.get_stmt_type() == stmt::T_ROLLBACK_SAVEPOINT || result.get_stmt_type() == stmt::T_RELEASE_SAVEPOINT)) {
+    // Native command executors call the same remote transaction service as DML.
   } else if (!ret && result.get_stmt_type() == stmt::T_USE_DATABASE) {
     auto *command = static_cast<ObUseDatabaseStmt *>(result.get_cmd());
     if (!command || ((static_cast<uint64_t>(command->get_db_id()) & ~(1ULL << 62)) >> 32) != worker_namespace) {

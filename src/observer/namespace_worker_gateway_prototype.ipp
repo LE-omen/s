@@ -1,8 +1,9 @@
-// Included in the Observer composition unit. The gateway remains the sole engine.
+// Included in the Observer composition unit. Shared storage serves SQL workers.
 #include "observer/namespace_worker_protocol_prototype.h"
 #include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include <map>
 #include <mutex>
+#include "rpc/ob_sql_request_operator.h"
 extern "C" {
 void *namespace_proto_spawn(uint64_t, uint64_t, uint32_t *);
 int namespace_proto_send(void *, const char *, size_t);
@@ -30,10 +31,10 @@ struct Channel {
   uint32_t pid = 0;
   std::atomic<bool> closed{false};
   RequestRoutes routes;
+  std::mutex bindings_mutex;
+  SessionBinding *bindings = nullptr;
   ~Channel() { fail(); namespace_proto_stop(handle); }
-  void fail() {
-    if (!closed.exchange(true)) { routes.fail(); namespace_proto_interrupt(handle); }
-  }
+  void fail();
   int send(const Frame &frame) {
     if (closed) { return OB_CONNECT_ERROR; }
     const int ret = frame.ret ? frame.ret : namespace_proto_send(handle, frame.data.data(), frame.data.size()) == 0
@@ -68,10 +69,31 @@ struct SessionBinding {
   std::shared_ptr<Channel> channel;
   uint64_t ns = 0, slot = 0, slot_generation = 0;
   sql::ObSQLSessionInfo *gateway = nullptr;
+  std::unique_ptr<EngineWrites> writes;
+  SessionBinding *previous = nullptr, *next = nullptr;
+  bool linked = false;
   ~SessionBinding() {
+    if (linked) {
+      std::lock_guard<std::mutex> guard(channel->bindings_mutex);
+      if (previous) { previous->next = next; } else { channel->bindings = next; }
+      if (next) { next->previous = previous; }
+    }
+    writes.reset();
     if (gateway) { share::server_service<sql::ObSQLSessionMgr>()->revert_session(gateway); }
   }
 };
+void Channel::fail() {
+  if (!closed.exchange(true)) {
+    routes.fail(); namespace_proto_interrupt(handle);
+    // Shutdown only schedules native connection teardown. The IPC reader does
+    // not wait for a session lock, execute rollback, or run another SQL engine.
+    std::lock_guard<std::mutex> guard(bindings_mutex);
+    for (auto *binding = bindings; binding; binding = binding->next) {
+      auto &socket = binding->gateway->get_sock_desc();
+      if (socket.sock_desc_) { SQL_REQ_OP.disconnect_by_sql_sock_desc(socket); }
+    }
+  }
+}
 sql::ObSQLSessionInfo *bound_session(SessionBinding *binding) { return binding ? binding->gateway : nullptr; }
 int attach(uint64_t ns, std::shared_ptr<Child> &child) {
   if (!enabled() || ns <= 1 || ns >= (1ULL << 30)) { return OB_NOT_SUPPORTED; }
@@ -88,7 +110,8 @@ int attach(uint64_t ns, std::shared_ptr<Child> &child) {
 const share::ObSysVarClassType state_vars[] = {
   share::SYS_VAR_CHARACTER_SET_CLIENT, share::SYS_VAR_CHARACTER_SET_CONNECTION,
   share::SYS_VAR_CHARACTER_SET_RESULTS, share::SYS_VAR_COLLATION_CONNECTION,
-  share::SYS_VAR_COLLATION_DATABASE, share::SYS_VAR_SQL_MODE, share::SYS_VAR_OB_QUERY_TIMEOUT
+  share::SYS_VAR_COLLATION_DATABASE, share::SYS_VAR_SQL_MODE, share::SYS_VAR_OB_QUERY_TIMEOUT,
+  share::SYS_VAR_AUTOCOMMIT
 };
 int append_session_state(sql::ObSQLSessionInfo &session, Frame &frame) {
   frame.number(session.get_database_id()); frame.string(session.get_database_name());
@@ -164,24 +187,32 @@ int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
       if (query && !reply.ret && !reply.consumed()) { ret = response(reply); }
       if (ret) { break; }
       if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; break; }
-      const int transaction_ret = writes && !query_ret ? writes->check_finished() : OB_SUCCESS;
+      const int transaction_ret = writes ? writes->check_finished() : OB_SUCCESS;
       return cancelled ? cancelled : query_ret ? query_ret : transaction_ret;
     }
     // One buffered reply per request, independent of every other request. Give
     // its credit back after taking ownership, before doing SQL/storage work.
     Frame credit('K'); credit.tag(pending->tag);
     if ((ret = channel.send(credit))) { break; }
-    if (cancelled) { continue; } // Keep ownership until D; no new storage work.
     if (reply.type() == 'd' || reply.type() == 'b' || reply.type() == 't' || reply.type() == 'i') {
-      Frame result; ret = catalog(ns, reply, result); result.tag(pending->tag);
+      Frame result('c');
+      if (cancelled) { result.number(cancelled); }
+      else { ret = catalog(ns, reply, result); }
+      result.tag(pending->tag);
       if (!ret) { ret = channel.send(result); }
     } else if (scans && (reply.type() == 'O' || reply.type() == 'F' || reply.type() == 'X')) {
-      Frame result; ret = scans->process(reply, result, writes ? writes->tx : nullptr); result.tag(pending->tag);
+      Frame result('s');
+      if (cancelled && reply.type() != 'X') { result.number(cancelled); }
+      else { ret = scans->process(reply, result, writes ? writes->tx : nullptr); }
+      result.tag(pending->tag);
       if (!ret) { ret = channel.send(result); }
     } else if (writes && (reply.type() == 'T' || reply.type() == 'W')) {
-      Frame result; ret = writes->process(reply, result); result.tag(pending->tag);
+      Frame result('w');
+      if (cancelled && !cleanup_write(reply)) { result.number(cancelled); }
+      else { ret = writes->process(reply, result); }
+      result.tag(pending->tag);
       if (!ret) { ret = channel.send(result); }
-    } else { ret = response(reply); }
+    } else if (!cancelled) { ret = response(reply); }
     if (ret && query && !channel.closed) { ret = cancel(ret); }
   }
   channel.fail(); return ret;
@@ -219,6 +250,7 @@ int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&b
   }
   if ((ret = share::server_service<sql::ObSQLSessionMgr>()->get_session(gateway.get_server_sid(), owned->gateway))) { return ret; }
   owned->ns = ns;
+  owned->writes = std::make_unique<EngineWrites>(ns, gateway);
   Frame request('A'); request.number(gateway.get_server_sid());
   request.number(gateway.get_capability().capability_);
   if ((ret = append_session_state(gateway, request))) { return ret; }
@@ -230,22 +262,37 @@ int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&b
     return opened ? OB_SUCCESS : OB_INVALID_ARGUMENT;
   });
   if (!ret && !opened) { owned->channel->fail(); ret = OB_INVALID_ARGUMENT; }
-  if (!ret) { binding = owned.release(); }
+  if (!ret) {
+    std::lock_guard<std::mutex> guard(owned->channel->bindings_mutex);
+    if (owned->channel->closed) { ret = OB_CONNECT_ERROR; }
+    else {
+      owned->next = owned->channel->bindings;
+      if (owned->next) { owned->next->previous = owned.get(); }
+      owned->channel->bindings = owned.get(); owned->linked = true;
+      binding = owned.release();
+    }
+  }
   return ret;
 }
 void close_session(SessionBinding *binding) {
   std::unique_ptr<SessionBinding> owned(binding);
-  if (!owned || owned->channel->closed) { return; }
-  Frame request('C'); request.number(owned->slot); request.number(owned->slot_generation);
-  const int ret = exchange(*owned->channel, owned->ns, request, nullptr, [](Frame &) { return OB_INVALID_ARGUMENT; });
-  // If even reserved control admission cannot progress, retaining an unreachable
-  // remote session is unsafe. Fail this activation and wake all its callers.
-  if (ret) { owned->channel->fail(); }
+  if (!owned) { return; }
+  {
+    // Disconnect runs independently of the query task. Wait before destroying
+    // either its bound transaction or the binding borrowed by that task.
+    sql::ObSQLSessionInfo::LockGuard lock(owned->gateway->get_query_lock());
+    if (!owned->channel->closed) {
+      Frame request('C'); request.number(owned->slot); request.number(owned->slot_generation);
+      const int ret = exchange(*owned->channel, owned->ns, request, nullptr, [](Frame &) { return OB_INVALID_ARGUMENT; });
+      if (ret) { owned->channel->fail(); }
+    }
+    owned->writes.reset();
+  } // Drop the native session reference only after releasing its query lock.
 }
 int query(SessionBinding &binding, const ObString &sql, bool change_database,
           const std::function<int(Frame &)> &response) {
   if (binding.channel->closed) { return OB_CONNECT_ERROR; }
-  EngineWrites writes(binding.ns, *binding.gateway);
+  EngineWrites &writes = *binding.writes;
   ReadScans scans(binding.ns); // Release scans before their borrowed transaction.
   Frame request(change_database ? 'U' : 'Q');
   request.number(binding.slot); request.number(binding.slot_generation);
@@ -266,6 +313,11 @@ int query(SessionBinding &binding, const ObString &sql, bool change_database,
     // real clock. Use the same absolute deadline when classifying its failure.
     return response_ret && ObTimeUtility::current_time() >= deadline ? OB_TIMEOUT : response_ret;
   }, deadline, &writes);
+  // The native SQL result has completed its cleanup before D. Keep the session
+  // transaction across requests, but release this statement's snapshot pin.
+  scans.scans.clear();
+  binding.gateway->reset_reserved_snapshot_version();
+  if (writes.check_finished()) { binding.channel->fail(); }
   if (ret == OB_TIMEOUT) { return ret; }
   return response_ret ? response_ret : ret;
 }
@@ -286,15 +338,17 @@ int worker_read_wire(Frame &frame) {
   if (namespace_proto_worker_read(frame.data.data(), frame.data.size(), &size)) { return OB_CONNECT_ERROR; }
   frame.data.resize(size); return size >= Frame::HEADER_SIZE ? OB_SUCCESS : OB_INVALID_ARGUMENT;
 }
-int worker_send(const Frame &frame) {
+int worker_send(const Frame &frame, bool cleanup) {
   if (!worker_request) { return worker_send_wire(frame); }
-  const int ret = worker_request->take_credit();
+  const int ret = worker_request->take_credit(cleanup);
   if (ret) { return ret; }
   Frame output = frame; output.tag(worker_request->tag);
   return worker_send_wire(std::move(output));
 }
 int worker_read(Frame &frame) {
-  return worker_request ? worker_request->take(frame) : OB_ERR_UNEXPECTED;
+  // Once an RPC is sent, consume its reply even after cancellation so cleanup
+  // cannot mistake an earlier operation's reply for its own.
+  return worker_request ? worker_request->take(frame, true) : OB_ERR_UNEXPECTED;
 }
 int fetch_catalog(char type, uint64_t id, const ObString &name, Frame &reply) {
   Frame request(type); request.number(id); request.string(name);

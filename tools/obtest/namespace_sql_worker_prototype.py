@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Throwaway SQL-only workers, query deadlines and autocommit DML.
+"""Throwaway SQL-only workers, native nested SQL, transactions and query deadlines.
 
 SEEKDB_FORK_PROTOTYPE_TEST_ROOT=/tmp python3 tools/obtest/namespace_sql_worker_prototype.py --binary build_release/src/observer/seekdb
 Add --case insert for V14 writes, rollback, isolation and crash recovery.
 Add --case dml for native drivers, automatic conflict retries, DML and recovery.
+Add --case nested for native foreign keys, nested session restoration and transactions.
 Linux integration probe. No claim of Windows/macOS or high-concurrency validation.
 """
 import argparse
@@ -94,14 +95,20 @@ class WorkerExperiment(LineageExperiment):
 
             for query in ("INSERT IGNORE INTO t1 VALUES(1,0)",
                           "INSERT INTO t1 VALUES(1,0) ON DUPLICATE KEY UPDATE v=0",
-                          "REPLACE INTO t1 VALUES(1,0)", "INSERT INTO t1 SELECT id+1000,v FROM t1"):
+                          "REPLACE INTO t1 VALUES(1,0)"):
                 try:
                     self.sql(query, first)
                 except pymysql.MySQLError as error:
                     self.record("unsupported_insert_rejected", sql=query, error=error.args)
                 else:
                     raise AssertionError(query)
+            self.sql("BEGIN", first)
+            self.sql("INSERT INTO t1 SELECT id+1000,v FROM t1 WHERE id<=2", first)
+            assert self.sql("SELECT id,v FROM t1 WHERE id>=1000 ORDER BY id", first) == ((1001,10),(1002,20))
             assert self.sql("SELECT id FROM t1 WHERE id>=1000", second) == ()
+            self.sql("ROLLBACK", first)
+            assert self.sql("SELECT id FROM t1 WHERE id>=1000", first) == ()
+            self.record("native_insert_select_in_transaction")
             assert self.sql("SELECT id,v FROM t1 ORDER BY id", sibling) == ((1,10),(2,20))
             assert self.sql("SELECT id,v FROM db1.t1 ORDER BY id") == ((1,10),(2,20))
             assert self.sql("SELECT id,v FROM " + self.table(self.root("a")[0], "db1.t1") + " ORDER BY id") == ((1,10),(2,20))
@@ -131,6 +138,132 @@ class WorkerExperiment(LineageExperiment):
                 if line.startswith("PROTOTYPE_V11_SESSION_" + kind + " "):
                     events.append({k: int(v) for k, v in re.findall(r"(\w+)=(\d+)", line)})
         return events
+
+    def run_nested(self):
+        # Native schemas and foreign keys are enrolled before the namespace fork.
+        # All statements under test then enter the worker through its public port.
+        self.sql("CREATE DATABASE db1")
+        self.sql("CREATE TABLE db1.parent(id INT PRIMARY KEY,v INT)")
+        self.sql("CREATE TABLE db1.child(id INT PRIMARY KEY,v INT,"
+                 "CONSTRAINT child_parent FOREIGN KEY(id) REFERENCES db1.parent(id) ON DELETE CASCADE)")
+        self.sql("CREATE TABLE db1.grandchild(id INT PRIMARY KEY,v INT,"
+                 "CONSTRAINT grandchild_child FOREIGN KEY(id) REFERENCES db1.child(id) ON DELETE CASCADE)")
+        self.sql("CREATE TABLE db1.leaf(id INT PRIMARY KEY,v INT,"
+                 "CONSTRAINT leaf_grandchild FOREIGN KEY(id) REFERENCES db1.grandchild(id) ON DELETE RESTRICT)")
+        self.sql("FORK DATABASE __empty__ TO a")
+        self.sql("FORK DATABASE a TO b")
+        self.b = self.root("b")[0]
+        first = second = None
+        try:
+            first, second = self.worker_connect(self.b), self.worker_connect(self.b)
+            self.sql("SET @outer_value=73", first)
+            self.sql("BEGIN", first)
+            assert first.server_status & 1, "BEGIN did not report IN_TRANS"
+            self.sql("INSERT INTO parent VALUES(10,100)", first)
+            self.sql("INSERT INTO child VALUES(10,@outer_value)", first)
+            self.sql("INSERT INTO grandchild VALUES(10,1000)", first)
+            self.sql("INSERT INTO leaf VALUES(10,10000)", first)
+            assert self.sql("SELECT v FROM child WHERE id=10", first) == ((73,),)
+            assert self.sql("SELECT * FROM parent", second) == ()
+            assert self.sql("SELECT @outer_value, DATABASE(), @@autocommit", first) == ((73,"db1",1),)
+            self.record("nested_foreign_key_reads_uncommitted_parent", session=first.thread_id())
+
+            self.sql("INSERT INTO parent VALUES(11,110)", first)
+            try:
+                self.sql("INSERT INTO child VALUES(11,110),(999,999)", first)
+            except pymysql.IntegrityError as error:
+                assert error.args[0] == 1452, error.args
+                self.record("nested_failure_rolls_back_only_statement", error=error.args)
+            else:
+                raise AssertionError("foreign key violation was accepted")
+            assert self.sql("SELECT id FROM parent ORDER BY id", first) == ((10,),(11,))
+            assert self.sql("SELECT id FROM child ORDER BY id", first) == ((10,),)
+            self.sql("INSERT INTO child VALUES(11,110)", first)
+            self.sql("SAVEPOINT keep_rows", first)
+            try:
+                self.sql("DELETE FROM parent WHERE id=10", first)
+            except pymysql.IntegrityError as error:
+                assert error.args[0] == 1451, error.args
+            else:
+                raise AssertionError("nested RESTRICT violation was accepted")
+            for table in ("parent","child","grandchild","leaf"):
+                assert self.sql("SELECT id FROM " + table + " WHERE id=10", first) == ((10,),)
+            assert self.sql("SELECT @outer_value, DATABASE(), @@autocommit", first) == ((73,"db1",1),)
+            self.record("inner_sql_failure_restores_outer_statement_and_session", session=first.thread_id())
+            self.sql("DELETE FROM leaf WHERE id=10", first)
+            self.sql("DELETE FROM parent WHERE id=10", first)
+            assert self.sql("SELECT * FROM grandchild", first) == ()
+            assert self.sql("SELECT id FROM child", first) == ((11,),)
+            self.sql("ROLLBACK TO SAVEPOINT keep_rows", first)
+            assert self.sql("SELECT id FROM grandchild", first) == ((10,),)
+            self.sql("RELEASE SAVEPOINT keep_rows", first)
+            worker_log = "".join(path.read_text(errors="replace") for path in
+                                 (self.base / "run").glob(f"namespace-worker-{self.b}-*/process.out"))
+            assert re.search(rf"PROTOTYPE_V17_INNER_SQL session={first.thread_id()} nested=2", worker_log), worker_log[-3000:]
+            self.record("multilevel_cascade_and_savepoint", depth=2, session=first.thread_id())
+            self.sql("ROLLBACK", first)
+            assert not first.server_status & 1
+            for table in ("parent","child","grandchild","leaf"):
+                assert self.sql("SELECT * FROM " + table, first) == ()
+                assert self.sql("SELECT * FROM " + table, second) == ()
+            self.record("whole_transaction_rollback")
+
+            self.sql("SET autocommit=0", first)
+            assert not first.server_status & 2
+            self.sql("INSERT INTO parent VALUES(20,200)", first)
+            self.sql("INSERT INTO child VALUES(20,200)", first)
+            self.sql("COMMIT", first)
+            assert self.sql("SELECT id FROM child", second) == ((20,),)
+            self.sql("SET autocommit=1", first)
+            assert first.server_status & 2
+            self.record("autocommit_and_commit_visibility")
+
+            self.sql("BEGIN", first)
+            self.sql("INSERT INTO parent VALUES(30,300)", first)
+            self.sql("SET ob_query_timeout=500000", first)
+            try:
+                self.sql("INSERT INTO child VALUES(30,300),(31,1+SLEEP(2))", first)
+            except pymysql.MySQLError as error:
+                assert error.args[0] == 4012, error.args
+            else:
+                raise AssertionError("expired statement succeeded")
+            self.sql("SET ob_query_timeout=10000000", first)
+            assert self.sql("SELECT id FROM parent WHERE id=30", first) == ((30,),)
+            assert self.sql("SELECT id FROM child WHERE id=30", first) == ()
+            self.sql("INSERT INTO child VALUES(30,300)", first)
+            self.sql("COMMIT", first)
+            assert self.sql("SELECT id FROM child WHERE id=30", second) == ((30,),)
+            self.record("cancel_preserves_prior_transaction_work")
+
+            self.sql("BEGIN", first)
+            self.sql("UPDATE parent SET v=201 WHERE id=20", first)
+            sid, offset = first.thread_id(), len(self.engine_log())
+            first.close(); first = None
+            self.wait_until(lambda: f"PROTOTYPE_V14_TX_RELEASED session={sid} rollback=1" in self.engine_log()[offset:],
+                            "disconnect rollback missing")
+            assert self.sql("SELECT v FROM parent WHERE id=20", second) == ((200,),)
+            self.sql("UPDATE parent SET v=202 WHERE id=20", second)
+            assert self.sql("SELECT v FROM parent WHERE id=20", second) == ((202,),)
+            self.record("disconnect_rolls_back_and_unlocks")
+
+            first = self.worker_connect(self.b)
+            self.sql("BEGIN", first)
+            self.sql("UPDATE parent SET v=999 WHERE id=20", first)
+            os.kill(self.worker_pid(self.b), signal.SIGKILL)
+            time.sleep(0.5)
+            second.close(); second = None
+            second = self.worker_connect(self.b)
+            assert self.sql("SELECT v FROM parent WHERE id=20", second) == ((202,),)
+            self.sql("UPDATE parent SET v=203 WHERE id=20", second)
+            assert self.sql("SELECT v FROM parent WHERE id=20", second) == ((203,),)
+            self.record("worker_death_rolls_back_idle_transaction")
+            assert self.sql("SELECT * FROM db1.parent") == ()
+            self.record("PASS", case="namespace_worker_nested", native_inner_sql=True,
+                        session_reused=True, storage_shared=True)
+        finally:
+            for connection in (first, second):
+                if connection is not None:
+                    connection.close()
 
     def run_dml(self):
         self.setup_lineage()
@@ -226,7 +359,7 @@ class WorkerExperiment(LineageExperiment):
                                  (self.base / "run").glob(f"namespace-worker-{self.b}-*/process.out"))
             assert re.search(r"PROTOTYPE_V16_NATIVE_EXECUTE .*attempt=[1-9]", worker_log), "no native retry observed"
             self.record("update_snapshot_conflict_retried", initial=20, final=22, client_retries=0)
-            for query in ("UPDATE IGNORE t1 SET v=0", "DELETE IGNORE FROM t1", "BEGIN", "SET autocommit=0"):
+            for query in ("UPDATE IGNORE t1 SET v=0", "DELETE IGNORE FROM t1"):
                 try:
                     self.sql(query, first)
                 except pymysql.MySQLError as error:
@@ -288,7 +421,7 @@ class WorkerExperiment(LineageExperiment):
             else:
                 raise AssertionError(database)
             assert self.sql("SELECT DATABASE(),@x", first) == (("db1", 17),)
-        for query in ("SET GLOBAL sql_mode=''", "SET autocommit=0", "BEGIN", "COMMIT",
+        for query in ("SET GLOBAL sql_mode=''",
                       "SET @x=(SELECT v FROM t1 WHERE id=1)", "SELECT missing_column FROM t1",
                       "SELECT 1; SET @x=999", "SET @x=999; SELECT @x"):
             try:
@@ -454,6 +587,7 @@ class WorkerExperiment(LineageExperiment):
         self.record("query_exceeds_old_30_second_ipc_limit", seconds=time.monotonic()-started, pid=pid)
 
         self.sql("SET ob_query_timeout=500000", first)
+        scan_log_offset = len(self.engine_log())
         for attempt in range(5):
             started = time.monotonic()
             with ThreadPoolExecutor(max_workers=1) as pool:
@@ -465,7 +599,11 @@ class WorkerExperiment(LineageExperiment):
             assert self.sql("SELECT @x,v FROM t1 WHERE id=1", first) == ((17,90),)
             assert self.worker_pid(self.b) == pid and Path(f"/proc/{pid}").exists()
             self.record("query_timeout_keeps_session_and_worker", attempt=attempt, seconds=elapsed, error=error)
-        assert f"PROTOTYPE_V13_SCANS_RELEASED ns={self.b} remaining=1" in self.engine_log()
+        # Cancellation now lets native close-scan RPCs finish before D, and the
+        # gateway clears any residual scans before dropping its snapshot pin.
+        remaining = re.findall(rf"PROTOTYPE_V13_SCANS_RELEASED ns={self.b} remaining=(\d+)",
+                               self.engine_log()[scan_log_offset:])
+        assert len(remaining) >= 5 and all(count == "0" for count in remaining), remaining
 
         queued = self.worker_connect(self.b)
         try:
@@ -649,15 +787,17 @@ class WorkerExperiment(LineageExperiment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
-    parser.add_argument("--case", choices=("full", "slow-timeout", "insert", "dml"), default="full")
+    parser.add_argument("--case", choices=("full", "slow-timeout", "insert", "dml", "nested"), default="full")
     args = parser.parse_args()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.environ["SEEKDB_NAMESPACE_SQL_WORKER_PROTOTYPE"] = "1"
-    case_name = {"insert": "insert_v14", "dml": "native_execution_v16"}.get(args.case, "timeout_v13")
+    case_name = {"insert": "insert_v14", "dml": "native_execution_v16", "nested": "nested_session_v17"}.get(args.case, "timeout_v13")
     experiment = WorkerExperiment(args.binary, case_name, prototype=6)
     try:
         experiment.start()
-        if args.case == "dml":
+        if args.case == "nested":
+            experiment.run_nested()
+        elif args.case == "dml":
             experiment.run_dml()
         elif args.case == "insert":
             experiment.run_inserts()

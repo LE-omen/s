@@ -10,7 +10,7 @@ using namespace common;
 using namespace share;
 using namespace share::schema;
 using namespace storage;
-int worker_send(const Frame &);
+int worker_send(const Frame &, bool cleanup = false);
 int worker_read(Frame &);
 struct EngineScan {
   ObArenaAllocator allocator{ObMemAttr("NsRemoteScan")};
@@ -22,11 +22,14 @@ struct EngineScan {
   ~EngineScan() { if (iter) { share::server_service<ObITabletScan>()->revert_scan_iter(iter); } }
   int open(uint64_t ns, Frame &request, transaction::ObTxDesc *tx) {
     const uint64_t table_id = request.number(), tablet_id = request.number();
-    const bool reverse = request.number() != 0, get = request.number() != 0;
+    param.scan_flag_.flag_ = request.number();
+    const bool get = request.number() != 0;
     param.limit_param_.limit_ = static_cast<int64_t>(request.number());
     param.limit_param_.offset_ = static_cast<int64_t>(request.number());
     const uint64_t count = request.number();
-    if (request.ret || count == 0 || count > 8 || ((table_id & ~(1ULL << 62)) >> 32) != ns) { return OB_NOT_SUPPORTED; }
+    fprintf(stderr, "PROTOTYPE_V17_SCAN_REQUEST ns=%llu table=%llu tablet=%llu columns=%llu\n",
+        (unsigned long long)ns, (unsigned long long)table_id, (unsigned long long)tablet_id, (unsigned long long)count);
+    if (request.ret || count > 8 || ((table_id & ~(1ULL << 62)) >> 32) != ns) { return OB_NOT_SUPPORTED; }
     int ret = OB_SUCCESS;
     ret = NamespaceForkKernelPrototype::schema_by_id(table_id, schema);
     if (ret) { return ret; }
@@ -47,7 +50,9 @@ struct EngineScan {
       ret = param.key_ranges_.push_back(range);
     }
     const uint64_t txid = request.number();
-    const bool read_latest = request.number() != 0;
+    const bool read_latest = param.scan_flag_.is_read_latest();
+    param.for_update_ = request.number() != 0;
+    param.is_for_foreign_check_ = request.number() != 0;
     if (!tx || static_cast<uint64_t>(data_plane::tx_desc_id(tx).get_id()) != txid) { return OB_INVALID_ARGUMENT; }
     request.read(param.snapshot_);
     param.tx_lock_timeout_ = request.number();
@@ -63,8 +68,6 @@ struct EngineScan {
     param.runtime_schema_version_ = schema->get_schema_version();
     param.timeout_ = THIS_WORKER.get_timeout_ts();
     param.is_get_ = get;
-    param.scan_flag_ = ObQueryFlag(reverse ? ObQueryFlag::Reverse : ObQueryFlag::Forward,
-        false, false, false, true, false, false, read_latest);
     param.allocator_ = &allocator; param.scan_allocator_ = &allocator;
     param.reserved_cell_count_ = count;
     ret = table.convert(*schema, param.column_ids_, sql::ObStoragePushdownFlag());
@@ -116,6 +119,7 @@ struct ReadScans {
       if (scans.size() >= 4) { ret = OB_NOT_SUPPORTED; }
       auto scan = std::make_unique<EngineScan>();
       if (!ret) { ret = scan->open(ns, request, tx); }
+      if (ret) { fprintf(stderr, "PROTOTYPE_V17_SCAN_FAILED ret=%d\n", ret); }
       reply.number(ret); reply.number(ret ? 0 : ++sequence);
       if (!ret) { scans.emplace(sequence, std::move(scan)); }
     } else {
@@ -126,13 +130,15 @@ struct ReadScans {
       else if (request.type() == 'F') { ret = it->second->fetch(reply); }
       else { reply.number(OB_NOT_SUPPORTED); }
     }
-    return ret;
+    // Storage errors belong in the reply. A sent RPC must receive that reply
+    // before cancellation cleanup can issue its next operation.
+    return reply.ret;
   }
 };
 class RemoteScanIterator final : public ObNewRowIterator {
 public:
   ObVTableScanParam &param;
-  uint64_t handle = 0, row_index = 0;
+  uint64_t handle = 0, row_index = 0, rows_left = 0;
   int64_t qualified = 0, returned = 0;
   bool end = false;
   std::vector<ObObj> cells;
@@ -141,12 +147,12 @@ public:
   ~RemoteScanIterator() override { reset(); }
   int open() {
     const sql::ObStoragePushdownFlag flags(param.pd_storage_flag_);
-    if (param.for_update_ || !param.op_ || !param.output_exprs_
+    if (!param.op_ || !param.output_exprs_
         || param.output_exprs_->count() != param.column_ids_.count()
         || (param.aggregate_exprs_ && !param.aggregate_exprs_->empty())
         || flags.is_filter_pushdown() || flags.is_aggregate_pushdown() || flags.is_group_by_pushdown()) { return OB_NOT_SUPPORTED; }
     Frame request('O'); request.number(param.index_id_); request.number(param.tablet_id_.id());
-    request.number(param.scan_flag_.is_reverse_scan()); request.number(param.is_get_);
+    request.number(param.scan_flag_.flag_); request.number(param.is_get_);
     // Legacy op_filters are SQL callbacks even when storage pushdown is off.
     // Apply both those predicates and the scan limit in this worker, in order.
     request.number(static_cast<uint64_t>(-1)); request.number(0);
@@ -160,7 +166,9 @@ public:
       request.append(range.start_key_.get_obj_ptr()[0]); request.append(range.end_key_.get_obj_ptr()[0]);
     }
     const auto &scan = static_cast<const ObTableScanParam &>(param);
-    request.number(scan.tx_id_.get_id()); request.number(param.scan_flag_.is_read_latest());
+    request.number(scan.tx_id_.get_id());
+    request.number(param.for_update_);
+    request.number(param.is_for_foreign_check_);
     request.append(scan.snapshot_); request.number(scan.tx_lock_timeout_); request.number(scan.tx_seq_base_);
     Frame reply; int ret = exchange(request, reply);
     if (!ret) { handle = reply.number(); if (!reply.consumed() || handle == 0) { ret = OB_INVALID_ARGUMENT; } }
@@ -169,13 +177,13 @@ public:
   int get_next_row(ObNewRow *&out) override {
     int ret = OB_SUCCESS;
     const size_t columns = param.column_ids_.count();
-    if (row_index == cells.size()) {
+    if (!rows_left) {
       if (end) { return OB_ITER_END; }
       Frame request('F'), reply; request.number(handle);
       if ((ret = exchange(request, reply))) { return ret; }
       end = reply.number() != 0; const uint64_t rows = reply.number();
       if (reply.ret || rows > 32 || (!rows && !end)) { return OB_INVALID_ARGUMENT; }
-      cells.resize(rows * columns); row_index = 0;
+      cells.resize(rows * columns); row_index = 0; rows_left = rows;
       for (auto &cell : cells) {
         reply.read(cell);
         if (!cell.is_null() && !ob_is_integer_type(cell.get_type())) { return OB_NOT_SUPPORTED; }
@@ -183,7 +191,8 @@ public:
       if (!reply.consumed()) { return OB_INVALID_ARGUMENT; }
       if (!rows) { return OB_ITER_END; }
     }
-    row.cells_ = cells.data() + row_index; row.count_ = columns; row_index += columns; out = &row;
+    row.cells_ = columns ? cells.data() + row_index : nullptr;
+    row.count_ = columns; row_index += columns; --rows_left; out = &row;
     return ret;
   }
   int get_next_row() override {
@@ -225,11 +234,11 @@ public:
   }
   void reset() override {
     if (handle) { Frame request('X'), reply; request.number(handle); exchange(request, reply); handle = 0; }
-    cells.clear(); row_index = 0; end = false; qualified = 0; returned = 0;
+    cells.clear(); row_index = 0; rows_left = 0; end = false; qualified = 0; returned = 0;
   }
 private:
   int exchange(const Frame &request, Frame &reply) {
-    int ret = worker_send(request);
+    int ret = worker_send(request, request.type() == 'X');
     if (!ret) { ret = worker_read(reply); }
     if (!ret && reply.type() != 's') { ret = OB_INVALID_ARGUMENT; }
     if (!ret) { ret = static_cast<int>(reply.number()); }

@@ -32,6 +32,7 @@
 #include "observer/mysql/obmp_base.h"
 #include "ob_inner_sql_read_context.h"
 #include "storage/tablelock/ob_lock_inner_connection_util.h"
+#include "observer/namespace_worker_protocol_prototype.h"
 
 namespace oceanbase
 {
@@ -70,6 +71,10 @@ public:
       MEMCPY(dup_sql->ptr(), sql_.ptr(), sql_.length());
       dup_sql->ptr()[sql_.length()] = '\0';
       res.get_session().store_query_string(*dup_sql);
+      if (namespace_worker_prototype::worker_namespace) {
+        fprintf(stderr, "PROTOTYPE_V17_INNER_SQL session=%u nested=%lld\n",
+            res.get_session().get_server_sid(), (long long)res.get_session().get_nested_count());
+      }
       ret = engine.stmt_query(*dup_sql, ctx, res);
     }
     return ret;

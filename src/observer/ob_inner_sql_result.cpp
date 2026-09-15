@@ -21,6 +21,7 @@
 
 #include "omt/ob_server_runtime.h"
 #include "observer/ob_inner_sql_connection.h"
+#include "observer/namespace_worker_protocol_prototype.h"
 
 namespace oceanbase
 {
@@ -79,12 +80,17 @@ int ObInnerSQLResult::init()
     .set_page_size(OB_MALLOC_MIDDLE_BLOCK_SIZE)
     .set_ablock_size(lib::INTACT_MIDDLE_AOBJECT_SIZE);
   if (OB_FAIL(CURRENT_CONTEXT->CREATE_CONTEXT(mem_context_, param))) {
-  } else if (OB_FAIL(::oceanbase::share::server_service<::oceanbase::omt::ObServerRuntimeController>()->lock_runtime(runtime_))) {
-    if (OB_IN_STOP_STATE == ret) {
-      ret = OB_SERVER_RUNTIME_NOT_READY;
+  } else if (namespace_worker_prototype::worker_namespace == 0) {
+    auto *controller = share::server_service<omt::ObServerRuntimeController>();
+    if (OB_ISNULL(controller)) { ret = OB_SERVER_RUNTIME_NOT_READY; }
+    else { ret = controller->lock_runtime(runtime_); }
+    if (OB_FAIL(ret)) {
+      if (OB_IN_STOP_STATE == ret) { ret = OB_SERVER_RUNTIME_NOT_READY; }
+      LOG_WARN("failed to lock server runtime", K(ret));
     }
-    LOG_WARN("failed to lock server runtime", K(ret));
   }
+  // The SQL worker owns one process-lifetime module graph. Its executors are
+  // joined before teardown, so an inner result needs no OMT runtime lease.
   if (OB_SUCC(ret)) {
     {
       // Inner SQL executes in the server runtime that owns this result.
