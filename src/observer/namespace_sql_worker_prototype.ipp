@@ -105,6 +105,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   bind_server_service<ObSqlMemoryManager>(mods_sql_memory_manager_);
   bind_server_service<ObOptStatMonitorManager>(mods_opt_stat_monitor_manager_);
   bind_server_service<ObDataAccessService>(mods_data_access_service_);
+  bind_server_service<common::ObILobReadService>(mods_lob_manager_);
   bind_server_service<share::ObISharedTimer>(mods_shared_timer_);
   bind_server_service<dtl::ObDfc>(mods_dfc_);
   bind_server_service<omt::ObPxPools>(mods_px_pools_);
