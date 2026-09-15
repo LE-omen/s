@@ -131,7 +131,7 @@ public:
     if (row.is_packed()) {
       const char *data = nullptr; int64_t size = 0;
       ret = row.get_packed_row_blob(data, size);
-      if (!ret && (size < 0 || size > MAX_FRAME || (size && !data))) { ret = OB_INVALID_ARGUMENT; }
+      if (!ret && (size < 0 || size > MAX_SQL_MESSAGE || (size && !data))) { ret = OB_INVALID_ARGUMENT; }
       if (!ret) { frame.string(ObString(static_cast<int32_t>(size), data)); }
     } else {
       ObArenaAllocator scratch(ObMemAttr("NsMySQLCell"));

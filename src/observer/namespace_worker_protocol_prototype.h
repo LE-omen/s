@@ -21,8 +21,8 @@ struct Frame {
   std::vector<char> data;
   int64_t pos = HEADER_SIZE;
   int ret = common::OB_SUCCESS;
-  size_t limit = MAX_FRAME;
-  explicit Frame(char type = '?', size_t max_size = MAX_FRAME) : data(HEADER_SIZE, 0), limit(max_size) { data[0] = type; }
+  size_t limit = MAX_SQL_MESSAGE;
+  explicit Frame(char type = '?', size_t max_size = MAX_SQL_MESSAGE) : data(HEADER_SIZE, 0), limit(max_size) { data[0] = type; }
   char type() const { return data.empty() ? '?' : data[0]; }
   RequestTag tag() {
     if (data.size() < HEADER_SIZE) { ret = common::OB_INVALID_ARGUMENT; return {}; }

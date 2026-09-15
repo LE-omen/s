@@ -12,6 +12,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_FRAME: usize = 256 * 1024;
 const MAX_SQL_MESSAGE: usize = 64 * 1024 * 1024;
+const FRAGMENT_HEADER: usize = 1 + 1 + 8 + 8;
+const FRAGMENT_CHUNK: usize = MAX_FRAME - FRAGMENT_HEADER;
 
 thread_local! {
     static RESPONSE_DEADLINE: Cell<i64> = const { Cell::new(0) };
@@ -34,7 +36,7 @@ pub(crate) fn response_expired() -> bool {
     })
 }
 
-fn read_frame(input: &mut impl Read) -> io::Result<Vec<u8>> {
+fn read_physical_frame(input: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut header = [0; 8];
     input.read_exact(&mut header)?;
     let len = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
@@ -46,33 +48,67 @@ fn read_frame(input: &mut impl Read) -> io::Result<Vec<u8>> {
     }
     let mut first = [0];
     input.read_exact(&mut first)?;
-    if len > MAX_FRAME && !matches!(first[0], b'Q' | b'I') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "oversized non-SQL frame",
-        ));
-    }
+    if len > MAX_FRAME { return Err(io::Error::new(io::ErrorKind::InvalidData, "oversized physical frame")); }
     let mut payload = vec![0; len];
     payload[0] = first[0];
     input.read_exact(&mut payload[1..])?;
     Ok(payload)
 }
 
+fn read_frame(input: &mut impl Read) -> io::Result<Vec<u8>> {
+    let first = read_physical_frame(input)?;
+    if first[0] != b'f' { return Ok(first); }
+    if first.len() < FRAGMENT_HEADER { return Err(io::Error::new(io::ErrorKind::InvalidData, "short fragment")); }
+    let original = first[1];
+    let total = u64::from_le_bytes(first[2..10].try_into().unwrap()) as usize;
+    let mut offset = u64::from_le_bytes(first[10..18].try_into().unwrap()) as usize;
+    if total == 0 || total > MAX_SQL_MESSAGE || offset != 0 || first.len() - FRAGMENT_HEADER > FRAGMENT_CHUNK {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid fragment"));
+    }
+    let mut result = Vec::with_capacity(total);
+    result.extend_from_slice(&first[FRAGMENT_HEADER..]);
+    offset = result.len();
+    while offset < total {
+        let part = read_physical_frame(input)?;
+        if part.len() < FRAGMENT_HEADER || part[0] != b'f' || part[1] != original
+            || u64::from_le_bytes(part[2..10].try_into().unwrap()) as usize != total
+            || u64::from_le_bytes(part[10..18].try_into().unwrap()) as usize != offset
+            || part.len() - FRAGMENT_HEADER > FRAGMENT_CHUNK {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid fragment sequence"));
+        }
+        result.extend_from_slice(&part[FRAGMENT_HEADER..]);
+        offset = result.len();
+    }
+    if offset != total { return Err(io::Error::new(io::ErrorKind::InvalidData, "incomplete fragment")); }
+    result[0] = original;
+    Ok(result)
+}
+
 fn write_frame(output: &mut impl Write, payload: &[u8]) -> io::Result<()> {
-    if payload.is_empty()
-        || payload.len() > MAX_SQL_MESSAGE
-        || (payload.len() > MAX_FRAME && !matches!(payload[0], b'Q' | b'I'))
-    {
+    if payload.is_empty() || payload.len() > MAX_SQL_MESSAGE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid worker frame size",
         ));
     }
-    let mut header = [0; 8];
-    header[..4].copy_from_slice(b"NS13");
-    header[4..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    output.write_all(&header)?;
-    output.write_all(payload)?;
+    if payload.len() <= MAX_FRAME {
+        let mut header = [0; 8]; header[..4].copy_from_slice(b"NS13");
+        header[4..].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        output.write_all(&header)?; output.write_all(payload)?;
+    } else {
+        let original = payload[0];
+        for (offset, chunk) in payload.chunks(FRAGMENT_CHUNK).enumerate() {
+            let offset = offset * FRAGMENT_CHUNK;
+            let mut fragment = Vec::with_capacity(FRAGMENT_HEADER + chunk.len());
+            fragment.push(b'f'); fragment.push(original);
+            fragment.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            fragment.extend_from_slice(&(offset as u64).to_le_bytes());
+            fragment.extend_from_slice(chunk);
+            let mut header = [0; 8]; header[..4].copy_from_slice(b"NS13");
+            header[4..].copy_from_slice(&(fragment.len() as u32).to_le_bytes());
+            output.write_all(&header)?; output.write_all(&fragment)?;
+        }
+    }
     output.flush()
 }
 
@@ -348,7 +384,7 @@ pub unsafe extern "C" fn namespace_proto_worker_read(
 
 #[no_mangle]
 pub unsafe extern "C" fn namespace_proto_worker_write(data: *const u8, len: usize) -> i32 {
-    if data.is_null() || len == 0 || len > MAX_FRAME {
+    if data.is_null() || len == 0 || len > MAX_SQL_MESSAGE {
         return -1;
     }
     match write_frame(
@@ -373,9 +409,9 @@ mod tests {
         write_frame(&mut wire, &sql).unwrap();
         assert_eq!(read_frame(&mut Cursor::new(&wire)).unwrap(), sql);
         sql[0] = b'r';
-        assert!(write_frame(&mut Vec::new(), &sql).is_err());
-        wire[8] = b'r';
-        assert!(read_frame(&mut Cursor::new(wire)).is_err());
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &sql).unwrap();
+        assert_eq!(read_frame(&mut Cursor::new(&wire)).unwrap(), sql);
         let mut header = b"NS13".to_vec();
         header.extend_from_slice(&((MAX_SQL_MESSAGE + 1) as u32).to_le_bytes());
         assert!(read_frame(&mut Cursor::new(header)).is_err());

@@ -29,7 +29,7 @@ inline void append_cell(Frame &frame, const obmysql::ObMySQLCellValue &cell) {
   frame.number(cell.year_); frame.number(cell.month_); frame.number(cell.day_);
   frame.number(cell.hour_); frame.number(cell.minute_); frame.number(cell.second_); frame.number(cell.is_negative_);
   const int64_t size = cell.get_bytes_len();
-  if (size < 0 || size > MAX_FRAME || (size && !cell.get_bytes())) { frame.ret = common::OB_INVALID_ARGUMENT; }
+  if (size < 0 || size > MAX_SQL_MESSAGE || (size && !cell.get_bytes())) { frame.ret = common::OB_INVALID_ARGUMENT; }
   else { frame.string(common::ObString(static_cast<int32_t>(size), cell.get_bytes())); }
 }
 inline void read_cell(Frame &frame, obmysql::ObMySQLCellValue &cell) {
