@@ -6,7 +6,7 @@ on:
   workflow_call:
   workflow_dispatch:
   pull_request_target:
-    branches: [master, develop]
+    branches: [master, develop, 'release/**']
     types: [labeled, synchronize]
   schedule:
     - cron: '30 9 * * *'
@@ -91,10 +91,12 @@ jobs:
                 core.setFailed(`Pull request #${pullRequest.number} is still a draft.`);
                 return;
               }
-              if (!['master', 'develop'].includes(pullRequest.base.ref)) {
+              const supportedBase = ['master', 'develop'].includes(pullRequest.base.ref)
+                || pullRequest.base.ref.startsWith('release/');
+              if (!supportedBase) {
                 core.setOutput('allowed', 'false');
                 core.setFailed(
-                  `Pull request #${pullRequest.number} targets ${pullRequest.base.ref}; SeekDB CI only supports master and develop.`,
+                  `Pull request #${pullRequest.number} targets ${pullRequest.base.ref}; SeekDB CI only supports master, develop, and release/* branches.`,
                 );
                 return;
               }
