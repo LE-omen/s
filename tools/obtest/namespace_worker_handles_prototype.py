@@ -87,7 +87,7 @@ def run(binary):
             query(first, "SET @x=17")
             baseline = query(first, "SELECT @x")[-1]
             query(first, "SET @x=999; SELECT @x", -4007)
-            handles = [open_session(101+i) for i in range(16)]
+            handles = [open_session(101+i) for i in range(64)]
             assert query(first, "SELECT @x")[-1] == baseline
             command(b"C" + numbers(*first))
             reused = open_session(200)
@@ -209,8 +209,8 @@ def run(binary):
             for handle in [reused] + handles:
                 command(b"C" + numbers(*handle))
             command(b"C" + numbers(*reused), -5066)
-            assert "active=0 slots=17" in (base / "process.out").read_text()
-            print(f"PASS: execution/credit/RPC/queued cancellation, stale cancellation, repeated reuse, concurrency, active=0; {base}")
+            assert "active=0 slots=65" in (base / "process.out").read_text()
+            print(f"PASS: 64-session execution/credit/RPC/queued cancellation, stale cancellation, repeated reuse, concurrency, active=0; {base}")
         finally:
             proc.stdin.close()
             try:

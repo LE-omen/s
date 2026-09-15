@@ -12,7 +12,9 @@
 #include "lib/thread/ob_thread_name.h"
 #include "lib/profile/ob_trace_id.h"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
-constexpr size_t MAX_REQUESTS = 32; // ceiling only; slots and frames grow on demand
+// Protocol ceiling only; vectors still grow on demand and no per-client slots
+// are preallocated. Keep one admission slot for control traffic.
+constexpr size_t MAX_REQUESTS = 256;
 struct PendingRequest;
 struct DirectInsertOwner;
 thread_local std::function<void(PendingRequest &, bool, bool)> worker_wait;
