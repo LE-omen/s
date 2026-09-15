@@ -2989,6 +2989,7 @@ OB_INLINE int ObSql::init_exec_context(const ObSqlCtx &context, ObExecContext &e
   } else {
     exec_ctx.set_my_session(context.session_info_);
     bind_exec_context_runtime_services(exec_ctx);
+    exec_ctx.set_lob_read_service(lob_read_service_);
     exec_ctx.set_sql_ctx(const_cast<ObSqlCtx*>(&context));
     if (OB_NOT_NULL(exec_ctx.get_physical_plan_ctx()) && OB_NOT_NULL(context.session_info_)) {
       int64_t query_timeout = 0;
