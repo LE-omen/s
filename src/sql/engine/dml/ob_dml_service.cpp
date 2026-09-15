@@ -1182,6 +1182,7 @@ int ObDMLService::prepare_dml_execution(
   concurrent_control::ObWriteFlag write_flag;
   write_spec.timeout_ = base_rtdef.timeout_ts_;
   write_spec.schema_version_ = base_ctdef.schema_version_;
+  write_spec.table_id_ = base_ctdef.index_tid_;
   write_spec.sql_mode_ = base_rtdef.sql_mode_;
   write_spec.tz_info_ = &base_ctdef.tz_info_;
   write_spec.branch_id_ = write_branch_id;

@@ -535,7 +535,19 @@ public:
       ObDmlExecution &execution) override {
     const auto view = table_plan.get_data_table();
     const auto &columns = table_plan.get_col_descs();
-    if (!write_context.is_valid() || columns.empty() || columns.count() > OB_MAX_COLUMN_NUMBER || !write_spec.tz_info_) { return OB_NOT_SUPPORTED; }
+    const uint64_t table_id = view.is_valid() ? view.get_table_id() : write_spec.table_id_;
+    ObSEArray<uint64_t, 16> effective_columns;
+    const ObTableSchema *fallback_schema = nullptr;
+    if (columns.empty() && table_id != 0) {
+      if (NamespaceForkKernelPrototype::schema_by_id(table_id, fallback_schema) == OB_SUCCESS && fallback_schema != nullptr) {
+        for (int64_t i = 0; i < fallback_schema->get_column_count(); ++i) {
+          const auto *column = fallback_schema->get_column_schema_by_idx(i);
+          if (column != nullptr && !column->is_hidden()) { effective_columns.push_back(column->get_column_id()); }
+        }
+      }
+    }
+    const int64_t column_count = columns.empty() ? effective_columns.count() : columns.count();
+    if (!write_context.is_valid() || column_count == 0 || column_count > OB_MAX_COLUMN_NUMBER || !write_spec.tz_info_) { return OB_NOT_SUPPORTED; }
     auto prepared = std::make_unique<RemoteExecution>();
     prepared->session = THIS_WORKER.get_session();
     StorageSessionScope scope(prepared->session);
@@ -544,16 +556,21 @@ public:
     prepared->tx = &tx;
     prepared->txid = tx.get_tx_id().get_id(); prepared->deadline = write_spec.timeout_;
     Frame request('W'), reply; request.number('P'); request.number(prepared->txid);
-    request.number(view.get_table_id()); request.number(write_spec.schema_version_);
+    request.number(table_id); request.number(write_spec.schema_version_);
     request.number(write_spec.timeout_); request.number(write_spec.sql_mode_); request.number(write_spec.branch_id_);
     request.number(write_spec.is_total_quantity_log_); request.number(write_spec.prelock_);
     request.number(write_spec.is_batch_stmt_); request.number(write_spec.is_main_table_in_fts_ddl_);
     request.number(write_spec.check_schema_version_); request.number(write_spec.access_vector_id_as_master_table_);
     request.append(*write_spec.tz_info_);
-    request.append(snapshot); request.append(write_flag); request.number(columns.count());
-    for (int64_t i = 0; i < columns.count(); ++i) {
-      request.number(columns.at(i).col_id_); prepared->types.push_back(columns.at(i).col_type_);
-      prepared->columns.push_back(columns.at(i).col_id_);
+    request.append(snapshot); request.append(write_flag); request.number(column_count);
+    for (int64_t i = 0; i < column_count; ++i) {
+      const uint64_t column_id = columns.empty() ? effective_columns.at(i) : columns.at(i).col_id_;
+      request.number(column_id); prepared->columns.push_back(column_id);
+      if (!columns.empty()) { prepared->types.push_back(columns.at(i).col_type_); }
+      else {
+        if (fallback_schema == nullptr || fallback_schema->get_column_schema(column_id) == nullptr) { return OB_INVALID_ARGUMENT; }
+        prepared->types.push_back(fallback_schema->get_column_schema(column_id)->get_meta_type());
+      }
     }
     execution.reset();
     int ret = write_rpc(request, reply);

@@ -35,6 +35,7 @@ struct ObDmlWriteSpec
   ObDmlWriteSpec()
     : timeout_(-1),
       schema_version_(-1),
+      table_id_(0),
       sql_mode_(0),
       tz_info_(nullptr),
       branch_id_(0),
@@ -48,6 +49,7 @@ struct ObDmlWriteSpec
 
   int64_t timeout_;
   int64_t schema_version_;
+  uint64_t table_id_;
   uint64_t sql_mode_;
   const common::ObTimeZoneInfo *tz_info_;
   int16_t branch_id_;
