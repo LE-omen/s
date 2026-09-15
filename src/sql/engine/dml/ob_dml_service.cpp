@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "sql/engine/dml/ob_dml_service.h"
 #include "sql/engine/expr/ob_datum_cast.h"
 #include "share/rc/ob_server_runtime.h"
@@ -1963,7 +1964,8 @@ int ObDMLService::check_nested_sql_legality(ObExecContext &ctx, common::ObTableI
 {
   int ret = OB_SUCCESS;
   ObSQLSessionInfo *session = ctx.get_my_session();
-  if (session->get_is_deserialized() && ctx.get_parent_ctx() != nullptr) {
+  if (session->get_is_deserialized() && ctx.get_parent_ctx() != nullptr
+      && observer::namespace_worker_prototype::worker_namespace <= 1) {
     // Nested SQL in a distributed worker lacks transaction scheduler control.
     pl::ObPLContext *pl_ctx = ctx.get_parent_ctx()->get_pl_stack_ctx();
     //this nested sql require transaction scheduler control
