@@ -8,7 +8,7 @@ int oceanbase::observer::ObMPBase::namespace_worker_request_prototype(
 {
   using namespace namespace_worker_prototype;
   ObSMConnection *conn = get_conn();
-  if (!conn || !conn->namespace_worker_binding_ || session.get_user_id() != OB_SYS_USER_ID) { return OB_NOT_SUPPORTED; }
+  if (!conn || !conn->namespace_worker_binding_) { return OB_NOT_SUPPORTED; }
   if (!session.is_valid() || session.is_zombie()) { return OB_ERR_SESSION_INTERRUPTED; }
   int64_t timeout = 0;
   int ret = session.get_query_timeout(timeout);

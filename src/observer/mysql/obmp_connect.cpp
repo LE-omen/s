@@ -233,9 +233,10 @@ int ObMPConnect::process()
     } else if (OB_FAIL(update_charset_sys_vars(*conn, *session))) {
     } else if (!namespace_worker_prototype::worker_process && namespace_worker_prototype::enabled()
                && (namespace_worker_prototype::bootstrap_enabled() || storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id()))
-               && session->get_user_id() != OB_SYS_USER_ID) {
-      ret = OB_NOT_SUPPORTED;
-    } else if (!namespace_worker_prototype::worker_process && namespace_worker_prototype::enabled()
+               ) {
+      ret = OB_SUCCESS;
+    }
+    if (OB_SUCC(ret) && !namespace_worker_prototype::worker_process && namespace_worker_prototype::enabled()
                && (namespace_worker_prototype::bootstrap_enabled() || storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id()))
                && OB_FAIL(namespace_worker_prototype::open_session(
                    storage::NamespaceForkKernelPrototype::is_encoded_id(session->get_database_id())

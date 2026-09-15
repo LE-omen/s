@@ -98,7 +98,7 @@ int finish_direct_request();
 int bind_direct_session(SessionBinding *binding, sql::ObSQLSessionInfo &session);
 int open_session(uint64_t namespace_id, sql::ObSQLSessionInfo &gateway, SessionBinding *&binding, bool internal = false);
 sql::ObSQLSessionInfo *bound_session(SessionBinding *binding);
-int append_session_state(sql::ObSQLSessionInfo &session, Frame &frame);
+int append_session_state(sql::ObSQLSessionInfo &session, Frame &frame, bool identity = false);
 int apply_session_state(sql::ObSQLSessionInfo &session, Frame &frame);
 void close_session(SessionBinding *binding);
 int query(SessionBinding &binding, const common::ObString &sql, bool change_database,

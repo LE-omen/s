@@ -179,7 +179,17 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     if (!ret && internal) { ret = ObInnerSQLConnection::init_session_info(&session, false, false); }
     if (!ret && state) {
       ret = apply_session_state(session, *state);
-      if (!ret && !state->consumed()) { ret = OB_INVALID_ARGUMENT; }
+      if (!ret && !state->consumed()) {
+        const uint64_t user_id = state->number();
+        const ObString user_name = state->string();
+        const ObString host_name = state->string();
+        if (!state->consumed() || state->ret || user_id > UINT64_MAX) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          ret = session.set_user(user_name, host_name, user_id);
+          if (!ret) { session.set_user_priv_set(OB_PRIV_SELECT | OB_PRIV_INSERT | OB_PRIV_UPDATE | OB_PRIV_DELETE); }
+        }
+      }
       const uint64_t db = session.get_database_id();
       const share::schema::ObDatabaseSchema *database = nullptr;
       if (!ret && !internal && db != OB_INVALID_ID) {

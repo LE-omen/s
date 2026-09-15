@@ -225,13 +225,20 @@ const share::ObSysVarClassType state_vars[] = {
   share::SYS_VAR_COLLATION_DATABASE, share::SYS_VAR_SQL_MODE, share::SYS_VAR_OB_QUERY_TIMEOUT,
   share::SYS_VAR_AUTOCOMMIT
 };
-int append_session_state(sql::ObSQLSessionInfo &session, Frame &frame) {
+int append_session_state(sql::ObSQLSessionInfo &session, Frame &frame, bool identity) {
   frame.number(session.get_database_id()); frame.string(session.get_database_name());
   int ret = OB_SUCCESS;
   for (auto id : state_vars) {
     ObObj value;
     if ((ret = session.get_sys_variable(id, value))) { return ret; }
     frame.number(value.is_uint64() ? value.get_uint64() : static_cast<uint64_t>(value.get_int()));
+  }
+  if (identity) {
+    // Authentication is performed before the worker session is opened. Carry
+    // the verified identity so permission checks in the worker use the same user.
+    frame.number(session.get_user_id());
+    frame.string(session.get_user_name());
+    frame.string(session.get_host_name());
   }
   return frame.ret;
 }
@@ -621,7 +628,7 @@ int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&b
   owned->writes = std::make_unique<EngineWrites>(ns, gateway);
   Frame request(internal ? 'a' : 'A'); request.number(gateway.get_server_sid());
   request.number(gateway.get_capability().capability_);
-  if ((ret = append_session_state(gateway, request))) { return ret; }
+  if ((ret = append_session_state(gateway, request, !internal))) { return ret; }
   bool opened = false;
   ret = exchange(*owned->channel, ns, request, nullptr, [&](Frame &reply) {
     if (reply.type() != 'a' || opened) { return OB_INVALID_ARGUMENT; }
