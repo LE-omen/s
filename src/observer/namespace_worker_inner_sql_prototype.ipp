@@ -32,7 +32,7 @@ struct InnerExchange {
       if (!ret && !frame.consumed()) { ret = OB_INVALID_ARGUMENT; }
       scans.scans.clear(); binding.gateway->reset_reserved_snapshot_version();
       if (binding.writes->check_finished()) { binding.channel->fail(); ret = OB_ERR_UNEXPECTED; }
-      if (!ret) { ret = pump.cancelled ? pump.cancelled : OB_ITER_END; }
+      if (!ret) { ret = pump.cancelled ? pump.cancelled.load() : OB_ITER_END; }
     }
     return ret;
   }

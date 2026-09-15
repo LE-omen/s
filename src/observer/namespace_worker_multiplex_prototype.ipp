@@ -24,6 +24,9 @@ struct PendingRequest {
   bool cancellable = false;
   std::atomic<int> cancelled{common::OB_SUCCESS};
   int error = common::OB_SUCCESS;
+  // Installed before sending the request. Storage frames are scheduled on the
+  // shared runtime, independently of the thread consuming SQL results.
+  std::function<int(Frame)> dispatch_storage;
   explicit PendingRequest(RequestTag t) : tag(t) {}
   int status() const {
     const int ret = cancelled.load();

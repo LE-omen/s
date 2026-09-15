@@ -4,6 +4,8 @@
 #include <map>
 #include <mutex>
 #include "rpc/ob_sql_request_operator.h"
+#include "share/rpc/ob_server_task.h"
+#include "rpc/frame/ob_req_processor.h"
 extern "C" {
 void *namespace_proto_spawn(uint64_t, uint64_t, uint32_t *);
 int namespace_proto_send(void *, const char *, size_t);
@@ -46,6 +48,65 @@ int admin_set_config(obcall::ObAdminSetConfigArg &arg) {
   if (!ret && !reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
   return ret;
 }
+bool is_storage_request(char type) {
+  return type == 'd' || type == 'b' || type == 't' || type == 'i' || type == 'j'
+      || type == 'O' || type == 'F' || type == 'X' || type == 'M' || type == 'T' || type == 'W';
+}
+// One admitted storage RPC at a time per SQL request. Native request workers
+// execute it; the pipe reader only submits the task. No per-session thread.
+struct StorageDispatch : std::enable_shared_from_this<StorageDispatch> {
+  std::mutex mutex;
+  std::mutex execution_mutex;
+  std::condition_variable changed;
+  size_t active = 0;
+  bool closed = false;
+  std::function<int(Frame &)> process;
+  void finish() {
+    std::lock_guard<std::mutex> guard(mutex);
+    --active; changed.notify_all();
+  }
+  void close() {
+    std::unique_lock<std::mutex> guard(mutex);
+    closed = true;
+    changed.wait(guard, [&] { return active == 0; });
+    process = {};
+  }
+  struct Task final : rpc::ObSrvTask {
+    struct Processor final : rpc::frame::ObReqProcessor {
+      std::shared_ptr<StorageDispatch> owner;
+      Frame input;
+      bool finished = false;
+      Processor(std::shared_ptr<StorageDispatch> context, Frame frame)
+          : owner(std::move(context)), input(std::move(frame)) {}
+      ~Processor() { if (!finished) { owner->finish(); } }
+      int run() override {
+        std::lock_guard<std::mutex> guard(owner->execution_mutex);
+        const int ret = owner->process(input);
+        owner->finish(); finished = true;
+        return ret;
+      }
+    } processor;
+    Task(std::shared_ptr<StorageDispatch> context, Frame frame)
+        : processor(std::move(context), std::move(frame)) {}
+    rpc::frame::ObReqProcessor &get_processor() override { return processor; }
+  };
+  int submit(Frame frame) {
+    {
+      std::lock_guard<std::mutex> guard(mutex);
+      if (closed) { return OB_CONNECT_ERROR; }
+      // The successor may arrive after reply publication but before run()
+      // returns. Keep one such slot and serialize access to native owners.
+      if (active >= 2) { return OB_SIZE_OVERFLOW; }
+      ++active;
+    }
+    auto *task = OB_NEW(Task, "NsStorageRPC", shared_from_this(), std::move(frame));
+    if (!task) { finish(); return OB_ALLOCATE_MEMORY_FAILED; }
+    int ret = share::check_server_runtime_ready();
+    if (!ret) { ret = static_cast<omt::ObServerRuntime *>(share::server_runtime())->recv_request(*task); }
+    if (ret) { ob_delete(task); }
+    return ret;
+  }
+};
 struct Channel {
   void *handle = nullptr;
   uint64_t generation = 0;
@@ -78,7 +139,11 @@ struct Channel {
     auto request = channel.routes.find(frame.tag());
     // The Rust pipe reader only dispatches. It never waits for a request's
     // consumer, executes storage work, or calls a client's packet sender.
-    if (request && request->post(std::move(frame))) { channel.fail(); }
+    if (request) {
+      const int ret = is_storage_request(frame.type()) && request->dispatch_storage
+          ? request->dispatch_storage(std::move(frame)) : request->post(std::move(frame));
+      if (ret) { channel.fail(); }
+    }
   }
 
 };
@@ -185,26 +250,34 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   if (!ret && table) { reply.append(*table); }
   return reply.ret;
 }
-// One request owns the pump. Internal read results can suspend between rows
-// without a background thread or materializing the whole result in the gateway.
+// SQL results retain credit-based streaming. Storage RPCs execute independently
+// through the native shared runtime, including while the result consumer sleeps.
 struct Exchange {
   Channel &channel;
   uint64_t ns;
   ReadScans *scans;
   EngineWrites *writes;
   bool query, finished = false;
-  int error = OB_SUCCESS, cancelled = OB_SUCCESS;
+  int error = OB_SUCCESS;
+  std::atomic<int> cancelled{OB_SUCCESS};
   std::shared_ptr<PendingRequest> pending;
+  std::shared_ptr<StorageDispatch> storage;
   Exchange(Channel &c, uint64_t n, Frame request, ReadScans *s, int64_t deadline, EngineWrites *w)
       : channel(c), ns(n), scans(s), writes(w),
         query(request.type() == 'Q' || request.type() == 'U' || request.type() == 'I') {
     pending = channel.routes.allocate(!query);
     if (!pending) { error = channel.closed ? OB_CONNECT_ERROR : OB_EAGAIN; return; }
     pending->deadline = query ? deadline : ObTimeUtility::current_time() + 30L * 1000000;
+    storage = std::make_shared<StorageDispatch>();
+    storage->process = [this](Frame &input) { return serve(input); };
+    pending->dispatch_storage = [context = storage](Frame input) { return context->submit(std::move(input)); };
     request.tag(pending->tag); error = channel.send(request);
   }
   ~Exchange() {
     if (pending) { channel.routes.release(pending->tag, true); }
+    // The borrowed native session and scan owners outlive this Exchange.
+    // On pipe failure, drain an already admitted task before releasing either.
+    if (storage) { storage->close(); }
   }
   int cancel(int reason) {
     if (cancelled || finished || !pending) { return error; }
@@ -215,6 +288,49 @@ struct Exchange {
         (unsigned long long)pending->tag.slot, (unsigned long long)pending->tag.generation, reason);
     return error = channel.send(message);
   }
+  int serve(Frame &input) {
+    const int64_t saved_timeout = THIS_WORKER.get_timeout_ts();
+    auto *saved_session = THIS_WORKER.get_session();
+    THIS_WORKER.set_timeout_ts(pending->deadline);
+    THIS_WORKER.set_session(writes ? &writes->session : nullptr);
+    Frame result;
+    const int state = cancelled.load();
+    int ret = OB_SUCCESS;
+    if (input.type() == 'd' || input.type() == 'b' || input.type() == 't' || input.type() == 'i' || input.type() == 'j') {
+      result = Frame('c');
+      if (state) { result.number(state); }
+      else { ret = catalog(ns, input, result); }
+    } else if (scans && (input.type() == 'O' || input.type() == 'F' || input.type() == 'X')) {
+      result = Frame('s');
+      if (state && input.type() != 'X') { result.number(state); }
+      else { ret = scans->process(input, result, writes ? writes->tx : nullptr, writes ? &writes->session : nullptr); }
+    } else if (input.type() == 'M') {
+      result = Frame('g');
+      const uint64_t operation = input.number();
+      obcall::ObAdminSetConfigArg arg;
+      input.read(arg);
+      int command_ret = state ? state : ns != 1 || operation != 1 ? OB_NOT_SUPPORTED
+          : !input.consumed() || !arg.is_valid() ? OB_INVALID_ARGUMENT : OB_SUCCESS;
+      if (!command_ret) { command_ret = ObServer::get_instance().get_local_management_service().admin_set_config(arg); }
+      result.number(command_ret);
+    } else if (writes && (input.type() == 'T' || input.type() == 'W')) {
+      result = Frame('w');
+      if (state && !cleanup_write(input)) { result.number(state); }
+      else { ret = writes->process(input, result); }
+    } else { ret = OB_INVALID_ARGUMENT; }
+    THIS_WORKER.set_session(saved_session);
+    THIS_WORKER.set_timeout_ts(saved_timeout);
+    result.tag(pending->tag);
+    // Send credit before the RPC reply; the SQL worker needs both before its
+    // next send. Dispatch serializes a successor arriving during publication.
+    if (!ret) {
+      Frame credit('K'); credit.tag(pending->tag);
+      ret = channel.send(credit);
+    }
+    if (!ret) { ret = channel.send(result); }
+    if (ret) { channel.fail(); }
+    return ret;
+  }
   int next(Frame &reply) {
     if (finished) { return OB_ITER_END; }
     while (!error) {
@@ -224,34 +340,7 @@ struct Exchange {
       if (reply.type() == 'D') { finished = true; return OB_SUCCESS; }
       Frame credit('K'); credit.tag(pending->tag);
       if ((error = channel.send(credit))) { break; }
-      Frame result;
-      if (reply.type() == 'd' || reply.type() == 'b' || reply.type() == 't' || reply.type() == 'i' || reply.type() == 'j') {
-        result = Frame('c');
-        if (cancelled) { result.number(cancelled); }
-        else { error = catalog(ns, reply, result); }
-      } else if (scans && (reply.type() == 'O' || reply.type() == 'F' || reply.type() == 'X')) {
-        result = Frame('s');
-        if (cancelled && reply.type() != 'X') { result.number(cancelled); }
-        else { error = scans->process(reply, result, writes ? writes->tx : nullptr, writes ? &writes->session : nullptr); }
-      } else if (reply.type() == 'M') {
-        result = Frame('g');
-        const uint64_t operation = reply.number();
-        obcall::ObAdminSetConfigArg arg;
-        reply.read(arg);
-        int command_ret = cancelled ? cancelled : ns != 1 || operation != 1 ? OB_NOT_SUPPORTED
-            : !reply.consumed() || !arg.is_valid() ? OB_INVALID_ARGUMENT : OB_SUCCESS;
-        if (!command_ret) { command_ret = ObServer::get_instance().get_local_management_service().admin_set_config(arg); }
-        result.number(command_ret);
-      } else if (writes && (reply.type() == 'T' || reply.type() == 'W')) {
-        result = Frame('w');
-        if (cancelled && !cleanup_write(reply)) { result.number(cancelled); }
-        else { error = writes->process(reply, result); }
-      } else {
-        if (!cancelled) { return OB_SUCCESS; }
-        continue;
-      }
-      result.tag(pending->tag);
-      if (!error) { error = channel.send(result); }
+      if (!cancelled) { return OB_SUCCESS; }
     }
     channel.fail(); return error;
   }
@@ -269,7 +358,7 @@ int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
       if (!ret && !reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
       if (ret) { channel.fail(); return ret; }
       const int transaction_ret = writes ? writes->check_finished() : OB_SUCCESS;
-      return pump.cancelled ? pump.cancelled : query_ret ? query_ret : transaction_ret;
+      return pump.cancelled ? pump.cancelled.load() : query_ret ? query_ret : transaction_ret;
     }
     if ((ret = response(reply))) {
       if (!pump.query || channel.closed || pump.cancel(ret)) { channel.fail(); return ret; }
