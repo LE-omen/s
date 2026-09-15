@@ -1230,7 +1230,11 @@ int ObSchemaGetterGuard::get_database_schema(
                                              const ObString &database_name,
                                              const ObDatabaseSchema *&database_schema)
 {
-  if (observer::namespace_worker_prototype::worker_namespace == 1) {
+  if (observer::namespace_worker_prototype::worker_namespace > 1
+      && database_name.prefix_match("__fork_ns_")) {
+    return storage::NamespaceForkKernelPrototype::database_in_namespace(
+        observer::namespace_worker_prototype::worker_namespace, database_name, database_schema);
+  } else if (observer::namespace_worker_prototype::worker_namespace == 1) {
     return worker_schema_prototype('d', 1, database_name, DATABASE_SCHEMA, database_schema);
   }
   if (storage::NamespaceForkKernelPrototype::is_namespace_address(database_name)) {
