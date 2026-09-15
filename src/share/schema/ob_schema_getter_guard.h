@@ -693,6 +693,10 @@ private:
                            const uint64_t schema_id,
                            const T *&schema);
   template<typename T>
+  int worker_schema_prototype(char operation, uint64_t id, const common::ObString &name,
+                              ObSchemaType type, const T *&schema);
+  void release_worker_schemas_prototype();
+  template<typename T>
   int put_to_local_cache(
       const ObSchemaType schema_type,
       const uint64_t schema_id,

@@ -9,15 +9,18 @@
 #include <string>
 #include <vector>
 namespace oceanbase { namespace sql { class ObSQLSessionInfo; } }
+namespace oceanbase { namespace obcall { struct ObAdminSetConfigArg; } }
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 constexpr size_t MAX_FRAME = 256 * 1024;
+constexpr size_t MAX_SQL_MESSAGE = 64 * 1024 * 1024;
 struct RequestTag { uint64_t slot = 0, generation = 0; };
 struct Frame {
   static constexpr int64_t HEADER_SIZE = 17; // type + request slot + generation
   std::vector<char> data;
   int64_t pos = HEADER_SIZE;
   int ret = common::OB_SUCCESS;
-  explicit Frame(char type = '?') : data(HEADER_SIZE, 0) { data[0] = type; }
+  size_t limit = MAX_FRAME;
+  explicit Frame(char type = '?', size_t max_size = MAX_FRAME) : data(HEADER_SIZE, 0), limit(max_size) { data[0] = type; }
   char type() const { return data.empty() ? '?' : data[0]; }
   RequestTag tag() {
     if (data.size() < HEADER_SIZE) { ret = common::OB_INVALID_ARGUMENT; return {}; }
@@ -31,7 +34,7 @@ struct Frame {
     }
   }
   void number(uint64_t n) {
-    if (data.size() + 8 > MAX_FRAME) { ret = common::OB_SIZE_OVERFLOW; return; }
+    if (data.size() + 8 > limit) { ret = common::OB_SIZE_OVERFLOW; return; }
     for (unsigned i = 0; i < 8; ++i) { data.push_back(static_cast<char>(n >> (8 * i))); }
   }
   uint64_t number() {
@@ -42,7 +45,7 @@ struct Frame {
   }
   void string(const common::ObString &s) {
     number(s.length());
-    if (ret || s.length() < 0 || data.size() + s.length() > MAX_FRAME) { ret = common::OB_SIZE_OVERFLOW; return; }
+    if (ret || s.length() < 0 || data.size() + s.length() > limit) { ret = common::OB_SIZE_OVERFLOW; return; }
     if (!s.empty()) { data.insert(data.end(), s.ptr(), s.ptr() + s.length()); }
   }
   common::ObString string() {
@@ -53,7 +56,7 @@ struct Frame {
   template<class T> void append(const T &value) {
     const int64_t n = value.get_serialize_size();
     int64_t p = data.size();
-    if (ret || n < 0 || data.size() + n > MAX_FRAME) { ret = common::OB_SIZE_OVERFLOW; return; }
+    if (ret || n < 0 || data.size() + n > limit) { ret = common::OB_SIZE_OVERFLOW; return; }
     data.resize(p + n); ret = value.serialize(data.data(), data.size(), p); data.resize(p);
   }
   template<class T> void read(T &value) {
@@ -64,9 +67,13 @@ struct Frame {
 using CatalogFetch = int (*)(char, uint64_t, const common::ObString &, Frame &);
 inline CatalogFetch worker_catalog_fetch = nullptr;
 inline uint64_t worker_namespace = 0;
+inline bool worker_process = false;
+bool bootstrap_enabled();
+int check_sql_execution_role();
+int admin_set_config(obcall::ObAdminSetConfigArg &arg);
 bool enabled();
 struct SessionBinding;
-int open_session(uint64_t namespace_id, sql::ObSQLSessionInfo &gateway, SessionBinding *&binding);
+int open_session(uint64_t namespace_id, sql::ObSQLSessionInfo &gateway, SessionBinding *&binding, bool internal = false);
 sql::ObSQLSessionInfo *bound_session(SessionBinding *binding);
 int append_session_state(sql::ObSQLSessionInfo &session, Frame &frame);
 int apply_session_state(sql::ObSQLSessionInfo &session, Frame &frame);

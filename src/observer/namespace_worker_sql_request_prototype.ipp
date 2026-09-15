@@ -8,6 +8,7 @@
 #include "sql/ob_query_retry_ctrl.h"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 int check_worker_sql(const ObString &text, sql::ObSQLSessionInfo &info, ObIAllocator &allocator) {
+  if (worker_namespace == 1) { return OB_SUCCESS; }
   using namespace sql;
   auto *session = &info;
   int ret = OB_SUCCESS;
@@ -46,6 +47,7 @@ int check_worker_sql(const ObString &text, sql::ObSQLSessionInfo &info, ObIAlloc
   return ret;
 }
 int check_worker_plan(ObMySQLResultSet &result) {
+  if (worker_namespace == 1) { return OB_SUCCESS; }
   using namespace sql;
   int ret = OB_SUCCESS;
   if (!ret && result.get_stmt_type() == stmt::T_SELECT) {

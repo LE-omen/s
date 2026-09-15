@@ -11,7 +11,7 @@ int namespace_proto_receive(void *, const char **, size_t *, uint64_t);
 void namespace_proto_stop(void *);
 void namespace_proto_interrupt(void *);
 int namespace_proto_dispatch(void *, void (*)(void *, const char *, size_t), void *);
-int namespace_proto_worker_read(char *, size_t, size_t *);
+int namespace_proto_worker_read(void (*)(void *, const char *, size_t), void *);
 int namespace_proto_worker_write(const char *, size_t);
 }
 #include "observer/namespace_worker_multiplex_prototype.ipp"
@@ -24,6 +24,27 @@ using storage::NamespaceForkKernelPrototype;
 bool enabled() {
   const char *value = std::getenv("SEEKDB_NAMESPACE_SQL_WORKER_PROTOTYPE");
   return value && !std::strcmp(value, "1") && NamespaceForkKernelPrototype::metadata_gc_mode();
+}
+bool bootstrap_enabled() {
+  const char *value = std::getenv("SEEKDB_NAMESPACE_SQL_WORKER_BOOTSTRAP_PROTOTYPE");
+  return value && !std::strcmp(value, "1");
+}
+int check_sql_execution_role() {
+  if (bootstrap_enabled() && !worker_process) {
+    fprintf(stderr, "PROTOTYPE_V18_SHARED_SQL_REJECT\n");
+    return OB_NOT_SUPPORTED;
+  }
+  return OB_SUCCESS;
+}
+int admin_set_config(obcall::ObAdminSetConfigArg &arg) {
+  if (worker_namespace != 1) { return OB_NOT_SUPPORTED; }
+  Frame request('M'), reply; request.number(1); request.append(arg);
+  int ret = worker_send(request);
+  if (!ret) { ret = worker_read(reply); }
+  if (!ret && reply.type() != 'g') { ret = OB_INVALID_ARGUMENT; }
+  if (!ret) { ret = static_cast<int>(reply.number()); }
+  if (!ret && !reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
+  return ret;
 }
 struct Channel {
   void *handle = nullptr;
@@ -69,6 +90,7 @@ struct SessionBinding {
   std::shared_ptr<Channel> channel;
   uint64_t ns = 0, slot = 0, slot_generation = 0;
   sql::ObSQLSessionInfo *gateway = nullptr;
+  bool internal = false;
   std::unique_ptr<EngineWrites> writes;
   SessionBinding *previous = nullptr, *next = nullptr;
   bool linked = false;
@@ -79,7 +101,7 @@ struct SessionBinding {
       if (next) { next->previous = previous; }
     }
     writes.reset();
-    if (gateway) { share::server_service<sql::ObSQLSessionMgr>()->revert_session(gateway); }
+    if (gateway && !internal) { share::server_service<sql::ObSQLSessionMgr>()->revert_session(gateway); }
   }
 };
 void Channel::fail() {
@@ -96,7 +118,7 @@ void Channel::fail() {
 }
 sql::ObSQLSessionInfo *bound_session(SessionBinding *binding) { return binding ? binding->gateway : nullptr; }
 int attach(uint64_t ns, std::shared_ptr<Child> &child) {
-  if (!enabled() || ns <= 1 || ns >= (1ULL << 30)) { return OB_NOT_SUPPORTED; }
+  if (!enabled() || ns == 0 || ns >= (1ULL << 30)) { return OB_NOT_SUPPORTED; }
   std::lock_guard<std::mutex> guard(children_mutex);
   auto it = children.find(ns);
   if (it == children.end()) {
@@ -140,7 +162,14 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   const ObDatabaseSchema *database = nullptr;
   const ObTableSchema *table = nullptr;
   const uint64_t owner = (id & ~(1ULL << 62)) >> 32;
-  if (!request.consumed() || (request.type() == 'd' ? id != ns : owner != ns)) {
+  ObSchemaGetterGuard guard;
+  if (ns == 1 && request.consumed() && (request.type() == 'd' || owns_table(ns, id))) {
+    ret = ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(guard);
+    if (!ret && request.type() == 'd') { ret = guard.get_database_schema(name, database); }
+    else if (!ret && request.type() == 'b') { ret = guard.get_database_schema(id, database); }
+    else if (!ret && (request.type() == 't' || request.type() == 'j')) { ret = guard.get_table_schema(id, name, request.type() == 'j', table); }
+    else if (!ret && request.type() == 'i') { ret = guard.get_table_schema(id, table); }
+  } else if (!request.consumed() || (request.type() == 'd' ? id != ns : owner != ns)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (request.type() == 'd') {
     ret = NamespaceForkKernelPrototype::database_in_namespace(ns, name, database);
@@ -156,68 +185,99 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   if (!ret && table) { reply.append(*table); }
   return reply.ret;
 }
-int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
-             const std::function<int(Frame &)> &response, int64_t deadline = INT64_MAX,
-             EngineWrites *writes = nullptr) {
-  const bool query = request.type() == 'Q' || request.type() == 'U';
-  auto pending = channel.routes.allocate(!query);
-  if (!pending) { return channel.closed ? OB_CONNECT_ERROR : OB_EAGAIN; }
-  pending->deadline = query ? deadline : ObTimeUtility::current_time() + 30L * 1000000;
-  struct Release { RequestRoutes &routes; RequestTag tag; ~Release() { routes.release(tag, true); } } release{channel.routes, pending->tag};
-  request.tag(pending->tag);
-  int ret = channel.send(request);
-  int cancelled = OB_SUCCESS;
-  auto cancel = [&](int reason) {
+// One request owns the pump. Internal read results can suspend between rows
+// without a background thread or materializing the whole result in the gateway.
+struct Exchange {
+  Channel &channel;
+  uint64_t ns;
+  ReadScans *scans;
+  EngineWrites *writes;
+  bool query, finished = false;
+  int error = OB_SUCCESS, cancelled = OB_SUCCESS;
+  std::shared_ptr<PendingRequest> pending;
+  Exchange(Channel &c, uint64_t n, Frame request, ReadScans *s, int64_t deadline, EngineWrites *w)
+      : channel(c), ns(n), scans(s), writes(w),
+        query(request.type() == 'Q' || request.type() == 'U' || request.type() == 'I') {
+    pending = channel.routes.allocate(!query);
+    if (!pending) { error = channel.closed ? OB_CONNECT_ERROR : OB_EAGAIN; return; }
+    pending->deadline = query ? deadline : ObTimeUtility::current_time() + 30L * 1000000;
+    request.tag(pending->tag); error = channel.send(request);
+  }
+  ~Exchange() {
+    if (pending) { channel.routes.release(pending->tag, true); }
+  }
+  int cancel(int reason) {
+    if (cancelled || finished || !pending) { return error; }
     cancelled = reason;
     Frame message('Z'); message.tag(pending->tag);
     message.number(reason == OB_TIMEOUT ? OB_TIMEOUT : OB_ERR_QUERY_INTERRUPTED);
     fprintf(stderr, "PROTOTYPE_V13_CANCEL request=%llu generation=%llu ret=%d\n",
         (unsigned long long)pending->tag.slot, (unsigned long long)pending->tag.generation, reason);
-    return channel.send(message);
-  };
-  while (!ret) {
-    Frame reply;
-    ret = pending->take(reply, cancelled != OB_SUCCESS);
-    if (ret == OB_TIMEOUT && query && !cancelled) { ret = cancel(ret); continue; }
-    if (ret) { break; }
+    return error = channel.send(message);
+  }
+  int next(Frame &reply) {
+    if (finished) { return OB_ITER_END; }
+    while (!error) {
+      error = pending->take(reply, cancelled != OB_SUCCESS);
+      if (error == OB_TIMEOUT && query && !cancelled) { cancel(error); continue; }
+      if (error) { break; }
+      if (reply.type() == 'D') { finished = true; return OB_SUCCESS; }
+      Frame credit('K'); credit.tag(pending->tag);
+      if ((error = channel.send(credit))) { break; }
+      Frame result;
+      if (reply.type() == 'd' || reply.type() == 'b' || reply.type() == 't' || reply.type() == 'i' || reply.type() == 'j') {
+        result = Frame('c');
+        if (cancelled) { result.number(cancelled); }
+        else { error = catalog(ns, reply, result); }
+      } else if (scans && (reply.type() == 'O' || reply.type() == 'F' || reply.type() == 'X')) {
+        result = Frame('s');
+        if (cancelled && reply.type() != 'X') { result.number(cancelled); }
+        else { error = scans->process(reply, result, writes ? writes->tx : nullptr, writes ? &writes->session : nullptr); }
+      } else if (reply.type() == 'M') {
+        result = Frame('g');
+        const uint64_t operation = reply.number();
+        obcall::ObAdminSetConfigArg arg;
+        reply.read(arg);
+        int command_ret = cancelled ? cancelled : ns != 1 || operation != 1 ? OB_NOT_SUPPORTED
+            : !reply.consumed() || !arg.is_valid() ? OB_INVALID_ARGUMENT : OB_SUCCESS;
+        if (!command_ret) { command_ret = ObServer::get_instance().get_local_management_service().admin_set_config(arg); }
+        result.number(command_ret);
+      } else if (writes && (reply.type() == 'T' || reply.type() == 'W')) {
+        result = Frame('w');
+        if (cancelled && !cleanup_write(reply)) { result.number(cancelled); }
+        else { error = writes->process(reply, result); }
+      } else {
+        if (!cancelled) { return OB_SUCCESS; }
+        continue;
+      }
+      result.tag(pending->tag);
+      if (!error) { error = channel.send(result); }
+    }
+    channel.fail(); return error;
+  }
+};
+int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
+             const std::function<int(Frame &)> &response, int64_t deadline = INT64_MAX,
+             EngineWrites *writes = nullptr) {
+  Exchange pump(channel, ns, std::move(request), scans, deadline, writes);
+  Frame reply;
+  int ret = OB_SUCCESS;
+  while (!(ret = pump.next(reply))) {
     if (reply.type() == 'D') {
       const int query_ret = static_cast<int>(reply.number());
-      // Terminal scalar state also covers SET that completed just as cancellation
-      // arrived. It must be applied even when result delivery was interrupted.
-      if (query && !reply.ret && !reply.consumed()) { ret = response(reply); }
-      if (ret) { break; }
-      if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; break; }
+      if (pump.query && !reply.ret && !reply.consumed()) { ret = response(reply); }
+      if (!ret && !reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
+      if (ret) { channel.fail(); return ret; }
       const int transaction_ret = writes ? writes->check_finished() : OB_SUCCESS;
-      return cancelled ? cancelled : query_ret ? query_ret : transaction_ret;
+      return pump.cancelled ? pump.cancelled : query_ret ? query_ret : transaction_ret;
     }
-    // One buffered reply per request, independent of every other request. Give
-    // its credit back after taking ownership, before doing SQL/storage work.
-    Frame credit('K'); credit.tag(pending->tag);
-    if ((ret = channel.send(credit))) { break; }
-    if (reply.type() == 'd' || reply.type() == 'b' || reply.type() == 't' || reply.type() == 'i') {
-      Frame result('c');
-      if (cancelled) { result.number(cancelled); }
-      else { ret = catalog(ns, reply, result); }
-      result.tag(pending->tag);
-      if (!ret) { ret = channel.send(result); }
-    } else if (scans && (reply.type() == 'O' || reply.type() == 'F' || reply.type() == 'X')) {
-      Frame result('s');
-      if (cancelled && reply.type() != 'X') { result.number(cancelled); }
-      else { ret = scans->process(reply, result, writes ? writes->tx : nullptr); }
-      result.tag(pending->tag);
-      if (!ret) { ret = channel.send(result); }
-    } else if (writes && (reply.type() == 'T' || reply.type() == 'W')) {
-      Frame result('w');
-      if (cancelled && !cleanup_write(reply)) { result.number(cancelled); }
-      else { ret = writes->process(reply, result); }
-      result.tag(pending->tag);
-      if (!ret) { ret = channel.send(result); }
-    } else if (!cancelled) { ret = response(reply); }
-    if (ret && query && !channel.closed) { ret = cancel(ret); }
+    if ((ret = response(reply))) {
+      if (!pump.query || channel.closed || pump.cancel(ret)) { channel.fail(); return ret; }
+    }
   }
-  channel.fail(); return ret;
+  return ret;
 }
-int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&binding) {
+int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&binding, bool internal) {
   binding = nullptr;
   std::unique_ptr<SessionBinding> owned(new SessionBinding());
   std::shared_ptr<Child> child;
@@ -248,10 +308,12 @@ int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&b
     }
     owned->channel = child->current;
   }
-  if ((ret = share::server_service<sql::ObSQLSessionMgr>()->get_session(gateway.get_server_sid(), owned->gateway))) { return ret; }
+  owned->internal = internal;
+  if (internal) { owned->gateway = &gateway; }
+  else if ((ret = share::server_service<sql::ObSQLSessionMgr>()->get_session(gateway.get_server_sid(), owned->gateway))) { return ret; }
   owned->ns = ns;
   owned->writes = std::make_unique<EngineWrites>(ns, gateway);
-  Frame request('A'); request.number(gateway.get_server_sid());
+  Frame request(internal ? 'a' : 'A'); request.number(gateway.get_server_sid());
   request.number(gateway.get_capability().capability_);
   if ((ret = append_session_state(gateway, request))) { return ret; }
   bool opened = false;
@@ -277,24 +339,25 @@ int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&b
 void close_session(SessionBinding *binding) {
   std::unique_ptr<SessionBinding> owned(binding);
   if (!owned) { return; }
-  {
+  auto close = [&] {
     // Disconnect runs independently of the query task. Wait before destroying
     // either its bound transaction or the binding borrowed by that task.
-    sql::ObSQLSessionInfo::LockGuard lock(owned->gateway->get_query_lock());
     if (!owned->channel->closed) {
       Frame request('C'); request.number(owned->slot); request.number(owned->slot_generation);
       const int ret = exchange(*owned->channel, owned->ns, request, nullptr, [](Frame &) { return OB_INVALID_ARGUMENT; });
       if (ret) { owned->channel->fail(); }
     }
     owned->writes.reset();
-  } // Drop the native session reference only after releasing its query lock.
+  };
+  if (owned->internal) { close(); } // The native inner connection already owns this lock.
+  else { sql::ObSQLSessionInfo::LockGuard lock(owned->gateway->get_query_lock()); close(); }
 }
 int query(SessionBinding &binding, const ObString &sql, bool change_database,
           const std::function<int(Frame &)> &response) {
   if (binding.channel->closed) { return OB_CONNECT_ERROR; }
   EngineWrites &writes = *binding.writes;
   ReadScans scans(binding.ns); // Release scans before their borrowed transaction.
-  Frame request(change_database ? 'U' : 'Q');
+  Frame request(change_database ? 'U' : 'Q', MAX_SQL_MESSAGE);
   request.number(binding.slot); request.number(binding.slot_generation);
   const int64_t deadline = THIS_WORKER.get_timeout_ts();
   request.number(deadline); request.string(sql);
@@ -334,9 +397,12 @@ int worker_send_wire(Frame frame) {
       ? OB_SUCCESS : OB_CONNECT_ERROR;
 }
 int worker_read_wire(Frame &frame) {
-  frame = Frame(); frame.data.resize(MAX_FRAME); size_t size = 0;
-  if (namespace_proto_worker_read(frame.data.data(), frame.data.size(), &size)) { return OB_CONNECT_ERROR; }
-  frame.data.resize(size); return size >= Frame::HEADER_SIZE ? OB_SUCCESS : OB_INVALID_ARGUMENT;
+  frame = Frame();
+  const int ret = namespace_proto_worker_read([](void *context, const char *data, size_t size) {
+    auto &frame = *static_cast<Frame *>(context);
+    frame.data.assign(data, data + size);
+  }, &frame);
+  return ret ? OB_CONNECT_ERROR : frame.data.size() >= Frame::HEADER_SIZE ? OB_SUCCESS : OB_INVALID_ARGUMENT;
 }
 int worker_send(const Frame &frame, bool cleanup) {
   if (!worker_request) { return worker_send_wire(frame); }

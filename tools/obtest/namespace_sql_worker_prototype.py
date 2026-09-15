@@ -93,9 +93,15 @@ class WorkerExperiment(LineageExperiment):
             assert self.sql("SELECT id,v FROM t1 WHERE id BETWEEN 310 AND 311 ORDER BY id", first) == ((310,3100),(311,3110))
             self.record("concurrent_insert_sessions", shared_worker=pid, transactions=2)
 
-            for query in ("INSERT IGNORE INTO t1 VALUES(1,0)",
-                          "INSERT INTO t1 VALUES(1,0) ON DUPLICATE KEY UPDATE v=0",
-                          "REPLACE INTO t1 VALUES(1,0)"):
+            self.sql("BEGIN", first)
+            with first.cursor() as cursor:
+                assert cursor.execute("INSERT INTO t1 VALUES(1,11) ON DUPLICATE KEY UPDATE v=VALUES(v)") == 2
+            assert self.sql("SELECT v FROM t1 WHERE id=1", first) == ((11,),)
+            assert self.sql("SELECT v FROM t1 WHERE id=1", second) == ((10,),)
+            self.sql("ROLLBACK", first)
+            assert self.sql("SELECT v FROM t1 WHERE id=1", first) == ((10,),)
+            self.record("native_upsert_transaction_rolled_back")
+            for query in ("INSERT IGNORE INTO t1 VALUES(1,0)", "REPLACE INTO t1 VALUES(1,0)"):
                 try:
                     self.sql(query, first)
                 except pymysql.MySQLError as error:

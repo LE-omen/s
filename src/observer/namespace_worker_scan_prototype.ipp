@@ -12,15 +12,42 @@ using namespace share::schema;
 using namespace storage;
 int worker_send(const Frame &, bool cleanup = false);
 int worker_read(Frame &);
+bool owns_table(uint64_t ns, uint64_t id) {
+  return ns == 1 ? !NamespaceForkKernelPrototype::is_encoded_id(id)
+      : ((id & ~(1ULL << 62)) >> 32) == ns;
+}
+int storage_schema(uint64_t ns, uint64_t id, ObSchemaGetterGuard &guard, const ObTableSchema *&schema) {
+  if (!owns_table(ns, id)) { return OB_INVALID_ARGUMENT; }
+  if (ns != 1) { return NamespaceForkKernelPrototype::schema_by_id(id, schema); }
+  int ret = ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(guard);
+  return ret ? ret : guard.get_table_schema(id, schema);
+}
 struct EngineScan {
+  struct VirtualContext {
+    sql::ObExecContext execution;
+    sql::ObEvalCtx evaluation;
+    sql::ObPushdownExprSpec spec;
+    sql::ObPushdownOperator op;
+    VirtualContext(ObIAllocator &allocator, sql::ObSQLSessionInfo &session)
+        : execution(allocator), evaluation(execution), spec(allocator), op(evaluation, spec) {
+      execution.set_my_session(&session);
+    }
+  };
   ObArenaAllocator allocator{ObMemAttr("NsRemoteScan")};
+  ObSchemaGetterGuard guard;
   ObTableParam table{allocator};
   ObTableScanParam param;
   std::vector<ObObj> keys;
   ObNewRowIterator *iter = nullptr;
   const ObTableSchema *schema = nullptr;
-  ~EngineScan() { if (iter) { share::server_service<ObITabletScan>()->revert_scan_iter(iter); } }
-  int open(uint64_t ns, Frame &request, transaction::ObTxDesc *tx) {
+  std::unique_ptr<VirtualContext> virtual_context;
+  ~EngineScan() {
+    if (iter) {
+      if (virtual_context) { share::server_service<ObIVirtualTableScan>()->revert_scan_iter(iter); }
+      else { share::server_service<ObITabletScan>()->revert_scan_iter(iter); }
+    }
+  }
+  int open(uint64_t ns, Frame &request, transaction::ObTxDesc *tx, sql::ObSQLSessionInfo *session) {
     const uint64_t table_id = request.number(), tablet_id = request.number();
     param.scan_flag_.flag_ = request.number();
     const bool get = request.number() != 0;
@@ -29,11 +56,11 @@ struct EngineScan {
     const uint64_t count = request.number();
     fprintf(stderr, "PROTOTYPE_V17_SCAN_REQUEST ns=%llu table=%llu tablet=%llu columns=%llu\n",
         (unsigned long long)ns, (unsigned long long)table_id, (unsigned long long)tablet_id, (unsigned long long)count);
-    if (request.ret || count > 8 || ((table_id & ~(1ULL << 62)) >> 32) != ns) { return OB_NOT_SUPPORTED; }
+    if (request.ret || count > OB_MAX_COLUMN_NUMBER || !owns_table(ns, table_id)) { return OB_NOT_SUPPORTED; }
     int ret = OB_SUCCESS;
-    ret = NamespaceForkKernelPrototype::schema_by_id(table_id, schema);
+    ret = storage_schema(ns, table_id, guard, schema);
     if (ret) { return ret; }
-    if (!schema || schema->get_tablet_id().id() != tablet_id) { return OB_INVALID_ARGUMENT; }
+    if (!schema || (!is_virtual_table(table_id) && schema->get_tablet_id().id() != tablet_id)) { return OB_INVALID_ARGUMENT; }
     for (uint64_t i = 0; !ret && i < count; ++i) {
       const uint64_t column = request.number();
       if (!schema->get_column_schema(column)) { ret = OB_NOT_SUPPORTED; }
@@ -41,13 +68,33 @@ struct EngineScan {
     }
     const uint64_t ranges = request.number();
     if (ret || request.ret || ranges > 256) { return ret ? ret : OB_NOT_SUPPORTED; }
-    keys.resize(ranges * 2);
+    const uint64_t width = request.number();
+    if (request.ret || width == 0 || width > OB_MAX_ROWKEY_COLUMN_NUMBER) { return OB_INVALID_ARGUMENT; }
+    keys.resize(ranges * 2 * width);
     for (uint64_t i = 0; !ret && i < ranges; ++i) {
       ObNewRange range; range.table_id_ = table_id;
       range.border_flag_.set_data(request.number());
-      request.read(keys[i * 2]); request.read(keys[i * 2 + 1]);
-      range.start_key_.assign(&keys[i * 2], 1); range.end_key_.assign(&keys[i * 2 + 1], 1);
-      ret = param.key_ranges_.push_back(range);
+      for (uint64_t j = 0; !ret && j < width * 2; ++j) {
+        ObObj value; request.read(value);
+        ret = request.ret ? request.ret : ob_write_obj(allocator, value, keys[i * width * 2 + j]);
+      }
+      range.start_key_.assign(&keys[i * width * 2], width);
+      range.end_key_.assign(&keys[i * width * 2 + width], width);
+      if (!ret) { ret = param.key_ranges_.push_back(range); }
+    }
+    if (is_virtual_table(table_id)) {
+      param.sql_mode_ = request.number();
+      if (ret || !request.consumed() || !session || ns != 1) { return ret ? ret : OB_INVALID_ARGUMENT; }
+      virtual_context = std::make_unique<VirtualContext>(allocator, *session);
+      param.index_id_ = table_id; param.tablet_id_ = ObTabletID(tablet_id);
+      param.schema_version_ = schema->get_schema_version();
+      param.runtime_schema_version_ = schema->get_schema_version();
+      param.timeout_ = THIS_WORKER.get_timeout_ts();
+      param.scan_allocator_ = &allocator; param.reserved_cell_count_ = count;
+      param.op_ = &virtual_context->op;
+      ret = share::server_service<ObIVirtualTableScan>()->table_scan(param, iter);
+      fprintf(stderr, "PROTOTYPE_V18_VIRTUAL_SCAN table=%llu ret=%d\n", (unsigned long long)table_id, ret);
+      return ret;
     }
     const uint64_t txid = request.number();
     const bool read_latest = param.scan_flag_.is_read_latest();
@@ -82,6 +129,16 @@ struct EngineScan {
     Frame rows('s'); rows.number(0); rows.number(0); rows.number(0);
     uint64_t count = 0; bool end = false; int ret = OB_SUCCESS;
     for (; count < 32; ++count) {
+      if (virtual_context) {
+        ObNewRow *row = nullptr;
+        ret = iter->get_next_row(row);
+        if (ret == OB_ITER_END) { ret = OB_SUCCESS; end = true; break; }
+        if (ret) { break; }
+        if (!row || row->get_count() != param.column_ids_.count()) { ret = OB_ERR_UNEXPECTED; break; }
+        for (int64_t i = 0; i < row->get_count(); ++i) { rows.append(row->get_cell(i)); }
+        if ((ret = rows.ret)) { break; }
+        continue;
+      }
       blocksstable::ObDatumRow *row = nullptr;
       ret = static_cast<ObTableScanIterator *>(iter)->get_next_row(row);
       if (ret == OB_ITER_END) { ret = OB_SUCCESS; end = true; break; }
@@ -112,13 +169,13 @@ struct ReadScans {
     fprintf(stderr, "PROTOTYPE_V13_SCANS_RELEASED ns=%llu remaining=%zu\n",
         (unsigned long long)ns, remaining);
   }
-  int process(Frame &request, Frame &reply, transaction::ObTxDesc *tx = nullptr) {
+  int process(Frame &request, Frame &reply, transaction::ObTxDesc *tx = nullptr, sql::ObSQLSessionInfo *session = nullptr) {
     int ret = OB_SUCCESS;
     reply = Frame('s');
     if (request.type() == 'O') {
       if (scans.size() >= 4) { ret = OB_NOT_SUPPORTED; }
       auto scan = std::make_unique<EngineScan>();
-      if (!ret) { ret = scan->open(ns, request, tx); }
+      if (!ret) { ret = scan->open(ns, request, tx, session); }
       if (ret) { fprintf(stderr, "PROTOTYPE_V17_SCAN_FAILED ret=%d\n", ret); }
       reply.number(ret); reply.number(ret ? 0 : ++sequence);
       if (!ret) { scans.emplace(sequence, std::move(scan)); }
@@ -142,6 +199,7 @@ public:
   int64_t qualified = 0, returned = 0;
   bool end = false;
   std::vector<ObObj> cells;
+  Frame batch; // Own variable-length cell bytes until the next batch.
   ObNewRow row;
   explicit RemoteScanIterator(ObVTableScanParam &p) : param(p) {}
   ~RemoteScanIterator() override { reset(); }
@@ -159,17 +217,23 @@ public:
     request.number(param.column_ids_.count());
     for (int64_t i = 0; i < param.column_ids_.count(); ++i) { request.number(param.column_ids_.at(i)); }
     request.number(param.key_ranges_.count());
+    const int64_t width = param.key_ranges_.empty() ? 1 : param.key_ranges_.at(0).start_key_.get_obj_cnt();
+    request.number(width);
     for (int64_t i = 0; i < param.key_ranges_.count(); ++i) {
       const ObNewRange &range = param.key_ranges_.at(i);
-      if (range.start_key_.get_obj_cnt() != 1 || range.end_key_.get_obj_cnt() != 1) { return OB_NOT_SUPPORTED; }
+      if (range.start_key_.get_obj_cnt() != width || range.end_key_.get_obj_cnt() != width) { return OB_NOT_SUPPORTED; }
       request.number(range.border_flag_.get_data());
-      request.append(range.start_key_.get_obj_ptr()[0]); request.append(range.end_key_.get_obj_ptr()[0]);
+      for (int64_t j = 0; j < width; ++j) { request.append(range.start_key_.get_obj_ptr()[j]); }
+      for (int64_t j = 0; j < width; ++j) { request.append(range.end_key_.get_obj_ptr()[j]); }
     }
-    const auto &scan = static_cast<const ObTableScanParam &>(param);
-    request.number(scan.tx_id_.get_id());
-    request.number(param.for_update_);
-    request.number(param.is_for_foreign_check_);
-    request.append(scan.snapshot_); request.number(scan.tx_lock_timeout_); request.number(scan.tx_seq_base_);
+    if (is_virtual_table(param.index_id_)) { request.number(param.sql_mode_); }
+    else {
+      const auto &scan = static_cast<const ObTableScanParam &>(param);
+      request.number(scan.tx_id_.get_id());
+      request.number(param.for_update_);
+      request.number(param.is_for_foreign_check_);
+      request.append(scan.snapshot_); request.number(scan.tx_lock_timeout_); request.number(scan.tx_seq_base_);
+    }
     Frame reply; int ret = exchange(request, reply);
     if (!ret) { handle = reply.number(); if (!reply.consumed() || handle == 0) { ret = OB_INVALID_ARGUMENT; } }
     return ret;
@@ -179,14 +243,13 @@ public:
     const size_t columns = param.column_ids_.count();
     if (!rows_left) {
       if (end) { return OB_ITER_END; }
-      Frame request('F'), reply; request.number(handle);
+      Frame request('F'); Frame &reply = batch; request.number(handle);
       if ((ret = exchange(request, reply))) { return ret; }
       end = reply.number() != 0; const uint64_t rows = reply.number();
       if (reply.ret || rows > 32 || (!rows && !end)) { return OB_INVALID_ARGUMENT; }
       cells.resize(rows * columns); row_index = 0; rows_left = rows;
       for (auto &cell : cells) {
         reply.read(cell);
-        if (!cell.is_null() && !ob_is_integer_type(cell.get_type())) { return OB_NOT_SUPPORTED; }
       }
       if (!reply.consumed()) { return OB_INVALID_ARGUMENT; }
       if (!rows) { return OB_ITER_END; }
@@ -196,17 +259,22 @@ public:
     return ret;
   }
   int get_next_row() override {
+    return next_row(false);
+  }
+  int next_row(bool stop_before_fetch) {
     if (param.limit_param_.limit_ >= 0 && returned >= param.limit_param_.limit_) { return OB_ITER_END; }
     int ret = OB_SUCCESS;
     for (;;) {
       if ((ret = THIS_WORKER.check_status())) { return ret; }
+      // A vector batch must keep all returned string pointers in one wire frame.
+      if (stop_before_fetch && !rows_left) { return OB_ITER_END; }
       ObNewRow *row = nullptr;
       if ((ret = get_next_row(row))) { return ret; }
       auto &ctx = param.op_->get_eval_ctx();
       param.op_->clear_datum_eval_flag();
       for (int64_t i = 0; !ret && i < row->count_; ++i) {
         sql::ObExpr *expr = param.output_exprs_->at(i);
-        ret = expr->locate_expr_datum(ctx).from_obj(row->cells_[i]);
+        ret = expr->locate_datum_for_write(ctx).from_obj(row->cells_[i], expr->obj_datum_map_);
         expr->set_evaluated_projected(ctx);
         expr->set_evaluated_flag(ctx);
       }
@@ -226,7 +294,7 @@ public:
     int ret = OB_SUCCESS;
     while (count < limit) {
       batch.set_batch_idx(count);
-      ret = get_next_row();
+      ret = next_row(count != 0);
       if (ret) { break; }
       ++count;
     }
@@ -245,7 +313,7 @@ private:
     return ret ? ret : reply.ret;
   }
 };
-class RemoteTabletScan final : public ObITabletScan {
+class RemoteTabletScan final : public ObIVirtualTableScan {
 public:
   int table_scan(ObVTableScanParam &param, ObNewRowIterator *&iter) override {
     if (iter) { return OB_INVALID_ARGUMENT; }
@@ -253,6 +321,11 @@ public:
     int ret = scan->open(); if (!ret) { iter = scan.release(); } return ret;
   }
   int revert_scan_iter(ObNewRowIterator *iter) override { delete iter; return OB_SUCCESS; }
+  int reuse_scan_iter(bool, ObNewRowIterator *iter) override {
+    auto *scan = static_cast<RemoteScanIterator *>(iter);
+    if (!scan) { return OB_INVALID_ARGUMENT; }
+    scan->reset(); return OB_SUCCESS;
+  }
   int table_rescan(ObVTableScanParam &, ObNewRowIterator *iter) override {
     auto *scan = static_cast<RemoteScanIterator *>(iter);
     if (!scan) { return OB_INVALID_ARGUMENT; }

@@ -11,6 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_FRAME: usize = 256 * 1024;
+const MAX_SQL_MESSAGE: usize = 64 * 1024 * 1024;
 
 thread_local! {
     static RESPONSE_DEADLINE: Cell<i64> = const { Cell::new(0) };
@@ -37,19 +38,31 @@ fn read_frame(input: &mut impl Read) -> io::Result<Vec<u8>> {
     let mut header = [0; 8];
     input.read_exact(&mut header)?;
     let len = u32::from_le_bytes(header[4..].try_into().unwrap()) as usize;
-    if header[..4] != *b"NS13" || len == 0 || len > MAX_FRAME {
+    if header[..4] != *b"NS13" || len == 0 || len > MAX_SQL_MESSAGE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "invalid worker frame",
         ));
     }
+    let mut first = [0];
+    input.read_exact(&mut first)?;
+    if len > MAX_FRAME && !matches!(first[0], b'Q' | b'I') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "oversized non-SQL frame",
+        ));
+    }
     let mut payload = vec![0; len];
-    input.read_exact(&mut payload)?;
+    payload[0] = first[0];
+    input.read_exact(&mut payload[1..])?;
     Ok(payload)
 }
 
 fn write_frame(output: &mut impl Write, payload: &[u8]) -> io::Result<()> {
-    if payload.is_empty() || payload.len() > MAX_FRAME {
+    if payload.is_empty()
+        || payload.len() > MAX_SQL_MESSAGE
+        || (payload.len() > MAX_FRAME && !matches!(payload[0], b'Q' | b'I'))
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid worker frame size",
@@ -226,7 +239,7 @@ pub unsafe extern "C" fn namespace_proto_send(
     data: *const u8,
     len: usize,
 ) -> i32 {
-    if worker.is_null() || data.is_null() || len == 0 || len > MAX_FRAME {
+    if worker.is_null() || data.is_null() || len == 0 || len > MAX_SQL_MESSAGE {
         return -1;
     }
     let worker = &*worker.cast::<Worker>();
@@ -318,17 +331,15 @@ pub unsafe extern "C" fn namespace_proto_stop(worker: *mut c_void) {
 
 #[no_mangle]
 pub unsafe extern "C" fn namespace_proto_worker_read(
-    data: *mut u8,
-    capacity: usize,
-    len: *mut usize,
+    callback: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize)>,
+    context: *mut c_void,
 ) -> i32 {
-    if data.is_null() || len.is_null() {
+    let Some(callback) = callback else {
         return -1;
-    }
+    };
     match read_frame(&mut io::stdin().lock()) {
-        Ok(frame) if frame.len() <= capacity => {
-            std::ptr::copy_nonoverlapping(frame.as_ptr(), data, frame.len());
-            *len = frame.len();
+        Ok(frame) => {
+            callback(context, frame.as_ptr(), frame.len());
             0
         }
         _ => -1,
@@ -346,5 +357,27 @@ pub unsafe extern "C" fn namespace_proto_worker_write(data: *const u8, len: usiz
     ) {
         Ok(()) => 0,
         Err(_) => -1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn large_sql_keeps_result_frames_bounded() {
+        let mut sql = vec![b'x'; MAX_FRAME + 4096];
+        sql[0] = b'I';
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &sql).unwrap();
+        assert_eq!(read_frame(&mut Cursor::new(&wire)).unwrap(), sql);
+        sql[0] = b'r';
+        assert!(write_frame(&mut Vec::new(), &sql).is_err());
+        wire[8] = b'r';
+        assert!(read_frame(&mut Cursor::new(wire)).is_err());
+        let mut header = b"NS13".to_vec();
+        header.extend_from_slice(&((MAX_SQL_MESSAGE + 1) as u32).to_le_bytes());
+        assert!(read_frame(&mut Cursor::new(header)).is_err());
     }
 }

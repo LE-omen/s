@@ -3039,4 +3039,5 @@ void set_server_stop()
 } // end of namespace oceanbase
 
 #include "observer/namespace_worker_gateway_prototype.ipp"
+#include "observer/namespace_worker_inner_sql_prototype.ipp"
 #include "observer/namespace_sql_worker_prototype.ipp"

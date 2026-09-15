@@ -27,6 +27,7 @@ int write_rpc(Frame &request, Frame &reply) {
 
 struct EngineWrite {
   ObArenaAllocator allocator{ObMemAttr("NsRemoteWrite")};
+  ObSchemaGetterGuard guard;
   ObDmlTablePlan plan{allocator};
   ObTimeZoneInfo timezone;
   ObWriteContext context;
@@ -53,18 +54,14 @@ struct EngineWrite {
     concurrent_control::ObWriteFlag flag;
     request.read(snapshot); request.read(flag);
     const uint64_t count = request.number();
-    if (request.ret || count == 0 || count > 2 || ((table & ~(1ULL << 62)) >> 32) != ns) { return OB_NOT_SUPPORTED; }
-    int ret = NamespaceForkKernelPrototype::schema_by_id(table, schema);
+    if (request.ret || count == 0 || count > OB_MAX_COLUMN_NUMBER || !owns_table(ns, table)) { return OB_NOT_SUPPORTED; }
+    int ret = storage_schema(ns, table, guard, schema);
     if (ret) { return ret; }
-    // Namespace catalog currently admits only these simple integer schemas.
-    if (!schema || schema->get_schema_version() != spec.schema_version_
-        || schema->get_column_count() != 2 || schema->get_index_tid_count() != 0) { return OB_NOT_SUPPORTED; }
+    if (!schema || schema->get_schema_version() != spec.schema_version_) { return OB_SCHEMA_EAGAIN; }
     for (uint64_t i = 0; !ret && i < count; ++i) {
       const uint64_t id = request.number();
       const auto *column = schema->get_column_schema(id);
-      if (!column || !ob_is_integer_type(column->get_data_type())
-          || (i == 0 && !column->is_rowkey_column())
-          || (i && id == columns.at(0))) { ret = OB_NOT_SUPPORTED; }
+      if (!column || has_exist_in_array(columns, id)) { ret = OB_INVALID_ARGUMENT; }
       else { ret = columns.push_back(id); }
     }
     if (ret || !request.consumed()) { return ret ? ret : OB_INVALID_ARGUMENT; }
@@ -77,12 +74,11 @@ struct EngineWrite {
     return ret;
   }
 
-  int batch(char operation, ObTxDesc &tx, Frame &request, int64_t &affected) {
+  int batch(char operation, ObTxDesc &tx, Frame &request, int64_t &affected, Frame &returned) {
     const uint64_t tablet_id = request.number(), count = request.number();
     const bool update = operation == 'U';
     if (request.ret || tablet_id != tablet.id() || count == 0
-        || count > (update ? 64 : 32) || (update && count % 2)
-        || (operation != 'L' && columns.count() != 2)) { return OB_INVALID_ARGUMENT; }
+        || count > (update ? 64 : 32) || (update && count % 2)) { return OB_INVALID_ARGUMENT; }
     int64_t lock_timeout = 0;
     ObRowLockMode lock_mode = ObRowLockMode::NONE;
     if (operation == 'L') {
@@ -91,19 +87,22 @@ struct EngineWrite {
     }
     ObSEArray<uint64_t, 2> updated_columns;
     const uint64_t updated_count = request.number();
-    if (request.ret || updated_count > 2 || (update ? updated_count == 0 : updated_count != 0)) { return OB_INVALID_ARGUMENT; }
+    if (request.ret || updated_count > uint64_t(columns.count())
+        || (update || operation == 'f' ? updated_count == 0 : updated_count != 0)) { return OB_INVALID_ARGUMENT; }
     for (uint64_t i = 0; i < updated_count; ++i) {
       const uint64_t column = request.number();
-      if (request.ret || (column != columns.at(0) && column != columns.at(1))
-          || (i && column == updated_columns.at(0))) { return OB_INVALID_ARGUMENT; }
+      if (request.ret || !has_exist_in_array(columns, column)
+          || has_exist_in_array(updated_columns, column)) { return OB_INVALID_ARGUMENT; }
       int ret = updated_columns.push_back(column);
       if (ret) { return ret; }
     }
+    auto duplicate_mode = operation == 'f' ? static_cast<ObDuplicateReturnMode>(request.number()) : ObDuplicateReturnMode::ALL;
+    if (duplicate_mode != ObDuplicateReturnMode::ALL && duplicate_mode != ObDuplicateReturnMode::ONE) { return OB_INVALID_ARGUMENT; }
     // Decode and validate a bounded batch before entering native storage.
     std::vector<ObObj> cells(count * columns.count());
     for (auto &cell : cells) {
       request.read(cell);
-      if (request.ret || (!cell.is_null() && !ob_is_integer_type(cell.get_type()))) { return OB_INVALID_ARGUMENT; }
+      if (request.ret) { return OB_INVALID_ARGUMENT; }
     }
     if (!request.consumed()) { return OB_INVALID_ARGUMENT; }
     class Rows final : public ObDatumRowIterator {
@@ -125,9 +124,37 @@ struct EngineWrite {
     int ret = rows.rows[0].init(columns.count());
     if (!ret) { ret = rows.rows[1].init(columns.count()); }
     auto *service = share::server_service<ObIDmlService>();
-    if (!ret && update) { ret = service->update_rows(tablet, tx, execution, columns, updated_columns, &rows, affected); }
+    if (!ret && operation == 'f') {
+      ObDatumRowIterator *duplicates = nullptr;
+      ret = service->insert_rows_fetch_duplicates(tablet, tx, execution, columns, updated_columns,
+                                                 &rows, duplicate_mode, affected, duplicates);
+      struct ReleaseDuplicates { ObIDmlService *service; ObDatumRowIterator *rows;
+        ~ReleaseDuplicates() { if (rows) { service->free_duplicate_rows_iterator(rows); } }
+      } release{service, duplicates};
+      if (!ret || ret == OB_ERR_PRIMARY_KEY_DUPLICATE) {
+        const int storage_ret = ret;
+        Frame values; int64_t count = 0; ret = OB_SUCCESS;
+        ObDatumRow *row = nullptr;
+        while (duplicates && !ret && !(ret = duplicates->get_next_row(row))) {
+          if (!row || row->get_column_count() != updated_columns.count() || count >= 32) { ret = OB_SIZE_OVERFLOW; break; }
+          for (int64_t i = 0; !ret && i < updated_columns.count(); ++i) {
+            ObObj cell;
+            ret = row->storage_datums_[i].to_obj_enhance(cell, schema->get_column_schema(updated_columns.at(i))->get_meta_type());
+            if (!ret) { values.append(cell); ret = values.ret; }
+          }
+          ++count;
+        }
+        if (ret == OB_ITER_END) { ret = OB_SUCCESS; }
+        if (!ret) {
+          returned.number(count);
+          returned.data.insert(returned.data.end(), values.data.begin() + Frame::HEADER_SIZE, values.data.end());
+          ret = storage_ret;
+        }
+      }
+    } else if (!ret && update) { ret = service->update_rows(tablet, tx, execution, columns, updated_columns, &rows, affected); }
     else if (!ret && operation == 'D') { ret = service->delete_rows(tablet, tx, execution, columns, &rows, affected); }
     else if (!ret && operation == 'L') { ret = service->lock_rows(tablet, tx, execution, lock_timeout, lock_mode, &rows, affected); }
+    else if (!ret && operation == 'p') { ret = service->put_rows(tablet, tx, execution, columns, &rows, affected); }
     else if (!ret) { ret = service->insert_rows(tablet, tx, execution, columns, &rows, affected); }
     fprintf(stderr, "PROTOTYPE_V15_WRITE_BATCH op=%c tx=%lld rows=%llu affected=%lld ret=%d\n",
         operation, (long long)tx.get_tx_id().get_id(), (unsigned long long)(update ? count / 2 : count), (long long)affected, ret);
@@ -252,14 +279,15 @@ struct EngineWrites {
         auto it = writes.find(handle);
         if (request.ret || it == writes.end()) { ret = OB_INVALID_ARGUMENT; }
         else if (operation == 'X' && request.consumed()) { writes.erase(it); }
-        else if (operation == 'I' || operation == 'U' || operation == 'D' || operation == 'L') {
-          int64_t affected = 0;
-          ret = it->second->batch(operation, *tx, request, affected); values.number(affected);
+        else if (operation == 'I' || operation == 'U' || operation == 'D' || operation == 'L' || operation == 'p' || operation == 'f') {
+          int64_t affected = 0; Frame returned;
+          ret = it->second->batch(operation, *tx, request, affected, returned); values.number(affected);
+          values.data.insert(values.data.end(), returned.data.begin() + Frame::HEADER_SIZE, returned.data.end());
         } else { ret = OB_INVALID_ARGUMENT; }
       }
     }
     reply = Frame('w'); reply.number(ret);
-    if (!ret) {
+    if (!ret || (request.type() == 'W' && operation == 'f' && ret == OB_ERR_PRIMARY_KEY_DUPLICATE)) {
       if ((request.type() == 'T' && operation != 'V') || (request.type() == 'W' && operation == 'X')) { reply.append(*tx); }
       reply.data.insert(reply.data.end(), values.data.begin() + Frame::HEADER_SIZE, values.data.end());
       if (values.ret) { reply.ret = values.ret; }
@@ -425,6 +453,33 @@ struct RemoteExecution final : public ObIDmlExecutionState {
   void set_skip_flush_redo(bool) override {} // No index writes in this slice.
 };
 
+class DuplicateRows final : public ObDatumRowIterator {
+public:
+  std::vector<Frame> batches;
+  size_t current = 0;
+  uint64_t remaining = 0;
+  int64_t width;
+  ObDatumRow row;
+  explicit DuplicateRows(int64_t n) : width(n) {}
+  int get_next_row(ObDatumRow *&out) override {
+    while (!remaining) {
+      if (current == batches.size()) { return OB_ITER_END; }
+      remaining = batches[current].number();
+      if (!remaining) { ++current; }
+    }
+    Frame &batch = batches[current];
+    int ret = row.is_valid() ? OB_SUCCESS : row.init(width);
+    for (int64_t i = 0; !ret && i < width; ++i) {
+      ObObj value; batch.read(value);
+      ret = batch.ret ? batch.ret : row.storage_datums_[i].from_obj_enhance(value);
+    }
+    if (!--remaining) {
+      if (!batch.consumed()) { ret = OB_INVALID_ARGUMENT; }
+      ++current;
+    }
+    out = &row; return ret;
+  }
+};
 class RemoteDmlService final : public ObIDmlService {
 public:
   int prepare_execution(
@@ -437,7 +492,7 @@ public:
       ObDmlExecution &execution) override {
     const auto view = table_plan.get_data_table();
     const auto &columns = table_plan.get_col_descs();
-    if (!write_context.is_valid() || columns.empty() || columns.count() > 2 || !write_spec.tz_info_) { return OB_NOT_SUPPORTED; }
+    if (!write_context.is_valid() || columns.empty() || columns.count() > OB_MAX_COLUMN_NUMBER || !write_spec.tz_info_) { return OB_NOT_SUPPORTED; }
     auto prepared = std::make_unique<RemoteExecution>();
     auto &tx = *static_cast<ObTxDesc *>(write_context.native_handle());
     prepared->tx = &tx;
@@ -451,7 +506,6 @@ public:
     request.append(*write_spec.tz_info_);
     request.append(snapshot); request.append(write_flag); request.number(columns.count());
     for (int64_t i = 0; i < columns.count(); ++i) {
-      if (!ob_is_integer_type(columns.at(i).col_type_.get_type())) { return OB_NOT_SUPPORTED; }
       request.number(columns.at(i).col_id_); prepared->types.push_back(columns.at(i).col_type_);
       prepared->columns.push_back(columns.at(i).col_id_);
     }
@@ -477,7 +531,8 @@ public:
       const ObDmlExecution &execution,
       const common::ObIArray<uint64_t> &column_ids,
       blocksstable::ObDatumRowIterator *row_iter,
-      int64_t &affected_rows) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_DML put_rows\n"); return OB_NOT_SUPPORTED; }
+      int64_t &affected_rows) override {
+    return write_rows('p', tablet_id, tx_desc, execution, &column_ids, nullptr, row_iter, affected_rows); }
   int insert_rows(
       const common::ObTabletID &tablet_id,
       transaction::ObTxDesc &tx_desc,
@@ -489,7 +544,8 @@ public:
   int write_rows(char operation, const ObTabletID &tablet_id, ObTxDesc &tx_desc,
       const ObDmlExecution &execution, const ObIArray<uint64_t> *column_ids,
       const ObIArray<uint64_t> *updated_column_ids, ObDatumRowIterator *row_iter, int64_t &affected_rows,
-      int64_t lock_timeout = 0, ObRowLockMode lock_mode = ObRowLockMode::NONE) {
+      int64_t lock_timeout = 0, ObRowLockMode lock_mode = ObRowLockMode::NONE,
+      DuplicateRows *duplicates = nullptr, ObDuplicateReturnMode duplicate_mode = ObDuplicateReturnMode::ALL) {
     auto *state = static_cast<RemoteExecution *>(execution_state(execution));
     if (!state || !row_iter || (column_ids && column_ids->count() != static_cast<int64_t>(state->columns.size()))
         || state->txid != static_cast<uint64_t>(tx_desc.get_tx_id().get_id())) { return OB_INVALID_ARGUMENT; }
@@ -499,7 +555,7 @@ public:
     }
     affected_rows = 0;
     int ret = OB_SUCCESS;
-    bool end = false;
+    bool end = false, duplicated = false;
     while (!ret && !end) {
       Frame cells;
       int64_t rows = 0;
@@ -526,15 +582,18 @@ public:
         if (updated_column_ids) {
           for (int64_t i = 0; i < updated_column_ids->count(); ++i) { request.number(updated_column_ids->at(i)); }
         }
+        if (duplicates) { request.number(static_cast<int>(duplicate_mode)); }
         request.data.insert(request.data.end(), cells.data.begin() + Frame::HEADER_SIZE, cells.data.end());
         ret = write_rpc(request, reply);
+        if (duplicates && ret == OB_ERR_PRIMARY_KEY_DUPLICATE) { duplicated = true; ret = OB_SUCCESS; }
         if (!ret) {
           affected_rows += reply.number();
-          if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
+          if (duplicates && !reply.ret) { duplicates->batches.push_back(std::move(reply)); }
+          else if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
         }
       }
     }
-    return ret; }
+    return ret ? ret : duplicated ? OB_ERR_PRIMARY_KEY_DUPLICATE : OB_SUCCESS; }
   int insert_rows_fetch_duplicates(
       const common::ObTabletID &tablet_id,
       transaction::ObTxDesc &tx_desc,
@@ -544,7 +603,14 @@ public:
       blocksstable::ObDatumRowIterator *row_iter,
       const ObDuplicateReturnMode return_mode,
       int64_t &affected_rows,
-      blocksstable::ObDatumRowIterator *&duplicated_rows) override { fprintf(stderr, "PROTOTYPE_V14_UNSUPPORTED_DML insert_rows_fetch_duplicates\n"); return OB_NOT_SUPPORTED; }
+      blocksstable::ObDatumRowIterator *&duplicated_rows) override {
+    if (duplicated_rows) { return OB_INVALID_ARGUMENT; }
+    auto result = std::make_unique<DuplicateRows>(duplicated_column_ids.count());
+    const int ret = write_rows('f', tablet_id, tx_desc, execution, &column_ids, &duplicated_column_ids,
+                              row_iter, affected_rows, 0, ObRowLockMode::NONE, result.get(), return_mode);
+    if (ret == OB_ERR_PRIMARY_KEY_DUPLICATE) { duplicated_rows = result.release(); }
+    return ret;
+  }
   void free_duplicate_rows_iterator(
       blocksstable::ObDatumRowIterator *iterator) override { delete iterator; }
   int update_rows(

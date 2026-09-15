@@ -15,6 +15,7 @@
  */
 
 #define USING_LOG_PREFIX SQL
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "sql/ob_sql.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -1059,6 +1060,8 @@ int ObSql::prepare_pl_sql(const ObString &sql,
                           ObSPIService::PLPrepareResult &pl_prepare_result,
                           ParamStore *params)
 {
+  const int role_ret = observer::namespace_worker_prototype::check_sql_execution_role();
+  if (role_ret) { return role_ret; }
   int ret = OB_SUCCESS;
   ObString cur_query;
   ObString trimed_stmt = const_cast<ObString &>(sql).trim();
@@ -1297,6 +1300,8 @@ int ObSql::execute_pl_sql(const ObString &sql,
                           bool is_prepare_protocol,
                           bool is_dynamic_sql)
 {
+  const int role_ret = observer::namespace_worker_prototype::check_sql_execution_role();
+  if (role_ret) { return role_ret; }
   int ret = OB_SUCCESS;
   int get_plan_err = OB_SUCCESS;
   TimeoutGuard timeout_guard(session);
@@ -2953,6 +2958,8 @@ int ObSql::code_generate(
 inline int ObSql::sanity_check(ObSqlCtx &context)
 {
   int ret = OB_SUCCESS;
+  const int role_ret = observer::namespace_worker_prototype::check_sql_execution_role();
+  if (role_ret) { return role_ret; }
   if (!inited_) {
     LOG_WARN("ob sql not inited");
   } else if (OB_UNLIKELY(NULL == context.session_info_)

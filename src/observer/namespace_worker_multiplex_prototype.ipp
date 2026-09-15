@@ -12,6 +12,8 @@
 #include "lib/thread/ob_thread_name.h"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 constexpr size_t MAX_REQUESTS = 32; // ceiling only; slots and frames grow on demand
+struct PendingRequest;
+thread_local std::function<void(PendingRequest &, bool, bool)> worker_wait;
 struct PendingRequest {
   RequestTag tag;
   std::mutex mutex;
@@ -52,6 +54,7 @@ struct PendingRequest {
     changed.notify_all(); return common::OB_SUCCESS;
   }
   int take(Frame &frame, bool draining = false) {
+    if (worker_wait) { worker_wait(*this, false, draining); }
     std::unique_lock<std::mutex> guard(mutex);
     auto ready = [&] { return error || incoming || terminal || (!draining && cancelled.load()); };
     if (draining || deadline == INT64_MAX) {
@@ -67,6 +70,7 @@ struct PendingRequest {
     frame = std::move(*slot); slot.reset(); return common::OB_SUCCESS;
   }
   int take_credit(bool draining = false) {
+    if (worker_wait) { worker_wait(*this, true, draining); }
     std::unique_lock<std::mutex> guard(mutex);
     if (!credit && !error && !reported_wait) {
       reported_wait = true;

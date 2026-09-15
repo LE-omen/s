@@ -18,6 +18,7 @@
 
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "ob_local_management_service.h"
+#include "observer/namespace_worker_protocol_prototype.h"
 #include "data_plane/ddl/ob_ddl_coordinator.h"
 #include "data_plane/ddl/ob_ddl_schedule.h"
 #include "query/command/ob_local_command_service.h"
@@ -2440,6 +2441,9 @@ int ObLocalManagementService::init_sys_admin_ctx(ObSystemAdminCtx &ctx)
 
 int ObLocalManagementService::admin_set_config(obcall::ObAdminSetConfigArg &arg)
 {
+  if (observer::namespace_worker_prototype::worker_process) {
+    return observer::namespace_worker_prototype::admin_set_config(arg);
+  }
   int ret = OB_SUCCESS;
   if (!inited_) {
     ret = OB_NOT_INIT;

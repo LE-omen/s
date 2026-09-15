@@ -19,10 +19,12 @@
 namespace oceanbase { namespace observer {
 int ObServer::namespace_sql_worker_prototype(const char *query)
 {
+  namespace_worker_prototype::worker_process = true;
   using namespace sql;
   using namespace common;
   using namespace share;
   int ret = OB_SUCCESS;
+  namespace_worker_prototype::RemoteTabletScan remote_scan;
   int64_t concurrency = 2;
   if (const char *value = std::getenv("SEEKDB_NAMESPACE_SQL_WORKER_THREADS")) {
     char *end = nullptr; concurrency = std::strtol(value, &end, 10);
@@ -90,7 +92,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   WORKER_STEP(ObPsCache::server_module_init(mods_ps_cache_));
   WORKER_STEP(ObSqlMemoryManager::server_module_init(mods_sql_memory_manager_));
   WORKER_STEP(ObOptStatManager::get_instance().init(&sql_proxy_, &config_));
-  WORKER_STEP(sql_engine_.init(&ObOptStatManager::get_instance(), &vt_data_service_,
+  WORKER_STEP(sql_engine_.init(&ObOptStatManager::get_instance(), &remote_scan,
       self_addr_, *mods_plan_cache_, *mods_ps_cache_, pl_engine_, *this, *this,
       local_management_service_, ob_service_, *this, *this, *this,
       *mods_srs_service_, *mods_lob_manager_));
@@ -99,24 +101,25 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   using namespace namespace_worker_prototype;
   if (ret != OB_SUCCESS) { return ret; }
   if (query[0] != '@') { return OB_NOT_SUPPORTED; }
-  RemoteTabletScan remote_scan;
   RemoteTransactionService remote_transactions;
   RemoteDmlService remote_dml;
   RemoteWriteContext remote_write_context;
   {
     bind_server_service<ObITabletScan>(&remote_scan);
+    bind_server_service<ObIVirtualTableScan>(&remote_scan);
     bind_server_service<data_plane::ObITransactionService>(&remote_transactions);
     bind_server_service<data_plane::ObIDmlService>(&remote_dml);
     bind_server_service<data_plane::ObIWriteContextService>(&remote_write_context);
     char *end = nullptr;
     worker_namespace = std::strtoull(query + 1, &end, 10);
-    if (!end || *end || worker_namespace <= 1 || worker_namespace >= (1ULL << 30)) { return OB_INVALID_ARGUMENT; }
+    if (!end || *end || worker_namespace == 0 || worker_namespace >= (1ULL << 30)) { return OB_INVALID_ARGUMENT; }
     worker_catalog_fetch = fetch_catalog;
   }
   struct SessionOwner {
     ObArenaAllocator allocator{ObMemAttr("NsSQLSession")};
     ObSQLSessionInfo session; // Destroyed before its allocator.
     std::atomic<bool> running{false};
+    common::sqlclient::ObISQLConnectionGuard inner;
   };
   struct SessionSlot {
     std::shared_ptr<SessionOwner> owner;
@@ -126,7 +129,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   std::vector<SessionSlot> slots;
   std::vector<uint64_t> free_slots;
   uint64_t active_sessions = 0;
-  auto initialize = [&](SessionOwner &owner, uint32_t sid, uint32_t capabilities, Frame *state) -> int {
+  auto initialize = [&](SessionOwner &owner, uint32_t sid, uint32_t capabilities, Frame *state, bool internal) -> int {
     int ret = OB_SUCCESS;
     ObSQLSessionInfo &session = owner.session;
     WORKER_STEP(session.test_init(1, sid, &owner.allocator));
@@ -134,19 +137,26 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     WORKER_STEP(session.set_user(ObString::make_string("root"), ObString::make_string("%"), OB_SYS_USER_ID));
     session.set_capability(obmysql::ObMySQLCapabilityFlags(capabilities));
     session.set_user_priv_set(OB_PRIV_SELECT | OB_PRIV_INSERT | OB_PRIV_UPDATE | OB_PRIV_DELETE);
+    if (worker_namespace == 1) { session.set_user_priv_set(OB_PRIV_ALL | OB_PRIV_GRANT); }
     session.set_session_manager(&session_mgr_);
+    if (!ret && internal) { ret = ObInnerSQLConnection::init_session_info(&session, false, false); }
     if (!ret && state) {
       ret = apply_session_state(session, *state);
       if (!ret && !state->consumed()) { ret = OB_INVALID_ARGUMENT; }
       const uint64_t db = session.get_database_id();
       const share::schema::ObDatabaseSchema *database = nullptr;
-      if (!ret && db != OB_INVALID_ID) {
-        if (((db & ~(1ULL << 62)) >> 32) != worker_namespace) { ret = OB_INVALID_ARGUMENT; }
+      if (!ret && !internal && db != OB_INVALID_ID) {
+        ObSchemaGetterGuard guard;
+        if (worker_namespace == 1) {
+          ret = schema_service_.get_runtime_schema_guard(guard);
+          if (!ret) { ret = guard.get_database_schema(db, database); }
+        } else if (((db & ~(1ULL << 62)) >> 32) != worker_namespace) { ret = OB_INVALID_ARGUMENT; }
         else { ret = storage::NamespaceForkKernelPrototype::database_by_id(db, database); }
         if (!ret && !database) { ret = OB_ERR_BAD_DATABASE; }
         if (!ret) { ret = session.set_default_database(database->get_database_name_str()); }
       }
     }
+    if (!ret && internal) { ret = ObInnerSQLConnection::create_connection_with_external_session(&session, owner.inner); }
     return ret;
   };
   // Native expression/operator checkpoints dispatch through THIS_WORKER. The
@@ -237,6 +247,61 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     } while (retry.get_retry_type() == RETRY_TYPE_LOCAL);
     return ret;
   };
+  auto execute_inner = [&](SessionOwner &owner, Frame &input) -> int {
+    auto *connection = static_cast<ObInnerSQLConnection *>(owner.inner.get_ptr());
+    if (!connection) { return OB_INVALID_ARGUMENT; }
+    THIS_WORKER.set_session(&owner.session);
+    struct SessionScope { ~SessionScope() { THIS_WORKER.set_session(nullptr); } } scope;
+    const int64_t deadline = input.number();
+    THIS_WORKER.set_timeout_ts(deadline);
+    ObSessionDDLInfo ddl; input.read(ddl); owner.session.set_ddl_info(ddl);
+    const uint64_t operation = input.number();
+    int ret = input.ret;
+    int64_t affected = 0;
+    if (!ret && (operation == 'R' || operation == 'W')) {
+      const bool user_sql = input.number() != 0;
+      const ObString text = input.string();
+      if (!input.consumed()) { return OB_INVALID_ARGUMENT; }
+      if (operation == 'W') { ret = connection->execute_write(text, affected, user_sql); }
+      else {
+        ObISQLClient::ReadResult result;
+        ret = connection->execute_read(text, result, user_sql);
+        if (!ret) {
+          auto *native = static_cast<ObInnerSQLResult *>(result.get_result());
+          const auto *fields = native->result_set().get_field_columns();
+          if (!fields) { return OB_ERR_UNEXPECTED; }
+          Frame metadata('m'); metadata.number(fields->count());
+          for (int64_t i = 0; i < fields->count(); ++i) { metadata.string(fields->at(i).cname_); }
+          ret = worker_send(metadata);
+          while (!ret && !(ret = native->next())) {
+            const ObNewRow *row = native->get_row();
+            if (!row) { ret = OB_ERR_UNEXPECTED; break; }
+            Frame values('r'); values.number(row->get_count());
+            for (int64_t i = 0; i < row->get_count(); ++i) { values.append(row->get_cell(i)); }
+            ret = worker_send(values);
+          }
+          if (ret == OB_ITER_END) { ret = OB_SUCCESS; }
+          const int close_ret = native->close();
+          if (!ret) { ret = close_ret; }
+        }
+      }
+    } else if (!ret && operation == 'B') {
+      const bool snapshot = input.number() != 0;
+      ret = input.consumed() ? connection->start_transaction(snapshot) : OB_INVALID_ARGUMENT;
+    } else if (!ret && operation == 'C') {
+      ret = input.consumed() ? connection->commit() : OB_INVALID_ARGUMENT;
+    } else if (!ret && operation == 'X') {
+      ret = input.consumed() ? connection->rollback() : OB_INVALID_ARGUMENT;
+    } else if (!ret && operation == 'S') {
+      const ObString name = input.string(); ObObj value; input.read(value);
+      if (!input.consumed()) { ret = OB_INVALID_ARGUMENT; }
+      else { ret = value.is_int() ? connection->set_session_variable(name, value.get_int())
+                                 : connection->set_session_variable(name, value.get_string()); }
+    } else if (!ret) { ret = OB_NOT_SUPPORTED; }
+    if (!ret && operation != 'R') { Frame result('o'); result.number(affected); ret = worker_send(result); }
+    fprintf(stderr, "PROTOTYPE_V18_INNER_EXECUTE session=%u operation=%c ret=%d\n", owner.session.get_server_sid(), char(operation), ret);
+    return ret;
+  };
   struct Job {
     Frame input;
     std::shared_ptr<PendingRequest> request;
@@ -260,28 +325,20 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         (unsigned long long)request->tag.slot, (unsigned long long)request->tag.generation, result);
     if (worker_send_wire(std::move(done))) { std::_Exit(1); }
   };
-  PrototypeThreads executors(concurrency, [&] {
-    lib::set_thread_name("NsSQLExecute");
-    lib::Worker *previous = &THIS_WORKER;
+  auto run_job = [&](Job &job) {
+    lib::Worker *previous_worker = &THIS_WORKER;
+    PendingRequest *previous_request = worker_request;
     RequestWorker request_worker;
     lib::Worker::set_worker_to_thread_local(&request_worker);
-    for (;;) {
-      Job job;
-      {
-        std::unique_lock<std::mutex> lock(jobs_mutex);
-        jobs_changed.wait(lock, [&] { return stopping || !jobs.empty(); });
-        if (stopping) { break; }
-        job = std::move(jobs.front()); jobs.pop_front();
-      }
       worker_request = job.request.get();
       THIS_WORKER.set_timeout_ts(job.request->deadline);
       Frame &input = job.input;
       int result = OB_SUCCESS;
-      if (input.type() == 'A') {
+      if (input.type() == 'A' || input.type() == 'a') {
         const uint64_t sid = input.number(), capabilities = input.number();
         auto owner = std::make_shared<SessionOwner>();
         result = input.ret || sid == 0 || sid > UINT32_MAX || capabilities > UINT32_MAX
-            ? OB_INVALID_ARGUMENT : initialize(*owner, sid, capabilities, &input);
+            ? OB_INVALID_ARGUMENT : initialize(*owner, sid, capabilities, &input, input.type() == 'a');
         if (!result) {
           Frame opened('a');
           {
@@ -297,6 +354,8 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
           }
           result = worker_send(opened);
         }
+      } else if (input.type() == 'I') {
+        result = execute_inner(*job.owner, input);
       } else {
         const int64_t deadline = static_cast<int64_t>(input.number());
         ObString sql = input.string();
@@ -320,10 +379,53 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
             job.owner->session.get_server_sid(), result);
       }
       complete(job.request, result, job.owner.get());
-      worker_request = nullptr;
-      THIS_WORKER.set_timeout_ts(INT64_MAX);
+    worker_request = previous_request;
+    lib::Worker::set_worker_to_thread_local(previous_worker);
+  };
+  PrototypeThreads executors(concurrency, [&] {
+    lib::set_thread_name("NsSQLExecute");
+    int depth = 0;
+    if (worker_namespace == 1) {
+      // Native internal callers can start another query before closing a streamed
+      // result. Run queued internal work while waiting, preserving both stacks.
+      // The pipe reader still only dispatches; no polling or extra thread.
+      worker_wait = [&](PendingRequest &waiting, bool credit, bool draining) {
+        auto ready = [&] {
+          std::lock_guard<std::mutex> guard(waiting.mutex);
+          return waiting.error || (credit ? waiting.credit : bool(waiting.incoming || waiting.terminal))
+              || (!draining && waiting.status());
+        };
+        std::unique_lock<std::mutex> lock(jobs_mutex);
+        while (!stopping && !ready()) {
+          auto internal = std::find_if(jobs.begin(), jobs.end(), [](const Job &job) {
+            return job.input.type() == 'a' || job.input.type() == 'I';
+          });
+          if (internal != jobs.end()) {
+            Job nested = std::move(*internal); jobs.erase(internal);
+            lock.unlock();
+            if (depth >= 8) { complete(nested.request, OB_SIZE_OVERFLOW, nested.owner.get()); }
+            else { ++depth; run_job(nested); --depth; }
+            lock.lock();
+          } else if (draining || waiting.deadline == INT64_MAX) {
+            jobs_changed.wait(lock);
+          } else {
+            jobs_changed.wait_until(lock,
+                std::chrono::system_clock::time_point(std::chrono::microseconds(waiting.deadline)));
+          }
+        }
+      };
     }
-    lib::Worker::set_worker_to_thread_local(previous);
+    for (;;) {
+      Job job;
+      {
+        std::unique_lock<std::mutex> lock(jobs_mutex);
+        jobs_changed.wait(lock, [&] { return stopping || !jobs.empty(); });
+        if (stopping) { break; }
+        job = std::move(jobs.front()); jobs.pop_front();
+      }
+      run_job(job);
+    }
+    worker_wait = {};
   });
   if ((ret = executors.start())) { return ret; }
   fprintf(stderr, "PROTOTYPE_V12_EXECUTORS count=%lld max_requests=%zu\n", (long long)concurrency, MAX_REQUESTS);
@@ -350,11 +452,13 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       }
       // Queued cancellation must not wait for an execution thread to become free.
       if (queued) { complete(request, reason, queued->owner.get()); }
+      jobs_changed.notify_all();
       continue;
     }
-    if (input.type() == 'K' || input.type() == 'c' || input.type() == 's' || input.type() == 'w') {
+    if (input.type() == 'K' || input.type() == 'c' || input.type() == 's' || input.type() == 'w' || input.type() == 'g') {
       auto request = requests.find(tag);
       if (request) { ret = request->post(std::move(input)); }
+      if (worker_namespace == 1) { std::lock_guard<std::mutex> guard(jobs_mutex); jobs_changed.notify_all(); }
       continue;
     }
     auto request = requests.accept(tag);
@@ -362,7 +466,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     if (input.type() == 'P') { complete(request, input.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT); continue; }
     int result = OB_SUCCESS;
     std::shared_ptr<SessionOwner> owner;
-    if (input.type() == 'Q' || input.type() == 'U' || input.type() == 'C') {
+    if (input.type() == 'Q' || input.type() == 'U' || input.type() == 'C' || input.type() == 'I') {
       const uint64_t index = input.number(), generation = input.number();
       {
         std::lock_guard<std::mutex> guard(sessions_mutex);
@@ -385,7 +489,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         // destroy the old session until that query has finished using it.
         owner.reset(); complete(request, result); continue;
       }
-    } else if (input.type() != 'A') { result = OB_NOT_SUPPORTED; }
+    } else if (input.type() != 'A' && input.type() != 'a') { result = OB_NOT_SUPPORTED; }
     if (!result && owner) {
       const int64_t saved = input.pos;
       const uint64_t deadline = input.number();
@@ -399,7 +503,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       std::lock_guard<std::mutex> guard(jobs_mutex);
       jobs.push_back(Job{std::move(input), request, owner});
     }
-    jobs_changed.notify_one();
+    jobs_changed.notify_all();
   }
   requests.fail();
   { std::lock_guard<std::mutex> guard(jobs_mutex); stopping = true; }
