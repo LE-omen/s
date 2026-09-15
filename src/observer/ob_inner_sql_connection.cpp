@@ -1170,6 +1170,14 @@ int ObInnerSQLConnection::execute_write_inner(const ObString &sql,
           "affected_rows", affected_rows,
           "start_ts", res.execute_start_ts_,
           "end_ts", res.execute_end_ts_);
+        // The shared process persists DDL metadata. Once the write has
+        // completed, refresh its native schema service so subsequent catalog
+        // lookups see the new table/columns.
+        if (!namespace_worker_prototype::worker_process && GCTX.schema_service_ && !ret) {
+          int64_t schema_version = OB_INVALID_VERSION;
+          const int refresh_ret = GCTX.schema_service_->get_published_schema_version(schema_version);
+          if (!refresh_ret) { (void)GCTX.schema_service_->async_refresh_schema(schema_version); }
+        }
       }
     }
 #ifndef NDEBUG
