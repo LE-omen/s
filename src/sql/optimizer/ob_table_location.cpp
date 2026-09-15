@@ -4993,7 +4993,8 @@ int ObTableLocation::get_list_value_node(const ObPartitionLevel part_level,
       if (OB_ISNULL(expr)) {
         ret = OB_ERR_UNEXPECTED;
       } else if (OB_FAIL(expr->has_exec_param(has_exec))) {
-      } else if (has_exec || expr->cnt_not_calculable_expr_ignore_column() || !expr->is_op_expr()) {
+      } else if (has_exec || expr->has_flag(CNT_PL_UDF) ||
+                 expr->cnt_not_calculable_expr_ignore_column() || !expr->is_op_expr()) {
         // do nothing
       } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(expr, expr_columns))) {
       } else if (expr_columns.empty()) {
