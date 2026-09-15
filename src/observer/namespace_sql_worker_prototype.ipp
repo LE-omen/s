@@ -135,11 +135,16 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   RemoteDmlService remote_dml;
   RemoteWriteContext remote_write_context;
   RemoteRangeService remote_ranges;
+  RemoteDirectInsertService remote_direct_insert;
   {
     bind_server_service<ObITabletScan>(&remote_scan);
     bind_server_service<ObIVirtualTableScan>(&remote_scan);
     bind_server_service<data_plane::ObITransactionService>(&remote_transactions);
     bind_server_service<data_plane::ObIRangeService>(&remote_ranges);
+    bind_server_service<data_plane::IDirectInsertService>(&remote_direct_insert);
+    // The native slice store persists scheduling metadata through inner SQL,
+    // whose storage path is already remote in this worker.
+    sql::register_ddl_slice_store(this);
     bind_server_service<data_plane::ObIDmlService>(&remote_dml);
     bind_server_service<data_plane::ObIWriteContextService>(&remote_write_context);
     char *end = nullptr;
@@ -358,6 +363,13 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     if (worker_send_wire(std::move(done))) { std::_Exit(1); }
   };
   auto execute_job = [&](Job &job) -> int {
+    if (!job.request->call_trace.is_valid()) { job.request->call_trace.init(self_addr_); }
+    ObTraceIdGuard trace_guard(job.request->call_trace);
+    struct CallTraceScope {
+      const ObCurTraceId::TraceId *previous = worker_call_trace;
+      explicit CallTraceScope(const ObCurTraceId::TraceId &trace) { worker_call_trace = &trace; }
+      ~CallTraceScope() { worker_call_trace = previous; }
+    } call_trace_scope(job.request->call_trace);
     lib::Worker *previous_worker = &THIS_WORKER;
     PendingRequest *previous_request = worker_request;
     RequestWorker request_worker;
@@ -439,7 +451,8 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     int depth = 0;
     if (worker_namespace == 1) {
       // Native internal callers can start another query before closing a streamed
-      // result. Run queued internal work while waiting, preserving both stacks.
+      // result. Only nest work from that call chain: unrelated SQL may need a lock
+      // held by the suspended caller and prevent its ready reply from being read.
       // The pipe reader still only dispatches; no polling or extra thread.
       worker_wait = [&](PendingRequest &waiting, bool credit, bool draining) {
         auto ready = [&] {
@@ -450,7 +463,8 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
         std::unique_lock<std::mutex> lock(jobs_mutex);
         while (!stopping && !ready()) {
           auto internal = std::find_if(jobs.begin(), jobs.end(), [](const Job &job) {
-            return job.input.type() == 'a' || job.input.type() == 'I';
+            return (job.input.type() == 'a' || job.input.type() == 'I')
+                && worker_call_trace && job.request->call_trace == *worker_call_trace;
           });
           if (internal != jobs.end()) {
             {
@@ -547,6 +561,10 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     }
     auto request = requests.accept(tag);
     if (!request) { ret = OB_INVALID_ARGUMENT; break; }
+    if (input.type() == 'a' || input.type() == 'I') {
+      input.read(request->call_trace);
+      if (input.ret || !request->call_trace.is_valid()) { ret = OB_INVALID_ARGUMENT; break; }
+    }
     if (input.type() == 'P') { complete(request, input.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT); continue; }
     int result = OB_SUCCESS;
     std::shared_ptr<SessionOwner> owner;

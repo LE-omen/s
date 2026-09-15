@@ -942,8 +942,21 @@ int NamespaceForkKernelPrototype::observe_database(ObISQLClient &trans, const Ob
 }
 int NamespaceForkKernelPrototype::check_database_ddl(const ObDatabaseSchema &schema, const ObISQLClient *trans) {
   if (lifetime_mode() && trans && source_drop_trans.load() == trans) { return OB_SUCCESS; }
-  return namespace_mode() && !is_inner_db(schema.get_database_id())
-      && !schema.get_database_name_str().prefix_match("__fork_proto_meta") ? OB_NOT_SUPPORTED : OB_SUCCESS;
+  if (!namespace_mode()) { return OB_SUCCESS; }
+  if (is_encoded_id(schema.get_database_id())) { return OB_NOT_SUPPORTED; }
+  if (is_inner_db(schema.get_database_id())
+      || schema.get_database_name_str().prefix_match("__fork_proto_meta")) { return OB_SUCCESS; }
+  bool ready = false; int ret = namespace_registry_ready(ready);
+  if (ret != OB_SUCCESS || !ready) { return ret; }
+  if (!GCTX.sql_proxy_) { return OB_NOT_INIT; }
+  MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
+  Roots root; Value existing;
+  ret = roots(*GCTX.sql_proxy_, 1, root, false, true);
+  if (ret == OB_ITER_END) { return OB_SUCCESS; }
+  if (ret != OB_SUCCESS) { return ret; }
+  ret = find(*GCTX.sql_proxy_, root.catalog, "@" + key_of(schema.get_database_id()), existing);
+  // Only databases captured in namespace metadata need the prototype's DDL protection.
+  return ret == OB_ENTRY_NOT_EXIST ? OB_SUCCESS : ret == OB_SUCCESS ? OB_NOT_SUPPORTED : ret;
 }
 int NamespaceForkKernelPrototype::control_namespace(const ObString &source, const ObString &target, uint64_t &id) {
   if (!namespace_mode() || !GCTX.sql_proxy_ || target.empty() || target.length() > 128) { return OB_INVALID_ARGUMENT; }

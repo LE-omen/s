@@ -28,6 +28,7 @@
 #include "storage/ddl/ob_ddl_direct_load_utils.h"
 #include "storage/ddl/ob_tablet_slice_writer.h"
 #include "data_plane/scheduler/ob_dag_scheduler.h"
+#include "share/rc/ob_server_runtime.h"
 
 namespace oceanbase
 {
@@ -515,6 +516,15 @@ public:
   }
 
 private:
+  int finish_and_destroy() override
+  {
+    common::ObIAllocator *allocator = allocator_;
+    const int ret = finish();
+    this->~ObDirectInsertSessionImpl();
+    allocator->free(this);
+    return ret;
+  }
+
   int check_running() const
   {
     int ret = common::OB_SUCCESS;
@@ -552,6 +562,9 @@ int ObDirectInsertOrchestrator::start(
 {
   int ret = common::OB_SUCCESS;
   session = nullptr;
+  if (auto *service = share::server_service<IDirectInsertService>()) {
+    return service->start(allocator, param, worker_context, session);
+  }
   ObDirectInsertSessionImpl *impl = nullptr;
   if (OB_UNLIKELY(!param.is_valid())) {
     ret = common::OB_INVALID_ARGUMENT;
@@ -579,13 +592,9 @@ int ObDirectInsertOrchestrator::finish(ObIDirectInsertSession *&session)
 {
   int ret = common::OB_SUCCESS;
   if (nullptr != session) {
-    ObDirectInsertSessionImpl *impl =
-        static_cast<ObDirectInsertSessionImpl *>(session);
-    common::ObIAllocator &allocator = impl->get_allocator();
-    ret = impl->finish();
-    impl->~ObDirectInsertSessionImpl();
-    allocator.free(impl);
+    ObIDirectInsertSession *owned = session;
     session = nullptr;
+    ret = owned->finish_and_destroy();
   }
   return ret;
 }

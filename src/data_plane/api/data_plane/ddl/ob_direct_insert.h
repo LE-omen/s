@@ -302,6 +302,22 @@ public:
 
 protected:
   virtual ~ObIDirectInsertSession() {}
+
+private:
+  virtual int finish_and_destroy() = 0;
+  friend class ObDirectInsertOrchestrator;
+};
+
+// The session and its writers belong to the storage implementation selected by
+// the process composition root. Query code keeps the same lifecycle contract.
+class IDirectInsertService
+{
+public:
+  virtual ~IDirectInsertService() {}
+  virtual int start(common::ObIAllocator &allocator,
+                    const ObDirectInsertStartParam &param,
+                    ObIDirectInsertWorkerContext &worker_context,
+                    ObIDirectInsertSession *&session) = 0;
 };
 
 class ObDirectInsertOrchestrator final

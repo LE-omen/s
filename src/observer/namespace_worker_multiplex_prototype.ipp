@@ -10,13 +10,20 @@
 #include <optional>
 #include "lib/thread/thread_pool.h"
 #include "lib/thread/ob_thread_name.h"
+#include "lib/profile/ob_trace_id.h"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 constexpr size_t MAX_REQUESTS = 32; // ceiling only; slots and frames grow on demand
 struct PendingRequest;
+struct DirectInsertOwner;
 thread_local std::function<void(PendingRequest &, bool, bool)> worker_wait;
+thread_local const common::ObCurTraceId::TraceId *worker_call_trace = nullptr;
 struct PendingRequest {
   RequestTag tag;
+  common::ObCurTraceId::TraceId call_trace;
   sql::ObSQLSessionInfo *sql_session = nullptr; // Worker-local owner; never sent over IPC.
+  // A PX route attaches once to its SQC's active storage session. This weak
+  // reference cannot prolong storage lifetime after all execution owners leave.
+  std::weak_ptr<DirectInsertOwner> direct_insert;
   std::mutex mutex;
   std::condition_variable changed;
   std::optional<Frame> incoming, terminal;

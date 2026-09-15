@@ -20,6 +20,7 @@ int namespace_proto_worker_write(const char *, size_t);
 #include "observer/namespace_worker_scan_prototype.ipp"
 #include "observer/namespace_worker_write_prototype.ipp"
 #include "observer/namespace_worker_range_prototype.ipp"
+#include "observer/namespace_worker_direct_insert_prototype.ipp"
 #include "observer/namespace_worker_commands_prototype.ipp"
 #include "observer/namespace_worker_privileges_prototype.ipp"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
@@ -54,7 +55,7 @@ int admin_set_config(obcall::ObAdminSetConfigArg &arg) {
 bool is_storage_request(char type) {
   return type == 'd' || type == 'b' || type == 't' || type == 'i' || type == 'j' || type == 'k'
       || type == 'u' || type == 'n' || type == 'p'
-      || type == 'O' || type == 'F' || type == 'X' || type == 'M' || type == 'T' || type == 'W' || type == 'G';
+      || type == 'O' || type == 'F' || type == 'X' || type == 'M' || type == 'T' || type == 'W' || type == 'G' || type == 'J';
 }
 // One admitted storage RPC at a time per SQL request. Native request workers
 // execute it; the pipe reader only submits the task. No per-session thread.
@@ -361,10 +362,11 @@ int serve_storage(uint64_t ns, ReadScans *scans, EngineWrites *writes, int state
 // the native transaction/session metadata required by storage, without a second
 // network connection, SQL plan cache, or protocol session in the shared process.
 struct DirectStorageContext {
-  ObArenaAllocator allocator{ObMemAttr("NsStorageSess")};
-  sql::ObSQLSessionInfo session;
+  std::shared_ptr<StorageSessionState> session_state = std::make_shared<StorageSessionState>();
+  sql::ObSQLSessionInfo &session = session_state->session;
   std::unique_ptr<EngineWrites> writes;
   ReadScans scans;
+  DirectInsertRoute direct_insert;
   std::weak_ptr<Channel> channel;
   RequestTag tag;
   uint64_t ns;
@@ -387,7 +389,7 @@ struct DirectStorageContext {
       const uint64_t sid = input.number();
       const uint64_t internal = input.number();
       if (initialized || !input.consumed() || internal > 1 || (!sid && !internal) || sid > UINT32_MAX) { ret = OB_INVALID_ARGUMENT; }
-      else { ret = session.test_init(1, static_cast<uint32_t>(sid), &allocator); }
+      else { ret = session.test_init(1, static_cast<uint32_t>(sid), &session_state->allocator); }
       if (!ret) { ret = session.load_default_sys_variable(false, false); }
       if (!ret) { writes = std::make_unique<EngineWrites>(ns, session); initialized = true; }
       result.number(ret);
@@ -397,11 +399,14 @@ struct DirectStorageContext {
       closing = input.type() == 'v';
       ret = input.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT;
       if (!ret) {
+        direct_insert.reset();
         scans.scans.clear(); session.reset_reserved_snapshot_version();
         if (closing) { writes.reset(); initialized = false; }
         else { ret = writes->check_finished(); }
       }
       result.number(ret);
+    } else if (input.type() == 'J') {
+      ret = direct_insert.process(ns, tag, owner->storage_routes, session_state, input, result);
     } else {
       ret = serve_storage(ns, &scans, writes.get(), OB_SUCCESS, input, result);
     }
@@ -479,6 +484,17 @@ struct Exchange {
     storage = std::make_shared<StorageDispatch>();
     storage->process = [this](Frame &input) { return serve(input); };
     pending->dispatch_storage = [context = storage](Frame input) { return context->submit(std::move(input)); };
+    if (request.type() == 'a' || request.type() == 'I') {
+      // Preserve the initiating call across inner connections and callbacks.
+      // Background callers establish a trace once on their native thread.
+      if (!ObCurTraceId::get_trace_id()->is_valid()) { ObCurTraceId::init(GCTX.self_addr()); }
+      Frame tagged(request.type(), request.limit);
+      tagged.append(*ObCurTraceId::get_trace_id());
+      tagged.data.insert(tagged.data.end(), request.data.begin() + Frame::HEADER_SIZE, request.data.end());
+      if (!tagged.ret) { tagged.ret = request.ret; }
+      if (tagged.data.size() > tagged.limit) { tagged.ret = OB_SIZE_OVERFLOW; }
+      request = std::move(tagged);
+    }
     request.tag(pending->tag); error = channel.send(request);
   }
   ~Exchange() {
@@ -718,7 +734,9 @@ int worker_send(const Frame &frame, bool cleanup) {
     // Request context follows each storage call, across both routing directions.
     // Connection routes survive commands and must not retain old query context.
     output = Frame(frame.type(), frame.limit);
-    output.append(*ObCurTraceId::get_trace_id());
+    // Native inner SQL may create statement traces. Keep the initiating call's
+    // identity on callbacks so cooperative execution cannot select unrelated SQL.
+    output.append(worker_call_trace ? *worker_call_trace : *ObCurTraceId::get_trace_id());
     if (worker_request->tag.slot & WORKER_REQUEST) {
       output.number(THIS_WORKER.get_timeout_ts());
     }

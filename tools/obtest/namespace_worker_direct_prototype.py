@@ -151,9 +151,26 @@ def lifecycle_probe(experiment, port):
         experiment.record("direct_global_variable_greeting_verified")
 
 
+def management_concurrency_probe(experiment, port):
+    def client(index):
+        with connect(port) as connection, connection.cursor() as cursor:
+            for generation in range(2):
+                database = f"concurrent_ddl_{index}_{generation}"
+                cursor.execute(f"CREATE DATABASE {database}")
+                cursor.execute(f"CREATE TABLE {database}.t(id INT PRIMARY KEY, v INT)")
+                cursor.execute(f"INSERT INTO {database}.t VALUES(1,%s)", (index,))
+                cursor.execute(f"SELECT v FROM {database}.t WHERE id=1")
+                assert cursor.fetchone() == (index,)
+                cursor.execute(f"DROP DATABASE {database}")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(client, range(3)))
+    experiment.record("direct_concurrent_management_verified", clients=3, databases=6)
+
+
 def ddl_probe(experiment, port):
     with connect(port) as connection, connection.cursor() as cursor:
         cursor.execute("CREATE DATABASE ddl_check")
+        cursor.execute("ALTER DATABASE ddl_check CHARACTER SET utf8mb4 COLLATE utf8mb4_bin")
         cursor.execute("USE ddl_check")
         cursor.execute("CREATE TABLE records(tenant_id INT, id INT, label VARCHAR(64), amount DECIMAL(12,2), "
                        "created DATE, nullable_value INT NULL, PRIMARY KEY(tenant_id,id))")
@@ -256,7 +273,8 @@ def probe(experiment):
         list(pool.map(client, range(8)))
     protocol_probe(experiment, port)
     failures = []
-    for name, check in [("authentication", authentication_probe), ("lifecycle", lifecycle_probe), ("ddl", ddl_probe)]:
+    for name, check in [("management_concurrency", management_concurrency_probe),
+                        ("authentication", authentication_probe), ("lifecycle", lifecycle_probe), ("ddl", ddl_probe)]:
         try:
             check(experiment, port)
         except Exception as error:

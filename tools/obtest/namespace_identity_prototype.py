@@ -43,6 +43,10 @@ class NamespaceExperiment(KernelExperiment):
             raise AssertionError(("unexpected success", statement))
 
     def run_namespace(self):
+        # An existing registry with no enrolled namespace must allow ordinary DDL.
+        self.sql("CREATE DATABASE unenrolled_db")
+        self.sql("ALTER DATABASE unenrolled_db CHARACTER SET utf8mb4 COLLATE utf8mb4_bin")
+        self.sql("DROP DATABASE unenrolled_db")
         # Enroll an existing database, then create others after namespace registration.
         self.sql("CREATE DATABASE db1")
         self.sql("CREATE TABLE db1.t1(id INT PRIMARY KEY,v INT)")
@@ -133,6 +137,7 @@ class NamespaceExperiment(KernelExperiment):
         self.expect_error("SELECT * FROM " + self.address(999, "db1", "t1"), {1049,1146})
         self.expect_error("FORK DATABASE a TO b", {1062})
         self.expect_error("DROP DATABASE db1", {1235})
+        self.expect_error("ALTER DATABASE db1 CHARACTER SET utf8mb4 COLLATE utf8mb4_bin", {1235})
         self.expect_error("DROP TABLE " + self.address(b, "db1", "t1"), {1235})
 
         roots = {name: self.root(name) for name in ("a", "b", "c")}

@@ -113,10 +113,8 @@ int ObDatabaseSqlService::update_database(const ObDatabaseSchema &database_schem
                                           const ObSchemaOperationType op_type,
                                           const ObString *ddl_stmt_str/*=NULL*/)
 {
-  if (storage::NamespaceForkKernelPrototype::check_database_ddl(database_schema) != OB_SUCCESS) {
-    return OB_NOT_SUPPORTED;
-  }
-  int ret = OB_SUCCESS;
+  int ret = storage::NamespaceForkKernelPrototype::check_database_ddl(database_schema, &sql_client);
+  if (ret != OB_SUCCESS) { return ret; }
   ObSqlString sql_string;
   
   
@@ -185,10 +183,8 @@ int ObDatabaseSqlService::delete_database(const ObDatabaseSchema &db_schema,
                                           common::ObISQLClient &sql_client,
                                           const ObString *ddl_stmt_str/*=NULL*/)
 {
-  if (storage::NamespaceForkKernelPrototype::check_database_ddl(db_schema, &sql_client) != OB_SUCCESS) {
-    return OB_NOT_SUPPORTED;
-  }
-  int ret = OB_SUCCESS;
+  int ret = storage::NamespaceForkKernelPrototype::check_database_ddl(db_schema, &sql_client);
+  if (ret != OB_SUCCESS) { return ret; }
   ObSqlString sql;
   int64_t affected_rows = 0;
   const int64_t IS_DELETED = 1;
