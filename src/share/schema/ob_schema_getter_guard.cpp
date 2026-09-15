@@ -2698,7 +2698,9 @@ int ObSchemaGetterGuard::get_schema(
     const T *&schema,
     int64_t specified_version /*=OB_INVALID_VERSION*/)
 {
-  if (observer::namespace_worker_prototype::worker_namespace == 1) {
+  const bool fork_user_schema = observer::namespace_worker_prototype::worker_namespace > 1
+      && storage::NamespaceForkKernelPrototype::is_encoded_id(schema_id);
+  if (observer::namespace_worker_prototype::worker_namespace == 1 || fork_user_schema) {
     const ObSchema *remote = nullptr;
     int remote_ret = OB_SUCCESS;
     if (schema_type == TABLE_SCHEMA) {
