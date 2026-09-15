@@ -18,9 +18,9 @@ bool owns_table(uint64_t ns, uint64_t id) {
 }
 int storage_schema(uint64_t ns, uint64_t id, ObSchemaGetterGuard &guard, const ObTableSchema *&schema) {
   if (!owns_table(ns, id)) { return OB_INVALID_ARGUMENT; }
-  // User tables are owned by the shared metadata catalog even for namespace 1;
-  // use the remote catalog path so a post-DDL table is visible immediately.
-  if (worker_catalog_fetch || ns != 1) { return NamespaceForkKernelPrototype::schema_by_id(id, schema); }
+  // Namespace 1 is the worker's native catalog. Forked namespaces use the
+  // shared immutable catalog overlay, keyed by encoded table ids.
+  if (ns != 1) { return NamespaceForkKernelPrototype::schema_by_id(id, schema); }
   int ret = ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(guard);
   return ret ? ret : guard.get_table_schema(id, schema);
 }

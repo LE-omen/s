@@ -1129,7 +1129,16 @@ int NamespaceForkKernelPrototype::capture(ObISQLClient &trans, uint64_t source, 
   return ret;
 }
 int NamespaceForkKernelPrototype::schema_by_name(uint64_t db, const ObString &name, const ObTableSchema *&schema) {
-  if (observer::namespace_worker_prototype::worker_catalog_fetch) { return remote_table('t', db, name, schema); }
+  // The source namespace keeps its canonical schema in the worker-local
+  // native schema service. Only forked namespaces consult the immutable
+  // namespace catalog overlay.
+  if (observer::namespace_worker_prototype::worker_catalog_fetch && is_encoded_id(db)) {
+    return remote_table('t', db, name, schema);
+  } else if (observer::namespace_worker_prototype::worker_catalog_fetch && !is_encoded_id(db)) {
+    ObSchemaGetterGuard guard;
+    int ret = GSCHEMASERVICE.get_runtime_schema_guard(guard);
+    return ret ? ret : guard.get_table_schema(db, name, false, schema);
+  }
   schema = nullptr; if (!enabled() || !GCTX.sql_proxy_) { return OB_NOT_INIT; }
   MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
   const uint64_t owner = namespace_mode() ? (is_encoded_id(db) ? database_of(db) : 1) : db;
