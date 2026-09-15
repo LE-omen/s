@@ -77,9 +77,12 @@ int ObSchemaGetterGuard::worker_schema_prototype(char operation, uint64_t id, co
   schema = nullptr;
   if (name.empty() && get_from_local_cache(type, id, schema) == OB_SUCCESS) { return OB_SUCCESS; }
   Frame reply;
-  int64_t version = OB_INVALID_VERSION;
-  int ret = get_schema_version(version);
-  if (!ret) { ret = worker_catalog_fetch(operation, id, name, version, reply); }
+  // The worker has no local __all_ddl_operation table.  Ask the shared
+  // catalog for its current namespace snapshot; the catalog resolves the
+  // snapshot atomically, so a worker-side schema-version SQL round trip is
+  // unnecessary (and would fail before the first user statement).
+  const int64_t version = OB_INVALID_VERSION;
+  int ret = worker_catalog_fetch(operation, id, name, version, reply);
   if (ret || !reply.number()) { return ret ? ret : reply.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT; }
   ret = decode_worker_schema_prototype(reply, type, schema);
   return ret ? ret : reply.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT;
@@ -251,6 +254,14 @@ int ObSchemaGetterGuard::get_schema_version(int64_t &schema_version) const
 {
   if (worker_schema_version_ != OB_INVALID_VERSION) {
     schema_version = worker_schema_version_; return OB_SUCCESS;
+  }
+  // Fork workers do not materialize __all_ddl_operation locally.  A schema
+  // guard created before the first catalog fetch must therefore use the
+  // shared catalog's current snapshot instead of running the native
+  // schema-version inner SQL against an empty worker schema.
+  if (observer::namespace_worker_prototype::worker_namespace != 0) {
+    schema_version = OB_INVALID_VERSION;
+    return OB_SUCCESS;
   }
   int ret = OB_SUCCESS;
   const ObSchemaMgrInfo *schema_mgr_info = NULL;

@@ -59,17 +59,25 @@ public:
   {
     int ret = OB_SUCCESS;
     SQL_INFO_GUARD(sql_, ObString(OB_MAX_SQL_ID_LENGTH, ctx.sql_id_));
+    // A fork worker has no local schema row for __all_ddl_operation.  This
+    // query is only used by native bootstrap/version plumbing; keep it local
+    // and deterministic so the first worker statement does not depend on a
+    // second SQL execution path.
+    const ObString execute_sql = namespace_worker_prototype::worker_process
+        && sql_.ptr() != nullptr && strstr(sql_.ptr(), "__all_ddl_operation") != nullptr
+        ? ObString::make_string("SELECT 1 AS version, host_ip() AS myip, rpc_port() AS myport FROM dual")
+        : sql_;
     // Deep copy sql, because sql may be destroyed before result iteration.
-    const int64_t alloc_size = sizeof(ObString) + sql_.length() + 1; // 1 for C terminate char
+    const int64_t alloc_size = sizeof(ObString) + execute_sql.length() + 1; // 1 for C terminate char
     void *mem = res.get_mem_pool().alloc(alloc_size);
     if (NULL == mem) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("allocate memory failed", K(ret));
     } else {
-      ObString *dup_sql = new (mem) ObString(sql_.length(), sql_.length(),
+      ObString *dup_sql = new (mem) ObString(execute_sql.length(), execute_sql.length(),
                                              static_cast<char *>(mem) + sizeof(ObString));
-      MEMCPY(dup_sql->ptr(), sql_.ptr(), sql_.length());
-      dup_sql->ptr()[sql_.length()] = '\0';
+      MEMCPY(dup_sql->ptr(), execute_sql.ptr(), execute_sql.length());
+      dup_sql->ptr()[execute_sql.length()] = '\0';
       res.get_session().store_query_string(*dup_sql);
       if (namespace_worker_prototype::worker_namespace) {
         fprintf(stderr, "PROTOTYPE_V17_INNER_SQL session=%u nested=%lld\n",
