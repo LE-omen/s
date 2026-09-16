@@ -150,9 +150,18 @@ class WorkerExperiment(LineageExperiment):
                 assert error.args[0] == 1146, error.args
             else:
                 raise AssertionError(table + " remained visible")
+        def assert_lob(handle, marker):
+            with handle.cursor() as cursor:
+                cursor.execute("SELECT payload,text_value FROM inherited_lob WHERE id=1")
+                assert cursor.fetchone() == (marker.encode() * 20000, marker * 20000)
         try:
             connection = self.worker_connect(self.b, read_timeout=20)
+            assert {row[0] for row in self.sql("SHOW DATABASES", connection)} >= {"db1", "db2"}
+            self.sql("USE db2", connection)
+            assert self.sql("SHOW TABLES", connection) == (("t1",),)
+            self.sql("USE db1", connection)
             self.sql("CREATE TABLE created_after_fork(id INT PRIMARY KEY,v INT)", connection)
+            assert ("created_after_fork",) in self.sql("SHOW TABLES", connection)
             self.sql("CREATE TABLE inherited_drop(id INT PRIMARY KEY,v INT)", connection)
             self.sql("INSERT INTO inherited_drop VALUES(1,10)", connection)
             for table in ("cold_drop", "inherited_multi_a", "inherited_multi_b",
@@ -160,6 +169,10 @@ class WorkerExperiment(LineageExperiment):
                 self.sql("CREATE TABLE " + table + "(id INT PRIMARY KEY,v INT)", connection)
             self.sql("INSERT INTO inherited_cow VALUES(1,10)", connection)
             self.sql("INSERT INTO atomic_survivor VALUES(1,10)", connection)
+            self.sql("CREATE TABLE inherited_lob(id INT PRIMARY KEY,payload MEDIUMBLOB,"
+                     "text_value MEDIUMTEXT) LOB_INROW_THRESHOLD=0", connection)
+            self.sql("INSERT INTO inherited_lob VALUES(1,REPEAT('b',20000),REPEAT('b',20000))",
+                     connection)
             self.sql("CREATE TABLE drop_after_fork(id INT PRIMARY KEY,v INT)", connection)
             self.sql("DROP TABLE drop_after_fork", connection)
             self.sql("DROP TABLE IF EXISTS drop_after_fork", connection)
@@ -171,6 +184,15 @@ class WorkerExperiment(LineageExperiment):
             c, _ = self.capture("b", "c")
             child = self.worker_connect(c)
             assert self.sql("SELECT id,v FROM created_after_fork", child) == ((1,10),)
+
+            lob_before = self.physical()
+            assert_lob(child, "b")
+            lob_after = self.physical()
+            assert len(set(lob_after) - set(lob_before)) == 3, (lob_before, lob_after)
+            self.sql("UPDATE inherited_lob SET payload=REPEAT('c',20000),"
+                     "text_value=REPEAT('c',20000) WHERE id=1", child)
+            assert_lob(child, "c")
+            assert_lob(connection, "b")
 
             cold_physical = self.physical()
             self.sql("DROP TABLE cold_drop", child)
@@ -231,6 +253,8 @@ class WorkerExperiment(LineageExperiment):
             child, grandchild = self.worker_connect(c), self.worker_connect(d)
             assert self.sql("SELECT id,v FROM created_after_fork ORDER BY id", child) == ((1,10),(2,20))
             assert self.sql("SELECT id,v FROM created_after_fork", grandchild) == ((1,10),)
+            assert_lob(child, "c")
+            assert_lob(grandchild, "c")
             for handle in (child, grandchild):
                 for table in ("cold_drop", "inherited_multi_a", "inherited_multi_b",
                               "inherited_mixed", "inherited_cow", "inherited_drop"):
@@ -240,6 +264,7 @@ class WorkerExperiment(LineageExperiment):
                         schema_visible_to_worker=True, source_isolated=True,
                         inherited_drop_isolated=True, multi_drop_atomic=True,
                         mixed_drop=True, private_tablet_reclaimed=True,
+                        lob_binding_unit_materialized=True,
                         descendant_inherits_schema=True, descendant_storage_isolated=True,
                         crash_recovery=True)
         finally:

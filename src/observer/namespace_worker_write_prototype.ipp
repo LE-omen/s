@@ -5,6 +5,10 @@
 #include "data_plane/blocksstable/ob_datum_row_iterator.h"
 #include "data_plane/transaction/ob_i_transaction_service.h"
 #include "data_plane/transaction/ob_i_tx_callback.h"
+#include "data_plane/lob/ob_lob_read.h"
+#include "share/lob/ob_lob_text_iter_context.h"
+#include "share/ob_lob_access_utils.h"
+#include "lib/charset/ob_charset.h"
 #include "storage/tx/ob_trans_define_v4.h"
 namespace oceanbase { namespace observer { namespace namespace_worker_prototype {
 using namespace data_plane;
@@ -24,6 +28,39 @@ int write_rpc(Frame &request, Frame &reply) {
   if (!ret && reply.type() != 'w') { ret = OB_INVALID_ARGUMENT; }
   if (!ret) { ret = static_cast<int>(reply.number()); }
   return ret ? ret : reply.ret;
+}
+
+int process_lob_read(Frame &request, Frame &reply, ObTxDesc *tx)
+{
+  const int64_t timeout = request.number();
+  const bool has_lob_header = request.number() != 0;
+  const ObString wire_locator = request.string();
+  int ret = request.ret;
+  ObArenaAllocator allocator(ObMemAttr("NsLobRead"));
+  ObString output;
+  if (!ret && (!request.consumed() || !has_lob_header || wire_locator.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  ObLobLocatorV2 locator(wire_locator, has_lob_header);
+  int64_t length = 0;
+  if (!ret && (!locator.is_valid() || !locator.is_persist_lob())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (!ret && OB_FAIL(locator.get_lob_data_byte_len(length))) {
+  } else if (!ret && (length < 0 || length > static_cast<int64_t>(MAX_SQL_MESSAGE - 64))) {
+    ret = OB_SIZE_OVERFLOW;
+  } else if (!ret && length > 0) {
+    char *buffer = static_cast<char *>(allocator.alloc(length));
+    if (!buffer) { ret = OB_ALLOCATE_MEMORY_FAILED; }
+    else { output.assign_buffer(buffer, static_cast<int32_t>(length)); }
+  }
+  if (!ret) {
+    ret = data_plane::read_lob_to_buffer(
+        allocator, locator, std::min(timeout, THIS_WORKER.get_timeout_ts()), tx, output);
+  }
+  reply = Frame('r');
+  reply.number(ret);
+  if (!ret) { reply.string(output); }
+  return reply.ret;
 }
 
 struct EngineWrite {
@@ -101,27 +138,34 @@ struct EngineWrite {
     if (duplicate_mode != ObDuplicateReturnMode::ALL && duplicate_mode != ObDuplicateReturnMode::ONE) { return OB_INVALID_ARGUMENT; }
     // Decode and validate a bounded batch before entering native storage.
     std::vector<ObObj> cells(count * columns.count());
-    for (auto &cell : cells) {
-      request.read(cell);
+    std::vector<bool> lob_headers(cells.size());
+    for (size_t i = 0; i < cells.size(); ++i) {
+      lob_headers[i] = request.read_object(cells[i]);
       if (request.ret) { return OB_INVALID_ARGUMENT; }
     }
     if (!request.consumed()) { return OB_INVALID_ARGUMENT; }
     class Rows final : public ObDatumRowIterator {
     public:
       std::vector<ObObj> &cells;
+      std::vector<bool> &lob_headers;
       int64_t width;
       size_t position = 0;
       // UPDATE's old row must remain alive while storage obtains its new row.
       ObDatumRow rows[2];
-      Rows(std::vector<ObObj> &values, int64_t columns) : cells(values), width(columns) {}
+      Rows(std::vector<ObObj> &values, std::vector<bool> &headers, int64_t columns)
+          : cells(values), lob_headers(headers), width(columns) {}
       int get_next_row(ObDatumRow *&out) override {
         if (position == cells.size()) { return OB_ITER_END; }
         ObDatumRow &row = rows[(position / width) % 2];
         int ret = OB_SUCCESS;
-        for (int64_t i = 0; !ret && i < width; ++i) { ret = row.storage_datums_[i].from_obj_enhance(cells[position++]); }
+        for (int64_t i = 0; !ret && i < width; ++i) {
+          const size_t index = position++;
+          ret = row.storage_datums_[i].from_obj_enhance(cells[index]);
+          if (!ret && lob_headers[index]) { row.storage_datums_[i].set_has_lob_header(); }
+        }
         row.row_flag_.set_flag(DF_INSERT); out = &row; return ret;
       }
-    } rows(cells, columns.count());
+    } rows(cells, lob_headers, columns.count());
     int ret = rows.rows[0].init(columns.count());
     if (!ret) { ret = rows.rows[1].init(columns.count()); }
     auto *service = share::server_service<ObIDmlService>();
@@ -146,7 +190,10 @@ struct EngineWrite {
               if (descriptors.at(j).col_id_ == updated_columns.at(i)) { column = &descriptors.at(j); }
             }
             ret = column ? row->storage_datums_[i].to_obj_enhance(cell, column->col_type_) : OB_INVALID_ARGUMENT;
-            if (!ret) { values.append(cell); ret = values.ret; }
+            if (!ret) {
+              values.write_object(cell, row->storage_datums_[i].has_lob_header());
+              ret = values.ret;
+            }
           }
           ++count;
         }
@@ -283,7 +330,23 @@ struct EngineWrites {
         values.append(result);
       } else { ret = OB_NOT_SUPPORTED; }
     } else if (!ret && request.type() == 'W') {
-      if (operation == 'P') {
+      if (operation == 'Q') {
+        const int64_t timeout = request.number();
+        const bool left_header = request.number() != 0;
+        const bool right_header = request.number() != 0;
+        const ObString left_data = request.string();
+        const ObString right_data = request.string();
+        if (request.ret || !request.consumed()) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          ObLobLocatorV2 left(left_data, left_header);
+          ObLobLocatorV2 right(right_data, right_header);
+          bool equal = false;
+          ret = share::server_service<ObIDmlService>()->lob_binary_equal(
+              left, right, std::min(timeout, THIS_WORKER.get_timeout_ts()), *tx, equal);
+          if (!ret) { values.number(equal); }
+        }
+      } else if (operation == 'P') {
         if (writes.size() >= 32) { ret = OB_SIZE_OVERFLOW; }
         auto prepared = std::make_unique<EngineWrite>();
         if (!ret) { ret = prepared->prepare(ns, *tx, request); }
@@ -513,8 +576,10 @@ public:
     Frame &batch = batches[current];
     int ret = row.is_valid() ? OB_SUCCESS : row.init(width);
     for (int64_t i = 0; !ret && i < width; ++i) {
-      ObObj value; batch.read(value);
+      ObObj value;
+      const bool has_lob_header = batch.read_object(value);
       ret = batch.ret ? batch.ret : row.storage_datums_[i].from_obj_enhance(value);
+      if (!ret && has_lob_header) { row.storage_datums_[i].set_has_lob_header(); }
     }
     if (!--remaining) {
       if (!batch.consumed()) { ret = OB_INVALID_ARGUMENT; }
@@ -523,8 +588,201 @@ public:
     out = &row; return ret;
   }
 };
+
+class CompletedLobReadCursor final : public common::ObILobReadCursor {
+public:
+  int get_next_row(ObString &) override { return OB_ITER_END; }
+  void reset() override {}
+};
+
+class RemoteLobReadService final : public common::ObILobReadService {
+public:
+  void set_local(common::ObILobReadService *service) { local_ = service; }
+
+  int get_outrow_lob_full_data(
+      common::ObLobTextIterCtx &ctx,
+      common::ObCollationType cs_type,
+      bool has_lob_header,
+      bool is_outrow,
+      common::ObIAllocator *tmp_alloc) override {
+    return use_remote(ctx.locator_)
+        ? (!has_lob_header || !is_outrow ? OB_INVALID_ARGUMENT : materialize(ctx, ctx.locator_))
+        : local_ ? local_->get_outrow_lob_full_data(
+              ctx, cs_type, has_lob_header, is_outrow, tmp_alloc) : OB_NOT_INIT;
+  }
+
+  int get_delta_lob_full_data(
+      common::ObLobTextIterCtx &ctx,
+      common::ObObjType type,
+      common::ObCollationType cs_type,
+      common::ObLobLocatorV2 &locator,
+      common::ObIAllocator *allocator,
+      common::ObString &data) override {
+    return local_ ? local_->get_delta_lob_full_data(
+        ctx, type, cs_type, locator, allocator, data) : OB_NOT_INIT;
+  }
+
+  int get_outrow_prefix_data(
+      common::ObLobTextIterCtx &ctx,
+      common::ObCollationType cs_type,
+      bool has_lob_header,
+      bool is_outrow,
+      common::ObIAllocator *tmp_alloc,
+      uint32_t prefix_char_len) override {
+    if (!use_remote(ctx.locator_)) {
+      return local_ ? local_->get_outrow_prefix_data(
+          ctx, cs_type, has_lob_header, is_outrow, tmp_alloc, prefix_char_len) : OB_NOT_INIT;
+    }
+    int ret = !has_lob_header || !is_outrow ? OB_INVALID_ARGUMENT : materialize(ctx, ctx.locator_);
+    if (!ret && ctx.content_byte_len_ > 0) {
+      const int64_t chars = common::ObCharset::strlen_char(cs_type, ctx.buff_, ctx.content_byte_len_);
+      const int64_t wanted = std::min<int64_t>(chars, prefix_char_len);
+      ctx.content_byte_len_ = static_cast<uint32_t>(
+          common::ObCharset::charpos(cs_type, ctx.buff_, ctx.content_byte_len_, wanted));
+    }
+    return ret;
+  }
+
+  int get_first_block(
+      common::ObLobTextIterCtx &ctx,
+      common::ObCollationType cs_type,
+      bool has_lob_header,
+      bool is_outrow,
+      common::ObIAllocator *tmp_alloc,
+      common::ObString &str,
+      common::ObTextStringIterState &state) override {
+    if (!use_remote(ctx.locator_)) {
+      return local_ ? local_->get_first_block(
+          ctx, cs_type, has_lob_header, is_outrow, tmp_alloc, str, state) : OB_NOT_INIT;
+    }
+    int ret = !has_lob_header || !is_outrow ? OB_INVALID_ARGUMENT : materialize(ctx, ctx.locator_);
+    if (!ret) {
+      free_lob_query_iter(ctx);
+      str.assign_ptr(ctx.buff_, ctx.content_byte_len_);
+      ctx.content_len_ = static_cast<uint32_t>(
+          common::ObCharset::strlen_char(cs_type, ctx.buff_, ctx.content_byte_len_));
+      ctx.accessed_byte_len_ = ctx.content_byte_len_;
+      ctx.accessed_len_ = ctx.content_len_;
+      ++ctx.iter_count_;
+      if (ctx.content_byte_len_ == 0) {
+        state = common::TEXTSTRING_ITER_END;
+      } else if (OB_ISNULL(ctx.read_cursor_ = new (std::nothrow) CompletedLobReadCursor())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        state = common::TEXTSTRING_ITER_NEXT;
+      }
+    }
+    return ret;
+  }
+
+  int get_next_block_inner(
+      common::ObLobTextIterCtx &ctx,
+      common::ObCollationType cs_type,
+      bool has_lob_header,
+      bool is_outrow,
+      common::ObString &str,
+      common::ObTextStringIterState &state) override {
+    if (!use_remote(ctx.locator_)) {
+      return local_ ? local_->get_next_block_inner(
+          ctx, cs_type, has_lob_header, is_outrow, str, state) : OB_NOT_INIT;
+    }
+    if (!has_lob_header || !is_outrow || !ctx.read_cursor_) { return OB_INVALID_ARGUMENT; }
+    free_lob_query_iter(ctx);
+    str.reset();
+    state = common::TEXTSTRING_ITER_END;
+    return OB_SUCCESS;
+  }
+
+  int get_outrow_char_len(
+      common::ObLobTextIterCtx &ctx,
+      common::ObCollationType cs_type,
+      common::ObIAllocator *tmp_alloc,
+      int64_t &char_length) override {
+    if (!use_remote(ctx.locator_)) {
+      return local_ ? local_->get_outrow_char_len(ctx, cs_type, tmp_alloc, char_length) : OB_NOT_INIT;
+    }
+    int ret = materialize(ctx, ctx.locator_);
+    if (!ret) {
+      char_length = common::ObCharset::strlen_char(cs_type, ctx.buff_, ctx.content_byte_len_);
+    }
+    return ret;
+  }
+
+  void free_lob_query_iter(common::ObLobTextIterCtx &ctx) override {
+    if (dynamic_cast<CompletedLobReadCursor *>(ctx.read_cursor_)) {
+      delete static_cast<CompletedLobReadCursor *>(ctx.read_cursor_);
+      ctx.read_cursor_ = nullptr;
+    } else if (local_) { local_->free_lob_query_iter(ctx); }
+  }
+
+private:
+  bool use_remote(common::ObLobLocatorV2 &locator) const {
+    common::ObMemLobExternHeader *header = nullptr;
+    if (locator.get_extern_header(header) != OB_SUCCESS || !header) { return false; }
+    const uint64_t table_id = NamespaceForkKernelPrototype::is_encoded_id(header->table_id_)
+        ? (header->table_id_ & UINT32_MAX) : header->table_id_;
+    return !is_inner_table(table_id);
+  }
+
+  int materialize(common::ObLobTextIterCtx &ctx, common::ObLobLocatorV2 &locator) {
+    if (!ctx.alloc_ || !locator.has_lob_header()) { return OB_INVALID_ARGUMENT; }
+    auto *session = THIS_WORKER.get_session();
+    StorageSessionScope scope(session);
+    if (scope.error()) { return scope.error(); }
+    const int64_t timeout = ctx.timeout_ts_ > 0 ? ctx.timeout_ts_ : THIS_WORKER.get_timeout_ts();
+    Frame request('h'), reply;
+    request.number(timeout);
+    request.number(locator.has_lob_header());
+    request.string(ObString(locator.size_, locator.ptr_));
+    int ret = request.ret ? request.ret : worker_send(request);
+    if (!ret) { ret = worker_read(reply); }
+    if (!ret && reply.type() != 'r') { ret = OB_INVALID_ARGUMENT; }
+    if (!ret) { ret = static_cast<int>(reply.number()); }
+    ObString data;
+    if (!ret) { data = reply.string(); }
+    if (!ret && (!reply.consumed() || data.length() > UINT32_MAX)) { ret = OB_INVALID_ARGUMENT; }
+    if (!ret) {
+      char *buffer = data.empty() ? nullptr : static_cast<char *>(ctx.alloc_->alloc(data.length()));
+      if (!data.empty() && !buffer) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        if (!data.empty()) { MEMCPY(buffer, data.ptr(), data.length()); }
+        ctx.buff_ = buffer;
+        ctx.buff_byte_len_ = static_cast<uint32_t>(data.length());
+        ctx.content_byte_len_ = static_cast<uint32_t>(data.length());
+        ctx.total_byte_len_ = data.length();
+      }
+    }
+    return ret ? ret : reply.ret;
+  }
+
+  common::ObILobReadService *local_ = nullptr;
+};
+
 class RemoteDmlService final : public ObIDmlService {
 public:
+  int lob_binary_equal(
+      ObLobLocatorV2 &left,
+      ObLobLocatorV2 &right,
+      int64_t timeout,
+      ObTxDesc &tx,
+      bool &equal) override {
+    auto *session = THIS_WORKER.get_session();
+    StorageSessionScope scope(session && session->get_tx_desc() == &tx ? session : nullptr);
+    if (scope.error()) { return scope.error(); }
+    Frame request('W'), reply;
+    request.number('Q'); request.number(tx.get_tx_id().get_id()); request.number(timeout);
+    request.number(left.has_lob_header()); request.number(right.has_lob_header());
+    request.string(ObString(left.size_, left.ptr_));
+    request.string(ObString(right.size_, right.ptr_));
+    int ret = request.ret ? request.ret : write_rpc(request, reply);
+    if (!ret) {
+      equal = reply.number() != 0;
+      if (!reply.consumed()) { ret = OB_INVALID_ARGUMENT; }
+    }
+    return ret;
+  }
+
   int prepare_execution(
       const ObDmlWriteSpec &write_spec,
       const ObDmlTablePlan &table_plan,
@@ -634,7 +892,10 @@ public:
         for (int64_t i = 0; !ret && i < width; ++i) {
           ObObj value;
           ret = row->storage_datums_[i].to_obj_enhance(value, state->types[i]);
-          if (!ret) { cells.append(value); ret = cells.ret; }
+          if (!ret) {
+            cells.write_object(value, row->storage_datums_[i].has_lob_header());
+            ret = cells.ret;
+          }
         }
         if (!ret) { ++rows; }
       }

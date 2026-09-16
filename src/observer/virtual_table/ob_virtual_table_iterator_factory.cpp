@@ -234,6 +234,11 @@ ObVirtualTableIteratorFactory::~ObVirtualTableIteratorFactory()
 {
 }
 
+ObMultiVersionSchemaService &ObVTIterCreator::get_schema_service()
+{
+  return NULL == schema_service_ ? local_management_service_.get_schema_service() : *schema_service_;
+}
+
 int ObVirtualTableIteratorFactory::create_virtual_table_iterator(ObVTableScanParam &params,
                                                                  ObVirtualTableIterator *&vt_iter)
 {
@@ -267,6 +272,7 @@ int ObVirtualTableIteratorFactory::check_can_create_iter(common::ObVTableScanPar
 int ObVTIterCreator::get_latest_expected_schema(
     const uint64_t table_id,
     const int64_t table_version,
+    const int64_t runtime_schema_version,
     ObSchemaGetterGuard &schema_guard,
     const ObTableSchema *&t_schema)
 {
@@ -274,7 +280,8 @@ int ObVTIterCreator::get_latest_expected_schema(
   if (OB_UNLIKELY(table_version < 0)) {
     ret = OB_INVALID_ARGUMENT;
     SERVER_LOG(WARN, "invalid schema version", K(table_version), K(ret));
-  } else if (OB_FAIL(local_management_service_.get_schema_service().get_runtime_schema_guard(schema_guard))) {
+  } else if (OB_FAIL(get_schema_service().get_runtime_schema_guard(
+      schema_guard, runtime_schema_version))) {
   } else if (OB_FAIL(schema_guard.get_table_schema( table_id, t_schema))) {
   } else if(NULL == t_schema
             || OB_UNLIKELY(table_version != t_schema->get_schema_version())) {
@@ -332,6 +339,7 @@ int ObVTIterCreator::create_vt_iter(ObVTableScanParam &params,
      SERVER_LOG(WARN, "invalid index_id", K(index_id), K(ret));
   } else if (OB_FAIL(get_latest_expected_schema(index_id,
                                                 params.schema_version_,
+                                                params.runtime_schema_version_,
                                                 schema_guard,
                                                 index_schema))) {
   } else {
@@ -1255,8 +1263,7 @@ int ObVTIterCreator::create_vt_iter(ObVTableScanParam &params,
           }
           case OB_ALL_VIRTUAL_SERVER_SCHEMA_INFO_TID: {
             ObAllVirtualServerSchemaInfo *server_schema_info = NULL;
-            share::schema::ObMultiVersionSchemaService &schema_service =
-                                                          local_management_service_.get_schema_service();
+            share::schema::ObMultiVersionSchemaService &schema_service = get_schema_service();
             if (OB_FAIL(NEW_VIRTUAL_TABLE(ObAllVirtualServerSchemaInfo,
                                           server_schema_info, schema_service))) {
             } else {
@@ -1266,8 +1273,7 @@ int ObVTIterCreator::create_vt_iter(ObVTableScanParam &params,
           }
           case OB_ALL_VIRTUAL_SCHEMA_MEMORY_TID: {
             ObAllVirtualSchemaMemory *schema_memory = NULL;
-            share::schema::ObMultiVersionSchemaService &schema_service =
-                                                          local_management_service_.get_schema_service();
+            share::schema::ObMultiVersionSchemaService &schema_service = get_schema_service();
             if (OB_FAIL(NEW_VIRTUAL_TABLE(ObAllVirtualSchemaMemory,
                                           schema_memory, schema_service))) {
             } else {
@@ -1277,8 +1283,7 @@ int ObVTIterCreator::create_vt_iter(ObVTableScanParam &params,
           }
           case OB_ALL_VIRTUAL_SCHEMA_SLOT_TID: {
             ObAllVirtualSchemaSlot *schema_slot = NULL;
-            share::schema::ObMultiVersionSchemaService &schema_service =
-                                                          local_management_service_.get_schema_service();
+            share::schema::ObMultiVersionSchemaService &schema_service = get_schema_service();
             if (OB_FAIL(NEW_VIRTUAL_TABLE(ObAllVirtualSchemaSlot,
                                           schema_slot, schema_service))) {
             } else {
@@ -1762,6 +1767,7 @@ int ObVTIterCreator::check_can_create_iter(ObVTableScanParam &params)
      SERVER_LOG(WARN, "invalid index_id", K(index_id), K(ret));
   } else if (OB_FAIL(get_latest_expected_schema(index_id,
                                                 params.schema_version_,
+                                                params.runtime_schema_version_,
                                                 schema_guard,
                                                 index_schema))) {
   } else {

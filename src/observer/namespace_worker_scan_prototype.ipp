@@ -50,19 +50,34 @@ struct EngineScan {
     }
   }
   int open(uint64_t ns, Frame &request, transaction::ObTxDesc *tx, sql::ObSQLSessionInfo *session) {
-    const uint64_t table_id = request.number(), tablet_id = request.number();
+    const uint64_t logical_table_id = request.number(), logical_tablet_id = request.number();
     param.scan_flag_.flag_ = request.number();
     const bool get = request.number() != 0;
     param.limit_param_.limit_ = static_cast<int64_t>(request.number());
     param.limit_param_.offset_ = static_cast<int64_t>(request.number());
     const uint64_t count = request.number();
     fprintf(stderr, "PROTOTYPE_V17_SCAN_REQUEST ns=%llu table=%llu tablet=%llu columns=%llu\n",
-        (unsigned long long)ns, (unsigned long long)table_id, (unsigned long long)tablet_id, (unsigned long long)count);
-    if (request.ret || count > OB_MAX_COLUMN_NUMBER || !owns_table(ns, table_id)) { return OB_NOT_SUPPORTED; }
+        (unsigned long long)ns, (unsigned long long)logical_table_id,
+        (unsigned long long)logical_tablet_id, (unsigned long long)count);
+    if (request.ret || count > OB_MAX_COLUMN_NUMBER || !owns_table(ns, logical_table_id)) { return OB_NOT_SUPPORTED; }
     int ret = OB_SUCCESS;
-    ret = storage_schema(ns, table_id, guard, schema);
+    ret = storage_schema(ns, logical_table_id, guard, schema);
     if (ret) { return ret; }
-    if (!schema || (!is_virtual_table(table_id) && schema->get_tablet_id().id() != tablet_id)) { return OB_INVALID_ARGUMENT; }
+    if (!schema || (!is_virtual_table(logical_table_id)
+        && schema->get_tablet_id().id() != logical_tablet_id)) { return OB_INVALID_ARGUMENT; }
+    uint64_t table_id = logical_table_id;
+    uint64_t tablet_id = logical_tablet_id;
+    if (ns != 1 && schema->is_sys_table()) {
+      const NamespaceObjectKey table_key{ns, logical_table_id};
+      const NamespaceObjectKey tablet_key{ns, logical_tablet_id};
+      if (!table_key.is_valid() || !tablet_key.is_valid()) { return OB_SIZE_OVERFLOW; }
+      tablet_id = tablet_key.storage_id();
+      ret = NamespaceForkKernelPrototype::schema_by_id(table_key.storage_id(), schema);
+      if (ret || !schema || schema->get_table_id() != logical_table_id
+          || schema->get_tablet_id().id() != tablet_id) {
+        return ret ? ret : OB_STATE_NOT_MATCH;
+      }
+    }
     for (uint64_t i = 0; !ret && i < count; ++i) {
       const uint64_t column = request.number();
       if (!schema->get_column_schema(column)) { ret = OB_NOT_SUPPORTED; }
@@ -84,7 +99,7 @@ struct EngineScan {
       range.end_key_.assign(&keys[i * width * 2 + width], width);
       if (!ret) { ret = param.key_ranges_.push_back(range); }
     }
-    if (is_virtual_table(table_id)) {
+    if (is_virtual_table(logical_table_id)) {
       param.sql_mode_ = request.number();
       if (ret || !request.consumed() || !session || ns != 1) { return ret ? ret : OB_INVALID_ARGUMENT; }
       virtual_context = std::make_unique<VirtualContext>(allocator, *session);
@@ -119,6 +134,7 @@ struct EngineScan {
     param.is_get_ = get;
     param.allocator_ = &allocator; param.scan_allocator_ = &allocator;
     param.reserved_cell_count_ = count;
+    table.get_enable_lob_locator_v2() = !is_inner_table(logical_table_id) && schema->is_user_table();
     ret = table.convert(*schema, param.column_ids_, sql::ObStoragePushdownFlag());
     param.table_param_ = &table;
     if (!ret) { ret = share::server_service<ObITabletScan>()->table_scan(param, iter); }
@@ -137,7 +153,7 @@ struct EngineScan {
         if (ret == OB_ITER_END) { ret = OB_SUCCESS; end = true; break; }
         if (ret) { break; }
         if (!row || row->get_count() != param.column_ids_.count()) { ret = OB_ERR_UNEXPECTED; break; }
-        for (int64_t i = 0; i < row->get_count(); ++i) { rows.append(row->get_cell(i)); }
+        for (int64_t i = 0; i < row->get_count(); ++i) { rows.write_object(row->get_cell(i), false); }
         if ((ret = rows.ret)) { break; }
         continue;
       }
@@ -158,7 +174,11 @@ struct EngineScan {
           // Native descriptors include decimal precision/scale and LOB flags.
           ret = row->storage_datums_[i].to_obj_enhance(value, descriptors.at(index).col_type_);
         }
-        if (!ret) { rows.append(value); }
+        if (!ret) {
+          const bool has_lob_header = table.enable_lob_locator_v2() && value.is_lob_storage()
+              && !value.is_null() && value.has_lob_header();
+          rows.write_object(value, has_lob_header);
+        }
       }
       if (ret) { break; }
       if (rows.ret) { ret = rows.ret; break; }
@@ -258,9 +278,7 @@ public:
       end = reply.number() != 0; const uint64_t rows = reply.number();
       if (reply.ret || rows > 32 || (!rows && !end)) { return OB_INVALID_ARGUMENT; }
       cells.resize(rows * columns); row_index = 0; rows_left = rows;
-      for (auto &cell : cells) {
-        reply.read(cell);
-      }
+      for (auto &cell : cells) { reply.read_object(cell); }
       if (!reply.consumed()) { return OB_INVALID_ARGUMENT; }
       if (!rows) { return OB_ITER_END; }
     }
@@ -284,7 +302,11 @@ public:
       param.op_->clear_datum_eval_flag();
       for (int64_t i = 0; !ret && i < row->count_; ++i) {
         sql::ObExpr *expr = param.output_exprs_->at(i);
-        ret = expr->locate_datum_for_write(ctx).from_obj(row->cells_[i], expr->obj_datum_map_);
+        ObDatum &datum = expr->locate_datum_for_write(ctx);
+        ret = datum.from_obj(row->cells_[i], expr->obj_datum_map_);
+        if (!ret && row->cells_[i].has_lob_header()) {
+          datum.set_has_lob_header();
+        }
         expr->set_evaluated_projected(ctx);
         expr->set_evaluated_flag(ctx);
       }

@@ -156,6 +156,12 @@ public:
       const data_plane::ObWriteContext &write_context,
       const concurrent_control::ObWriteFlag &write_flag,
       data_plane::ObDmlExecution &execution) override;
+  int lob_binary_equal(
+      common::ObLobLocatorV2 &left,
+      common::ObLobLocatorV2 &right,
+      int64_t timeout_ts,
+      transaction::ObTxDesc &tx_desc,
+      bool &is_equal) override;
   int delete_rows(
       const common::ObTabletID &tablet_id,
       transaction::ObTxDesc &tx_desc,

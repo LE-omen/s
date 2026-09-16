@@ -120,6 +120,12 @@ friend class MockSchemaService;
 const static int DEFAULT_RESERVE_SIZE = 2;
 typedef common::ObSEArray<SchemaObj, DEFAULT_RESERVE_SIZE> SchemaObjs;
 typedef common::ObSEArray<ObSchemaMgrInfo, DEFAULT_RESERVE_SIZE> SchemaMgrInfos;
+struct WorkerOwnedSchema {
+  explicit WorkerOwnedSchema(ObSchema *schema = nullptr) : schema_(schema) {}
+  TO_STRING_KV(KP_(schema));
+  ObSchema *schema_;
+};
+typedef common::ObSEArray<WorkerOwnedSchema, DEFAULT_RESERVE_SIZE> WorkerOwnedSchemas;
 
 public:
 
@@ -701,6 +707,9 @@ private:
   template<typename T>
   int decode_worker_schema_prototype(observer::namespace_worker_prototype::Frame &reply,
                                       ObSchemaType type, const T *&schema);
+  int worker_table_schemas_prototype(
+      uint64_t database_id,
+      common::ObIArray<const ObTableSchema *> &table_schemas);
   void release_worker_schemas_prototype();
   template<typename T>
   int put_to_local_cache(
@@ -751,6 +760,7 @@ private:
   SchemaMgrInfos schema_mgr_infos_;
   // for new lazy logic
   SchemaObjs schema_objs_;
+  WorkerOwnedSchemas worker_owned_schemas_;
 
   ObSchemaMgrItem::Mod mod_;
   SchemaGuardType schema_guard_type_;

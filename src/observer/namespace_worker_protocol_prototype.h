@@ -3,6 +3,7 @@
 #define SEEKDB_NAMESPACE_WORKER_PROTOCOL_PROTOTYPE_H_
 #include "lib/ob_errno.h"
 #include "lib/string/ob_string.h"
+#include "common/object/ob_object.h"
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -63,6 +64,19 @@ struct Frame {
   }
   template<class T> void read(T &value) {
     if (!ret) { ret = value.deserialize(data.data(), data.size(), pos); }
+  }
+  void write_object(const common::ObObj &value, const bool has_lob_header) {
+    append(value);
+    number(has_lob_header);
+  }
+  void write_object(const common::ObObj &value) {
+    write_object(value, value.has_lob_header());
+  }
+  bool read_object(common::ObObj &value) {
+    read(value);
+    const bool has_lob_header = !ret && number() != 0;
+    if (!ret && has_lob_header) { value.set_has_lob_header(); }
+    return !ret && has_lob_header;
   }
   bool consumed() const { return !ret && pos == static_cast<int64_t>(data.size()); }
 };

@@ -53,9 +53,10 @@ int admin_set_config(obcall::ObAdminSetConfigArg &arg) {
   return ret;
 }
 bool is_storage_request(char type) {
-  return type == 'd' || type == 'b' || type == 't' || type == 'i' || type == 'j' || type == 'k'
+  return type == 'd' || type == 'b' || type == 't' || type == 'i' || type == 'j' || type == 'k' || type == 'l'
       || type == 'u' || type == 'n' || type == 'p'
-      || type == 'O' || type == 'F' || type == 'X' || type == 'M' || type == 'T' || type == 'W' || type == 'G' || type == 'J';
+      || type == 'O' || type == 'F' || type == 'X' || type == 'M' || type == 'T' || type == 'W' || type == 'G' || type == 'J'
+      || type == 'h';
 }
 // One admitted storage RPC at a time per SQL request. Native request workers
 // execute it; the pipe reader only submits the task. No per-session thread.
@@ -212,7 +213,6 @@ int attach(uint64_t ns, std::shared_ptr<Child> &child) {
   std::lock_guard<std::mutex> guard(children_mutex);
   auto it = children.find(ns);
   if (it == children.end()) {
-    if (children.size() >= 2) { return OB_SIZE_OVERFLOW; }
     it = children.emplace(ns, std::make_shared<Child>()).first;
   }
   child = it->second; return OB_SUCCESS;
@@ -304,6 +304,7 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   const ObUserInfo *user = nullptr;
   const ObSysVariableSchema *variables = nullptr;
   const uint64_t owner = (id & ~(1ULL << 62)) >> 32;
+  int64_t namespace_schema_version = OB_INVALID_VERSION;
   ObSchemaGetterGuard guard;
   if (ns == 1 && request.consumed() && (request.type() == 'd' || owns_table(ns, id))) {
     ret = catalog_schema_guard(snapshot_version, guard);
@@ -324,6 +325,10 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
     }
   } else if (!request.consumed() || (request.type() == 'd' ? id != ns : owner != ns)) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (snapshot_version != OB_INVALID_VERSION
+      && OB_FAIL(NamespaceForkKernelPrototype::namespace_schema_version(ns, namespace_schema_version))) {
+  } else if (snapshot_version != OB_INVALID_VERSION && namespace_schema_version != snapshot_version) {
+    ret = OB_SCHEMA_EAGAIN;
   } else if (request.type() == 'd') {
     ret = NamespaceForkKernelPrototype::database_in_namespace(ns, name, database);
   } else if (request.type() == 'b') {
@@ -332,6 +337,17 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
     ret = NamespaceForkKernelPrototype::schema_by_name(id, name, table);
   } else if (request.type() == 'i') {
     ret = NamespaceForkKernelPrototype::schema_by_id(id, table);
+  } else if (request.type() == 'l') {
+    ObArray<const ObTableSchema *> tables;
+    ret = name.empty() ? NamespaceForkKernelPrototype::list_schemas(id, tables) : OB_INVALID_ARGUMENT;
+    int64_t current_version = OB_INVALID_VERSION;
+    if (!ret && snapshot_version != OB_INVALID_VERSION) {
+      ret = NamespaceForkKernelPrototype::namespace_schema_version(ns, current_version);
+      if (!ret && current_version != snapshot_version) { ret = OB_SCHEMA_EAGAIN; }
+    }
+    reply = Frame('c'); reply.number(ret); reply.number(ret ? 0 : tables.count());
+    for (int64_t i = 0; !ret && i < tables.count(); ++i) { reply.append(*tables.at(i)); }
+    return reply.ret;
   } else { ret = OB_NOT_SUPPORTED; }
   reply = Frame('c'); reply.number(ret); reply.number(database || table || user || variables ? 1 : 0);
   if (!ret && database) { reply.append(*database); }
@@ -342,11 +358,15 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
 }
 int serve_storage(uint64_t ns, ReadScans *scans, EngineWrites *writes, int state, Frame &input, Frame &result) {
     int ret = OB_SUCCESS;
-    if (input.type() == 'd' || input.type() == 'b' || input.type() == 't' || input.type() == 'i' || input.type() == 'j' || input.type() == 'k'
+    if (input.type() == 'd' || input.type() == 'b' || input.type() == 't' || input.type() == 'i' || input.type() == 'j' || input.type() == 'k' || input.type() == 'l'
         || input.type() == 'u' || input.type() == 'n' || input.type() == 'p') {
       result = Frame('c');
       if (state) { result.number(state); }
       else { ret = catalog(ns, input, result); }
+    } else if (input.type() == 'h') {
+      result = Frame('r');
+      if (state) { result.number(state); }
+      else { ret = process_lob_read(input, result, writes ? writes->tx : nullptr); }
     } else if (input.type() == 'G') {
       result = Frame('g');
       if (state) { result.number(state); }
@@ -580,7 +600,9 @@ int exchange(Channel &channel, uint64_t ns, Frame request, ReadScans *scans,
       return pump.cancelled ? pump.cancelled.load() : query_ret ? query_ret : transaction_ret;
     }
     if ((ret = response(reply))) {
-      if (!pump.query || channel.closed || pump.cancel(ret)) { channel.fail(); return ret; }
+      if (!pump.query || channel.closed || pump.cancel(ret)) {
+        channel.fail(); return ret;
+      }
     }
   }
   return ret;
@@ -617,7 +639,9 @@ int open_session(uint64_t ns, sql::ObSQLSessionInfo &gateway, SessionBinding *&b
         channel->fail(); return OB_CONNECT_ERROR;
       }
       const uint64_t client_port = ready.consumed() ? 0 : ready.number();
-      if (!ready.consumed() || client_port > UINT16_MAX) { channel->fail(); return OB_INVALID_ARGUMENT; }
+      if (!ready.consumed() || client_port > UINT16_MAX) {
+        channel->fail(); return OB_INVALID_ARGUMENT;
+      }
       channel->client_port = static_cast<uint32_t>(client_port);
       if (namespace_proto_dispatch(channel->handle, Channel::receive_frame, channel.get())) {
         channel->fail(); return OB_CONNECT_ERROR;

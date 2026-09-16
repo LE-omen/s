@@ -26,6 +26,7 @@
 #include "storage/ob_query_iterator_factory.h"
 #include "storage/access/ob_table_scan_iterator.h"
 #include "storage/access/ob_dml_table_plan_access.h"
+#include "data_plane/lob/ob_lob_read.h"
 #include "storage/retrieval/ob_block_stat_iter.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tx_storage/ob_memstore_freezer.h"
@@ -37,6 +38,16 @@ using namespace common;
 using namespace share;
 namespace storage
 {
+
+int ObAccessService::lob_binary_equal(
+    common::ObLobLocatorV2 &left,
+    common::ObLobLocatorV2 &right,
+    int64_t timeout_ts,
+    transaction::ObTxDesc &tx_desc,
+    bool &is_equal)
+{
+  return data_plane::lob_binary_equal(left, right, timeout_ts, &tx_desc, is_equal);
+}
 
 namespace
 {

@@ -77,12 +77,12 @@ int ObSchemaGetterGuard::worker_schema_prototype(char operation, uint64_t id, co
   schema = nullptr;
   if (name.empty() && get_from_local_cache(type, id, schema) == OB_SUCCESS) { return OB_SUCCESS; }
   Frame reply;
-  // The worker has no local __all_ddl_operation table.  Ask the shared
-  // catalog for its current namespace snapshot; the catalog resolves the
-  // snapshot atomically, so a worker-side schema-version SQL round trip is
-  // unnecessary (and would fail before the first user statement).
-  const int64_t version = OB_INVALID_VERSION;
-  int ret = worker_catalog_fetch(operation, id, name, version, reply);
+  int64_t version = OB_INVALID_VERSION;
+  int ret = get_schema_version(version);
+  if (ret != OB_SUCCESS || version == OB_INVALID_VERSION) {
+    return ret != OB_SUCCESS ? ret : OB_SCHEMA_EAGAIN;
+  }
+  ret = worker_catalog_fetch(operation, id, name, version, reply);
   if (ret || !reply.number()) { return ret ? ret : reply.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT; }
   ret = decode_worker_schema_prototype(reply, type, schema);
   return ret ? ret : reply.consumed() ? OB_SUCCESS : OB_INVALID_ARGUMENT;
@@ -102,24 +102,53 @@ int ObSchemaGetterGuard::decode_worker_schema_prototype(observer::namespace_work
       : type == DATABASE_SCHEMA ? static_cast<const ObDatabaseSchema *>(base)->get_database_id()
       : type == USER_SCHEMA ? static_cast<const ObUserInfo *>(base)->get_user_id() : 1;
   if (reply.ret) { ret = reply.ret; }
-  else { ret = put_to_local_cache(type, key, base, handle); }
+  else if (OB_FAIL(worker_owned_schemas_.push_back(WorkerOwnedSchema(owned)))) {
+  } else if (OB_FAIL(put_to_local_cache(type, key, base, handle))) {
+    worker_owned_schemas_.pop_back();
+  }
   if (ret) { owned->~T(); }
   else { schema = owned; }
+  return ret;
+}
+int ObSchemaGetterGuard::worker_table_schemas_prototype(
+    uint64_t database_id,
+    ObIArray<const ObTableSchema *> &table_schemas)
+{
+  using namespace observer::namespace_worker_prototype;
+  table_schemas.reset();
+  int64_t version = OB_INVALID_VERSION;
+  int ret = get_schema_version(version);
+  Frame reply;
+  if (OB_SUCC(ret)) {
+    ret = worker_catalog_fetch('l', database_id, ObString(), version, reply);
+  }
+  const uint64_t count = OB_SUCC(ret) ? reply.number() : 0;
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(reply.ret)) {
+    ret = reply.ret;
+  } else if (count > reply.data.size() / sizeof(uint64_t)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    for (uint64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+      const ObTableSchema *schema = nullptr;
+      if (OB_FAIL(decode_worker_schema_prototype(reply, TABLE_SCHEMA, schema))) {
+      } else if (OB_FAIL(table_schemas.push_back(schema))) {
+      }
+    }
+    if (OB_SUCC(ret) && !reply.consumed()) {
+      ret = OB_INVALID_ARGUMENT;
+    }
+  }
   return ret;
 }
 void ObSchemaGetterGuard::release_worker_schemas_prototype()
 {
   delete worker_priv_mgr_; worker_priv_mgr_ = nullptr;
   // Remote values belong to this native guard, not a second process-wide cache.
-  if (observer::namespace_worker_prototype::worker_namespace == 1) {
-    for (auto &object : schema_objs_) {
-      if (!object.handle_.is_valid() && object.schema_
-          && (object.schema_type_ == TABLE_SCHEMA || object.schema_type_ == DATABASE_SCHEMA
-              || object.schema_type_ == USER_SCHEMA || object.schema_type_ == SYS_VARIABLE_SCHEMA)) {
-        object.schema_->~ObSchema(); object.schema_ = nullptr;
-      }
-    }
+  for (WorkerOwnedSchema &owned : worker_owned_schemas_) {
+    if (owned.schema_) { owned.schema_->~ObSchema(); }
   }
+  worker_owned_schemas_.reset();
 }
 int ObSchemaGetterGuard::get_priv_mgr(const ObPrivMgr *&priv_mgr)
 {
@@ -180,6 +209,7 @@ ObSchemaGetterGuard::ObSchemaGetterGuard()
     session_id_(0),
     schema_mgr_infos_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(local_allocator_)),
     schema_objs_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(local_allocator_)),
+    worker_owned_schemas_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(local_allocator_)),
     mod_(ObSchemaMgrItem::MOD_STACK),
     schema_guard_type_(INVALID_SCHEMA_GUARD_TYPE),
     is_inited_(false),
@@ -193,6 +223,7 @@ ObSchemaGetterGuard::ObSchemaGetterGuard(const ObSchemaMgrItem::Mod mod)
     session_id_(0),
     schema_mgr_infos_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(local_allocator_)),
     schema_objs_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(local_allocator_)),
+    worker_owned_schemas_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(local_allocator_)),
     mod_(mod),
     schema_guard_type_(INVALID_SCHEMA_GUARD_TYPE),
     is_inited_(false),
@@ -3073,7 +3104,10 @@ int ObSchemaGetterGuard::get_table_ids_in_runtime(ObIArray<uint64_t> &table_ids)
     const ObSchemaMgr *mgr = NULL;                                                   \
     ObArray<const ObSimpleTableSchemaV2 *> schemas;                                  \
     schema_array.reset();                                                            \
-    if (!check_inner_stat()) {                                                       \
+    if (observer::namespace_worker_prototype::worker_namespace > 1                   \
+        && storage::NamespaceForkKernelPrototype::is_encoded_id(dst_schema_id)) {    \
+      return worker_table_schemas_prototype(dst_schema_id, schema_array);            \
+    } else if (!check_inner_stat()) {                                                \
       ret = OB_INNER_STAT_ERROR;                                                     \
       LOG_WARN("inner stat error", KR(ret));                                          \
     } else if (OB_INVALID_ID == dst_schema_id) {                                     \
@@ -3196,7 +3230,17 @@ int ObSchemaGetterGuard::get_table_schemas_in_##DST_SCHEMA( \
   int ret = OB_SUCCESS; \
   const ObSchemaMgr *mgr = NULL; \
   table_schemas.reset(); \
-  if (!check_inner_stat()) { \
+  if (observer::namespace_worker_prototype::worker_namespace > 1 \
+      && storage::NamespaceForkKernelPrototype::is_encoded_id(dst_schema_id)) { \
+    ObArray<const ObTableSchema *> full_schemas; \
+    if (OB_FAIL(worker_table_schemas_prototype(dst_schema_id, full_schemas))) { \
+    } else { \
+      for (int64_t i = 0; OB_SUCC(ret) && i < full_schemas.count(); ++i) { \
+        ret = table_schemas.push_back(full_schemas.at(i)); \
+      } \
+    } \
+    return ret; \
+  } else if (!check_inner_stat()) { \
     ret = OB_INNER_STAT_ERROR; \
     LOG_WARN("inner stat error", KR(ret)); \
   } else if (OB_INVALID_ID == dst_schema_id) { \

@@ -35,7 +35,13 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   const std::string logical_host(logical_ip.ptr(), logical_ip.length());
   if (!bootstrap.consumed() || logical_port == 0 || logical_port > UINT16_MAX
       || !self_addr_.set_ip_addr(logical_host.c_str(), static_cast<int>(logical_port))) { return OB_INVALID_ARGUMENT; }
+  if (query[0] != '@') { return OB_NOT_SUPPORTED; }
+  char *namespace_end = nullptr;
+  namespace_worker_prototype::worker_namespace = std::strtoull(query + 1, &namespace_end, 10);
+  if (!namespace_end || *namespace_end || namespace_worker_prototype::worker_namespace == 0
+      || namespace_worker_prototype::worker_namespace >= (1ULL << 30)) { return OB_INVALID_ARGUMENT; }
   namespace_worker_prototype::RemoteTabletScan remote_scan;
+  namespace_worker_prototype::RemoteLobReadService remote_lob_read;
   int64_t concurrency = 2;
   if (const char *value = std::getenv("SEEKDB_NAMESPACE_SQL_WORKER_THREADS")) {
     char *end = nullptr; concurrency = std::strtol(value, &end, 10);
@@ -86,6 +92,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   WORKER_STEP(init_sql_proxy());
   WORKER_STEP(schema_status_proxy_.init());
   WORKER_STEP(init_schema());
+  vt_data_service_.get_vt_iter_factory().get_vt_iter_creator().set_schema_service(schema_service_);
   WORKER_STEP(session_mgr_.init());
   WORKER_STEP(server_module_new_default(mods_plan_cache_));
   WORKER_STEP(server_module_new_default(mods_ps_cache_));
@@ -98,6 +105,7 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   WORKER_STEP(server_module_new_default(mods_px_pools_));
   WORKER_STEP(server_module_new_default(mods_dtl_interm_result_manager_));
   WORKER_STEP(storage::ObLobManager::server_module_new(mods_lob_manager_));
+  remote_lob_read.set_local(mods_lob_manager_);
   bind_server_service<ObSQLSessionMgr>(&session_mgr_);
   bind_server_service<ObVTIterCreator>(&vt_data_service_.get_vt_iter_factory().get_vt_iter_creator());
   bind_server_service<ObPlanCache>(mods_plan_cache_);
@@ -124,16 +132,16 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   WORKER_STEP(ObPsCache::server_module_init(mods_ps_cache_));
   WORKER_STEP(ObSqlMemoryManager::server_module_init(mods_sql_memory_manager_));
   WORKER_STEP(ObOptStatManager::get_instance().init(&sql_proxy_, &config_));
+  bind_server_service<common::ObILobReadService>(&remote_lob_read);
   namespace_worker_prototype::RemoteRootCommands remote_commands;
   WORKER_STEP(sql_engine_.init(&ObOptStatManager::get_instance(), &remote_scan,
       self_addr_, *mods_plan_cache_, *mods_ps_cache_, pl_engine_, *this, *this,
       remote_commands, ob_service_, *this, *this, *this,
-      *mods_srs_service_, *mods_lob_manager_));
+      *mods_srs_service_, remote_lob_read));
   gctx_.status_ = SS_SERVING;
   g_server_modules_ready = OB_SUCC(ret);
   using namespace namespace_worker_prototype;
   if (ret != OB_SUCCESS) { return ret; }
-  if (query[0] != '@') { return OB_NOT_SUPPORTED; }
   RemoteTransactionService remote_transactions;
   RemoteDmlService remote_dml;
   RemoteWriteContext remote_write_context;
@@ -141,7 +149,9 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
   RemoteDirectInsertService remote_direct_insert;
   {
     bind_server_service<ObITabletScan>(&remote_scan);
-    bind_server_service<ObIVirtualTableScan>(&remote_scan);
+    // Virtual tables are SQL/session/schema views owned by this worker. Only
+    // physical tablet access crosses the storage IPC boundary.
+    bind_server_service<ObIVirtualTableScan>(&vt_data_service_);
     bind_server_service<data_plane::ObITransactionService>(&remote_transactions);
     bind_server_service<data_plane::ObIRangeService>(&remote_ranges);
     bind_server_service<data_plane::IDirectInsertService>(&remote_direct_insert);
@@ -150,9 +160,6 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     sql::register_ddl_slice_store(this);
     bind_server_service<data_plane::ObIDmlService>(&remote_dml);
     bind_server_service<data_plane::ObIWriteContextService>(&remote_write_context);
-    char *end = nullptr;
-    worker_namespace = std::strtoull(query + 1, &end, 10);
-    if (!end || *end || worker_namespace == 0 || worker_namespace >= (1ULL << 30)) { return OB_INVALID_ARGUMENT; }
     worker_catalog_fetch = fetch_catalog;
   }
   struct SessionOwner {
@@ -231,6 +238,8 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       return ret ? ret : lib::Worker::check_status();
     }
   };
+  std::mutex namespace_schema_mutex;
+  std::atomic<bool> namespace_schema_loaded{false};
   auto execute = [&](SessionOwner &owner, const ObString &text, int64_t deadline) -> int {
     ObSQLSessionInfo &session = owner.session;
     const int64_t started = ObTimeUtility::current_time();
@@ -283,9 +292,16 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       if (!ret && worker_namespace == 1 && ddl_schema_version > local_schema_version) {
         ret = schema_service_.async_refresh_schema(ddl_schema_version);
       }
-      // Use the native version-fenced path: it reads the current schema
-      // version from inner tables and refreshes before returning a guard.
-      if (!ret) { ret = schema_service_.get_runtime_schema_guard_with_version_in_inner_table(guard); }
+      if (!ret && !namespace_schema_loaded.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(namespace_schema_mutex);
+        if (!namespace_schema_loaded.load(std::memory_order_relaxed)) {
+          ret = schema_service_.refresh_and_add_schema(false);
+          if (!ret) { namespace_schema_loaded.store(true, std::memory_order_release); }
+        }
+      }
+      // A namespace is owned by this process. Take its version once and pin
+      // every schema lookup made through this statement's guard to that value.
+      if (!ret) { ret = schema_service_.get_runtime_schema_guard(guard, local_schema_version); }
       if (!ret) { ret = session.update_query_sensitive_system_variable(guard); }
       if (!ret) { ret = result->init(); }
       int64_t version = 0;
@@ -571,7 +587,8 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
     if (tag.slot & WORKER_REQUEST) {
       auto request = worker_storage_routes.find(tag);
       if (!request || (input.type() != 'K' && input.type() != 'l' && input.type() != 'c'
-          && input.type() != 's' && input.type() != 'w' && input.type() != 'g')) { ret = OB_INVALID_ARGUMENT; break; }
+          && input.type() != 's' && input.type() != 'w' && input.type() != 'g'
+          && input.type() != 'r')) { ret = OB_INVALID_ARGUMENT; break; }
       ret = request->post(std::move(input));
       if (worker_namespace == 1) { std::lock_guard<std::mutex> guard(jobs_mutex); jobs_changed.notify_all(); }
       continue;
@@ -597,7 +614,8 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       jobs_changed.notify_all();
       continue;
     }
-    if (input.type() == 'K' || input.type() == 'c' || input.type() == 's' || input.type() == 'w' || input.type() == 'g') {
+    if (input.type() == 'K' || input.type() == 'c' || input.type() == 's' || input.type() == 'w'
+        || input.type() == 'g' || input.type() == 'r') {
       auto request = requests.find(tag);
       if (request) { ret = request->post(std::move(input)); }
       if (worker_namespace == 1) { std::lock_guard<std::mutex> guard(jobs_mutex); jobs_changed.notify_all(); }

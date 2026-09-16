@@ -434,11 +434,19 @@ int ObDMLService::check_lob_column_changed(ObEvalCtx &eval_ctx,
       if (old_lob.is_persist_lob() && new_lob.is_delta_temp_lob()) {
         if (OB_FAIL(ObDeltaLob::has_diff(new_lob, result))) {
         }
-      } else if (OB_FAIL(data_plane::lob_binary_equal(
-                     old_lob, new_lob, timeout,
-                     eval_ctx.exec_ctx_.get_my_session()->get_tx_desc(), is_equal))) {
       } else {
-        result = is_equal ? 0 : 1;
+        data_plane::ObIDmlService *dml_service =
+            share::server_service<data_plane::ObIDmlService>();
+        transaction::ObTxDesc *tx_desc =
+            eval_ctx.exec_ctx_.get_my_session()->get_tx_desc();
+        if (OB_ISNULL(dml_service) || OB_ISNULL(tx_desc)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("DML service or transaction is null", K(ret), KP(dml_service), KP(tx_desc));
+        } else if (OB_FAIL(dml_service->lob_binary_equal(
+                       old_lob, new_lob, timeout, *tx_desc, is_equal))) {
+        } else {
+          result = is_equal ? 0 : 1;
+        }
       }
     } else {
       result = ObDatum::binary_equal(old_datum, new_datum) ? 0 : 1;

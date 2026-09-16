@@ -31,6 +31,7 @@ class ObDatumRowIterator;
 namespace common
 {
 class ObIAllocator;
+class ObLobLocatorV2;
 class ObTabletID;
 template <typename T> class ObIArray;
 }
@@ -73,6 +74,13 @@ public:
       const ObWriteContext &write_context,
       const concurrent_control::ObWriteFlag &write_flag,
       ObDmlExecution &execution) = 0;
+
+  virtual int lob_binary_equal(
+      common::ObLobLocatorV2 &left,
+      common::ObLobLocatorV2 &right,
+      int64_t timeout_ts,
+      transaction::ObTxDesc &tx_desc,
+      bool &is_equal) = 0;
 
   virtual int delete_rows(
       const common::ObTabletID &tablet_id,

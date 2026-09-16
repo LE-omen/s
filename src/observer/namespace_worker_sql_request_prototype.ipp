@@ -23,15 +23,15 @@ int check_worker_sql(const ObString &text, sql::ObSQLSessionInfo &info, ObIAlloc
   if (!ret) {
     const ParseNode *node = parsed.result_tree_;
     if (node && node->type_ == T_STMT_LIST && node->num_child_ == 1) { node = node->children_[0]; }
-    if (!node || (node->type_ != T_SELECT && node->type_ != T_INSERT && node->type_ != T_UPDATE
-                  && node->type_ != T_DELETE && node->type_ != T_VARIABLE_SET
-                  && node->type_ != T_CREATE_TABLE
-                  && node->type_ != T_DROP_TABLE
-                  && node->type_ != T_USE_DATABASE && node->type_ != T_BEGIN && node->type_ != T_COMMIT
-                  && node->type_ != T_ROLLBACK && node->type_ != T_CREATE_SAVEPOINT
-                  && node->type_ != T_ROLLBACK_SAVEPOINT && node->type_ != T_RELEASE_SAVEPOINT)) { ret = OB_NOT_SUPPORTED; }
-    if (!ret && node->type_ == T_INSERT && (node->num_child_ != 4 || node->children_[3])) { ret = OB_NOT_SUPPORTED; }
-    // IGNORE needs additional savepoint operations; keep it outside this slice.
+    if (!node) { ret = OB_INVALID_ARGUMENT; }
+    if (!ret && node->type_ == T_INSERT
+        && (node->num_child_ != 4
+            || !node->children_[1]
+            || node->children_[1]->type_ == T_REPLACE
+            || node->children_[3])) {
+      ret = OB_NOT_SUPPORTED;
+    }
+    // REPLACE and IGNORE need additional write/savepoint operations; keep them outside this slice.
     if (!ret && node->type_ == T_UPDATE && (node->num_child_ != 11 || node->children_[8])) { ret = OB_NOT_SUPPORTED; }
     if (!ret && node->type_ == T_DELETE && (node->num_child_ != 10 || node->children_[9])) { ret = OB_NOT_SUPPORTED; }
     std::vector<const ParseNode *> pending;
@@ -52,18 +52,7 @@ int check_worker_plan(ObMySQLResultSet &result) {
   if (worker_namespace == 1) { return OB_SUCCESS; }
   using namespace sql;
   int ret = OB_SUCCESS;
-  if (!ret && result.get_stmt_type() == stmt::T_SELECT) {
-    if (!result.get_physical_plan()) { ret = OB_NOT_SUPPORTED; }
-  } else if (!ret && result.get_stmt_type() == stmt::T_INSERT) {
-    // DAS DML may execute through the command driver without a physical plan.
-    // The worker's response path already selects the appropriate driver.
-  } else if (!ret && (result.get_stmt_type() == stmt::T_UPDATE || result.get_stmt_type() == stmt::T_DELETE)) {
-    // See INSERT above.
-  } else if (!ret && result.get_stmt_type() == stmt::T_CREATE_TABLE) {
-    // Native command execution delegates the metadata mutation to the shared service.
-  } else if (!ret && result.get_stmt_type() == stmt::T_DROP_TABLE) {
-    // Native command execution delegates the metadata mutation to the shared service.
-  } else if (!ret && result.get_stmt_type() == stmt::T_VARIABLE_SET) {
+  if (result.get_stmt_type() == stmt::T_VARIABLE_SET) {
     auto *command = static_cast<ObVariableSetStmt *>(result.get_cmd());
     if (!command || command->has_global_variable()) { ret = OB_NOT_SUPPORTED; }
     for (int64_t i = 0; !ret && i < command->get_variables_size(); ++i) {
@@ -84,16 +73,12 @@ int check_worker_plan(ObMySQLResultSet &result) {
             && node.variable_name_.case_compare("collation_connection") != 0) { ret = OB_NOT_SUPPORTED; }
       }
     }
-  } else if (!ret && (result.get_stmt_type() == stmt::T_START_TRANS
-      || result.get_stmt_type() == stmt::T_END_TRANS || result.get_stmt_type() == stmt::T_CREATE_SAVEPOINT
-      || result.get_stmt_type() == stmt::T_ROLLBACK_SAVEPOINT || result.get_stmt_type() == stmt::T_RELEASE_SAVEPOINT)) {
-    // Native command executors call the same remote transaction service as DML.
   } else if (!ret && result.get_stmt_type() == stmt::T_USE_DATABASE) {
     auto *command = static_cast<ObUseDatabaseStmt *>(result.get_cmd());
     if (!command || ((static_cast<uint64_t>(command->get_db_id()) & ~(1ULL << 62)) >> 32) != worker_namespace) {
       ret = OB_NOT_SUPPORTED;
     }
-  } else if (!ret) { ret = OB_NOT_SUPPORTED; }
+  }
   return ret;
 }
 

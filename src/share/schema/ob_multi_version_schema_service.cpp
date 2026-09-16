@@ -658,7 +658,7 @@ int ObMultiVersionSchemaService::get_runtime_schema_guard(
     int64_t runtime_schema_version/* = common::OB_INVALID_VERSION*/,
     const RefreshSchemaMode refresh_schema_mode /* = RefreshSchemaMode::NORMAL */)
 {
-  const bool remote = observer::namespace_worker_prototype::worker_namespace == 1;
+  const bool remote = observer::namespace_worker_prototype::worker_namespace != 0;
   const int64_t requested_version = runtime_schema_version;
   // The local bootstrap manager supplies immutable engine definitions. Remote
   // catalog reads use the shared service's version, including historical guards.
