@@ -124,10 +124,29 @@ public:
     return ret ? ret : finish_root_reply(reply, command_ret);
   }
 };
+template<class Arg>
+int prepare_namespace_root_arg(uint64_t, Arg &, std::string &) { return common::OB_SUCCESS; }
+int prepare_namespace_root_arg(uint64_t ns, obcall::ObCreateTableArg &arg, std::string &database_name) {
+  if (ns == 1) { return common::OB_SUCCESS; }
+  database_name = "__fork_ns_" + std::to_string(ns) + "__"
+      + std::string(arg.db_name_.ptr(), arg.db_name_.length());
+  arg.db_name_ = common::ObString(database_name.size(), database_name.data());
+  return common::OB_SUCCESS;
+}
+template<class Result>
+int finish_namespace_root_result(uint64_t, Result &) { return common::OB_SUCCESS; }
+int finish_namespace_root_result(uint64_t ns, obcall::ObCreateTableRes &result) {
+  if (ns == 1) { return common::OB_SUCCESS; }
+  // The native published version can be newer than the table version saved in
+  // the namespace catalog. The worker fence must wait for the latter.
+  return storage::NamespaceForkKernelPrototype::namespace_schema_version(ns, result.schema_version_);
+}
 int process_root_command(uint64_t ns, Frame &request, Frame &reply) {
   reply = Frame('g');
-  if (ns != 1) { reply.number(common::OB_NOT_SUPPORTED); return reply.ret; }
   const common::ObString method = request.string();
+  if (ns != 1 && method != common::ObString::make_string("parallel_create_table")) {
+    reply.number(common::OB_NOT_SUPPORTED); return reply.ret;
+  }
   auto &service = ObServer::get_instance().get_local_management_service();
 #define ROOT_ONE(name, Arg, Const) \
   if (method == common::ObString::make_string(#name)) { \
@@ -144,7 +163,10 @@ int process_root_command(uint64_t ns, Frame &request, Frame &reply) {
     auto arg = std::make_unique<Arg>(); Result result; request.read(*arg); \
     if (!request.consumed()) { reply.number(common::OB_INVALID_ARGUMENT); } \
     else { \
-      const int ret = service.name(*arg, result); reply.number(0); reply.number(ret); \
+      std::string namespace_database; \
+      int ret = prepare_namespace_root_arg(ns, *arg, namespace_database); \
+      if (!ret) { ret = service.name(*arg, result); } \
+      if (!ret) { ret = finish_namespace_root_result(ns, result); } reply.number(0); reply.number(ret); \
       if constexpr (!std::is_const_v<Const Arg>) { reply.append(*arg); } \
       reply.append(result); \
     } \

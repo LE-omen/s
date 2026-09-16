@@ -288,12 +288,14 @@ int catalog(uint64_t ns, Frame &request, Frame &reply) {
   }
   if (request.type() == 'k') {
     int64_t version = OB_INVALID_VERSION;
-    if (!request.consumed() || ns != 1 || id > 1 || snapshot_version != OB_INVALID_VERSION
+    if (!request.consumed() || id > 1 || snapshot_version != OB_INVALID_VERSION
         || (!name.empty() && name != "published")) { ret = OB_INVALID_ARGUMENT; }
-    else {
+    else if (ns == 1) {
       auto &service = ObMultiVersionSchemaService::get_instance();
       ret = name.empty() ? service.get_runtime_refreshed_schema_version(version, id != 0)
           : service.get_published_schema_version(version, id != 0);
+    } else {
+      ret = NamespaceForkKernelPrototype::namespace_schema_version(ns, version);
     }
     reply = Frame('c'); reply.number(ret); reply.number(version); return reply.ret;
   }

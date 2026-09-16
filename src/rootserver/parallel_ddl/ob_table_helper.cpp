@@ -20,6 +20,7 @@
 #include "rootserver/ob_lob_meta_builder.h"
 #include "rootserver/ob_lob_piece_builder.h"
 #include "rootserver/ob_table_creator.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "rootserver/freeze/ob_major_freeze_helper.h"
 #include "share/ob_rpc_struct.h"
 #include "share/ob_debug_sync_point.h"
@@ -568,6 +569,8 @@ int ObTableHelper::inner_generate_table_schema_(const ObCreateTableArg &arg, ObT
     LOG_WARN("fail to gen object ids", KR(ret), K(object_cnt));
   } else if (OB_FAIL(id_generator.next(object_id))) {
   } else {
+    object_id = storage::NamespaceForkKernelPrototype::encode_object(
+        new_table.get_database_id(), object_id);
     (void) new_table.set_table_id(object_id);
   }
 
@@ -577,6 +580,8 @@ int ObTableHelper::inner_generate_table_schema_(const ObCreateTableArg &arg, ObT
     
     cst.set_table_id(new_table.get_table_id());
     if (OB_FAIL(id_generator.next(object_id))) {
+    } else if (FALSE_IT(object_id = storage::NamespaceForkKernelPrototype::encode_object(
+                   new_table.get_database_id(), object_id))) {
     } else if (FALSE_IT(cst.set_constraint_id(object_id))) {
     } else if (OB_FAIL(new_table.add_constraint(cst))) {
     }

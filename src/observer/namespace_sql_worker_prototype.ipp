@@ -274,8 +274,13 @@ int ObServer::namespace_sql_worker_prototype(const char *query)
       // unlike an unconditional refresh this does not contend on every query.
       int64_t local_schema_version = 0;
       const int64_t ddl_schema_version = session.get_last_ddl_schema_version();
-      if (!ret) { ret = schema_service_.get_runtime_refreshed_schema_version(local_schema_version); }
-      if (!ret && ddl_schema_version > local_schema_version) {
+      if (!ret && worker_namespace > 1) {
+        ret = fetch_schema_version(false, false, local_schema_version);
+        if (!ret && ddl_schema_version > local_schema_version) { ret = OB_SCHEMA_EAGAIN; }
+      } else if (!ret) {
+        ret = schema_service_.get_runtime_refreshed_schema_version(local_schema_version);
+      }
+      if (!ret && worker_namespace == 1 && ddl_schema_version > local_schema_version) {
         ret = schema_service_.async_refresh_schema(ddl_schema_version);
       }
       // Use the native version-fenced path: it reads the current schema

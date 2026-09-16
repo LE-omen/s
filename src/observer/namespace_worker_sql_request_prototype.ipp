@@ -25,6 +25,7 @@ int check_worker_sql(const ObString &text, sql::ObSQLSessionInfo &info, ObIAlloc
     if (node && node->type_ == T_STMT_LIST && node->num_child_ == 1) { node = node->children_[0]; }
     if (!node || (node->type_ != T_SELECT && node->type_ != T_INSERT && node->type_ != T_UPDATE
                   && node->type_ != T_DELETE && node->type_ != T_VARIABLE_SET
+                  && node->type_ != T_CREATE_TABLE
                   && node->type_ != T_USE_DATABASE && node->type_ != T_BEGIN && node->type_ != T_COMMIT
                   && node->type_ != T_ROLLBACK && node->type_ != T_CREATE_SAVEPOINT
                   && node->type_ != T_ROLLBACK_SAVEPOINT && node->type_ != T_RELEASE_SAVEPOINT)) { ret = OB_NOT_SUPPORTED; }
@@ -57,6 +58,8 @@ int check_worker_plan(ObMySQLResultSet &result) {
     // The worker's response path already selects the appropriate driver.
   } else if (!ret && (result.get_stmt_type() == stmt::T_UPDATE || result.get_stmt_type() == stmt::T_DELETE)) {
     // See INSERT above.
+  } else if (!ret && result.get_stmt_type() == stmt::T_CREATE_TABLE) {
+    // Native command execution delegates the metadata mutation to the shared service.
   } else if (!ret && result.get_stmt_type() == stmt::T_VARIABLE_SET) {
     auto *command = static_cast<ObVariableSetStmt *>(result.get_cmd());
     if (!command || command->has_global_variable()) { ret = OB_NOT_SUPPORTED; }

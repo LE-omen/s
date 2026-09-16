@@ -17,6 +17,7 @@
 
 #include "share/schema/ob_latest_schema_guard.h"
 #include "share/schema/ob_multi_version_schema_service.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 
 using namespace oceanbase::lib;
 using namespace oceanbase::common;
@@ -157,6 +158,12 @@ int ObLatestSchemaGuard::get_database_id(
     const common::ObString &database_name,
     uint64_t &database_id)
 {
+  if (storage::NamespaceForkKernelPrototype::is_namespace_address(database_name)) {
+    const ObDatabaseSchema *database = nullptr;
+    const int ret = storage::NamespaceForkKernelPrototype::database_by_address(database_name, database);
+    database_id = database ? database->get_database_id() : OB_INVALID_ID;
+    return ret;
+  }
   int ret = OB_SUCCESS;
   ObSchemaService *schema_service_impl = NULL;
   ObISQLClient *sql_client = NULL;
@@ -181,6 +188,14 @@ int ObLatestSchemaGuard::get_table_id(
     ObTableType &table_type,
     int64_t &schema_version)
 {
+  if (storage::NamespaceForkKernelPrototype::is_encoded_id(database_id)) {
+    const ObTableSchema *table = nullptr;
+    const int ret = storage::NamespaceForkKernelPrototype::schema_by_name(database_id, table_name, table);
+    table_id = table ? table->get_table_id() : OB_INVALID_ID;
+    table_type = table ? table->get_table_type() : ObTableType::MAX_TABLE_TYPE;
+    schema_version = table ? table->get_schema_version() : OB_INVALID_VERSION;
+    return ret;
+  }
   int ret = OB_SUCCESS;
   ObSchemaService *schema_service_impl = NULL;
   ObISQLClient *sql_client = NULL;
@@ -330,6 +345,9 @@ int ObLatestSchemaGuard::get_table_schema(
     const uint64_t table_id,
     const ObTableSchema *&table_schema)
 {
+  if (storage::NamespaceForkKernelPrototype::is_encoded_id(table_id)) {
+    return storage::NamespaceForkKernelPrototype::schema_by_id(table_id, table_schema);
+  }
   int ret = OB_SUCCESS;
   if (OB_FAIL(check_inner_stat_())) {
   } else if (OB_FAIL(get_schema_(TABLE_SCHEMA,
@@ -358,6 +376,9 @@ int ObLatestSchemaGuard::get_database_schema(
     const uint64_t database_id,
     const ObDatabaseSchema *&database_schema)
 {
+  if (storage::NamespaceForkKernelPrototype::is_encoded_id(database_id)) {
+    return storage::NamespaceForkKernelPrototype::database_by_id(database_id, database_schema);
+  }
   int ret = OB_SUCCESS;
   database_schema = NULL;
   if (OB_FAIL(check_inner_stat_())) {

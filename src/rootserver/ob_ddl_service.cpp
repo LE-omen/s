@@ -36,6 +36,7 @@
 #include "sql/engine/cmd/ob_partition_executor_utils.h"
 #include "share/ob_global_stat_proxy.h"
 #include "rootserver/fork_table/ob_fork_table_util.h"
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/resolver/expr/ob_raw_expr_modify_column_name.h"
 #include "rootserver/ob_ddl_service_launcher.h" // for ObDDLServiceLauncher
@@ -730,6 +731,8 @@ int ObDDLService::generate_tablet_id(
       if (OB_FAIL(id_generator.next(new_tablet_id))) {
         LOG_WARN("fail to get next tablet_id", KR(ret));
       } else {
+        new_tablet_id = storage::NamespaceForkKernelPrototype::encode_object(
+            table_schema.get_database_id(), new_tablet_id);
         (void) table_schema.set_tablet_id(new_tablet_id);
       }
     } else {

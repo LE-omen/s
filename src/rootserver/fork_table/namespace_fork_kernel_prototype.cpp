@@ -859,6 +859,22 @@ int NamespaceForkKernelPrototype::protect_snapshot_tablets(ObIArray<ObTabletID> 
 bool NamespaceForkKernelPrototype::is_encoded_id(uint64_t id) {
   return enabled() && id != OB_INVALID_ID && (id & (3ULL << 62)) == ID_MARK;
 }
+uint64_t NamespaceForkKernelPrototype::encode_object(uint64_t database_id, uint64_t local_id) {
+  return is_encoded_id(database_id) && NamespaceObjectKey{database_of(database_id), local_id}.is_valid()
+      ? encoded(database_of(database_id), local_id) : local_id;
+}
+int NamespaceForkKernelPrototype::namespace_schema_version(uint64_t ns, int64_t &version) {
+  version = OB_INVALID_VERSION;
+  if (!namespace_mode() || !GCTX.sql_proxy_ || !NamespaceObjectKey{ns, 1}.is_valid()) {
+    return OB_INVALID_ARGUMENT;
+  }
+  MetadataReadGuard access;
+  if (access.error() != OB_SUCCESS) { return access.error(); }
+  Roots root;
+  const int ret = roots(*GCTX.sql_proxy_, ns, root);
+  if (ret == OB_SUCCESS) { version = root.schema_version; }
+  return ret;
+}
 bool NamespaceForkKernelPrototype::is_namespace_address(const ObString &name) {
   return namespace_mode() && name.prefix_match("__fork_ns_");
 }
@@ -1082,8 +1098,17 @@ int NamespaceForkKernelPrototype::control_namespace(const ObString &source, cons
   return ret;
 }
 int NamespaceForkKernelPrototype::observe_schema(ObISQLClient &trans, const ObTableSchema &schema) {
-  if (!enabled() || !schema.is_user_table() || is_encoded_id(schema.get_table_id())) { return OB_SUCCESS; }
-  if (namespace_mode() && is_inner_db(schema.get_database_id())) { return OB_SUCCESS; }
+  if (!enabled() || !schema.is_user_table()) { return OB_SUCCESS; }
+  const bool encoded_schema = is_encoded_id(schema.get_table_id());
+  const uint64_t database_id = encoded_schema ? local_of(schema.get_database_id()) : schema.get_database_id();
+  const uint64_t table_id = encoded_schema ? local_of(schema.get_table_id()) : schema.get_table_id();
+  const uint64_t tablet_id = encoded_schema ? local_of(schema.get_tablet_id().id()) : schema.get_tablet_id().id();
+  const uint64_t owner = encoded_schema ? database_of(schema.get_table_id()) : namespace_mode() ? 1 : database_id;
+  if (encoded_schema && (!is_encoded_id(schema.get_database_id())
+      || !is_encoded_id(schema.get_tablet_id().id())
+      || database_of(schema.get_database_id()) != owner
+      || database_of(schema.get_tablet_id().id()) != owner)) { return OB_INVALID_ARGUMENT; }
+  if (namespace_mode() && is_inner_db(database_id)) { return OB_SUCCESS; }
   int ret = OB_SUCCESS;
   if (namespace_mode()) {
     bool ready = false; ret = namespace_registry_ready(ready);
@@ -1092,21 +1117,20 @@ int NamespaceForkKernelPrototype::observe_schema(ObISQLClient &trans, const ObTa
   { // Finish the result before issuing another statement on the same DDL connection.
   ObSqlString q; ObMySQLProxy::MySQLResult res; ObString name;
   sqlclient::ObMySQLResult *r = nullptr;
-  if (OB_FAIL(q.assign_fmt("SELECT database_name FROM oceanbase.__all_database WHERE database_id=%lu", schema.get_database_id()))) {
+  if (OB_FAIL(q.assign_fmt("SELECT database_name FROM oceanbase.__all_database WHERE database_id=%lu", database_id))) {
   } else if (OB_FAIL(trans.read(res, q.ptr()))) {
   } else if (OB_ISNULL(r = res.get_result())) { ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(r->next())) {
   } else if (OB_FAIL(r->get_varchar(0L, name))) {
   } else if (namespace_mode() ? name.prefix_match("__fork_proto_meta")
                              : !name.prefix_match("__fork_proto_a")) { return OB_SUCCESS;
-  } else if (!supported(schema) || schema.get_database_id() >= (1ULL << 30)
-      || schema.get_table_id() >= (1ULL << 32) || schema.get_tablet_id().id() >= (1ULL << 32)) { ret = OB_NOT_SUPPORTED; }
+  } else if (!supported(schema) || database_id >= (1ULL << 30)
+      || table_id >= (1ULL << 32) || tablet_id >= (1ULL << 32)) { ret = OB_NOT_SUPPORTED; }
   }
   if (ret != OB_SUCCESS) { return ret; }
   {
   MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
   Roots root;
-  const uint64_t owner = namespace_mode() ? 1 : schema.get_database_id();
   ret = roots(trans, owner, root, true);
   if (namespace_mode() && (ret == OB_ITER_END || ret == OB_TABLE_NOT_EXIST || ret == OB_ERR_BAD_DATABASE)) {
     if (lifetime_mode() && ret == OB_ITER_END) {
@@ -1118,20 +1142,33 @@ int NamespaceForkKernelPrototype::observe_schema(ObISQLClient &trans, const ObTa
   }
   if (ret == OB_ITER_END) { ret = OB_SUCCESS; }
   if (ret != OB_SUCCESS) { return ret; }
-  if (root.snapshot != 0) { return OB_NOT_SUPPORTED; }
-  std::string serialized(schema.get_serialize_size(), '\0'); int64_t pos = 0; uint64_t object = 0;
+  if (root.snapshot != 0 && !encoded_schema) { return OB_NOT_SUPPORTED; }
+  ObArenaAllocator allocator("NsDDLSchema");
+  ObTableSchema normalized(&allocator);
+  if (OB_FAIL(normalized.assign(schema))) { return ret; }
+  if (encoded_schema) {
+    // Catalog blobs stay namespace-neutral; schema lookup re-encodes them for
+    // the requesting namespace while the directory retains the physical owner.
+    normalized.set_database_id(database_id);
+    normalized.set_table_id(table_id);
+    normalized.set_tablet_id(ObTabletID(tablet_id));
+    for (int64_t i = 0; i < normalized.get_column_count(); ++i) {
+      const_cast<ObColumnSchemaV2 *>(normalized.get_column_schema_by_idx(i))->set_table_id(table_id);
+    }
+  }
+  std::string serialized(normalized.get_serialize_size(), '\0'); int64_t pos = 0; uint64_t object = 0;
   Value value;
-  if (OB_FAIL(schema.serialize(&serialized[0], serialized.size(), pos))) {
+  if (OB_FAIL(normalized.serialize(&serialized[0], serialized.size(), pos))) {
   } else if (OB_FAIL(save_blob(trans, serialized, object))) {
   } else {
-    value.data = entry(object, schema.get_table_id(), schema.get_tablet_id().id());
+    value.data = entry(object, table_id, tablet_id, encoded_schema ? schema.get_tablet_id().id() : 0);
     const std::string name_key = namespace_mode()
-        ? "T" + key_of(schema.get_database_id()) + "/" + schema.get_table_name() : schema.get_table_name();
+        ? "T" + key_of(database_id) + "/" + schema.get_table_name() : schema.get_table_name();
     if (OB_FAIL(put(trans, root.catalog, name_key, value, root.catalog))) {
-    } else if (OB_FAIL(put(trans, root.catalog, "#" + key_of(schema.get_table_id()), value, root.catalog))) {
-    } else if (OB_FAIL(put(trans, root.directory, key_of(schema.get_tablet_id().id()), value, root.directory))) {
+    } else if (OB_FAIL(put(trans, root.catalog, "#" + key_of(table_id), value, root.catalog))) {
+    } else if (OB_FAIL(put(trans, root.directory, key_of(tablet_id), value, root.directory))) {
     } else {
-      root.schema_version = schema.get_schema_version();
+      root.schema_version = std::max(root.schema_version, schema.get_schema_version());
       ret = save_roots(trans, owner, root);
       LOG_INFO("PROTOTYPE_V2_SOURCE_DIRECTORY", K(ret), "table_id", schema.get_table_id(), "directory_root", root.directory.page);
     }
@@ -1247,7 +1284,21 @@ int NamespaceForkKernelPrototype::list_schemas(uint64_t db, ObIArray<const ObTab
 int NamespaceForkKernelPrototype::check_ddl(const ObSimpleTableSchemaV2 &schema, const ObISQLClient *trans) {
   if (lifetime_mode() && trans && source_drop_trans.load() == trans) { return OB_SUCCESS; }
   if (!enabled() || !schema.is_user_table()) { return OB_SUCCESS; }
-  if (is_encoded_id(schema.get_table_id())) { return OB_NOT_SUPPORTED; }
+  if (is_encoded_id(schema.get_table_id())) {
+    if (!is_encoded_id(schema.get_database_id())
+        || database_of(schema.get_database_id()) != database_of(schema.get_table_id())) {
+      return OB_INVALID_ARGUMENT;
+    }
+    MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
+    ObISQLClient *client = const_cast<ObISQLClient *>(trans);
+    if (!client) { client = GCTX.sql_proxy_; }
+    if (!client) { return OB_NOT_INIT; }
+    Roots root; Value existing;
+    int ret = roots(*client, database_of(schema.get_table_id()), root);
+    if (ret != OB_SUCCESS) { return ret; }
+    ret = find(*client, root.catalog, "#" + key_of(local_of(schema.get_table_id())), existing);
+    return ret == OB_ENTRY_NOT_EXIST ? OB_SUCCESS : ret == OB_SUCCESS ? OB_NOT_SUPPORTED : ret;
+  }
   if (namespace_mode()) {
     bool ready = false; const int ret = namespace_registry_ready(ready);
     if (ret != OB_SUCCESS || !ready) { return ret; }

@@ -5,6 +5,7 @@ SEEKDB_FORK_PROTOTYPE_TEST_ROOT=/tmp python3 tools/obtest/namespace_sql_worker_p
 Add --case insert for V14 writes, rollback, isolation and crash recovery.
 Add --case dml for native drivers, automatic conflict retries, DML and recovery.
 Add --case nested for native foreign keys, nested session restoration and transactions.
+Add --case ddl for CREATE TABLE followed by write and read in a fork namespace.
 Linux integration probe. No claim of Windows/macOS or high-concurrency validation.
 """
 import argparse
@@ -29,10 +30,11 @@ class WorkerExperiment(LineageExperiment):
         super().start()
         self.sql("ALTER SYSTEM SET syslog_level='WARN'")
 
-    def worker_connect(self, namespace, client_flag=0):
+    def worker_connect(self, namespace, client_flag=0, read_timeout=40):
         return pymysql.connect(host="127.0.0.1", port=self.port, user="root", password="",
                                database=f"__fork_ns_{namespace}__db1", charset="utf8mb4",
-                               autocommit=True, connect_timeout=10, read_timeout=40, write_timeout=10, client_flag=client_flag)
+                               autocommit=True, connect_timeout=10, read_timeout=read_timeout,
+                               write_timeout=10, client_flag=client_flag)
 
     def worker_pid(self, namespace):
         matches = re.findall(r"PROTOTYPE_V10_WORKER_READY ns=(\d+) generation=(\d+) pid=(\d+)",
@@ -136,6 +138,47 @@ class WorkerExperiment(LineageExperiment):
         finally:
             first.close()
             sibling.close()
+
+    def run_ddl(self):
+        self.setup_lineage()
+        c = None
+        connection = source = child = None
+        try:
+            connection = self.worker_connect(self.b, read_timeout=20)
+            self.sql("CREATE TABLE created_after_fork(id INT PRIMARY KEY,v INT)", connection)
+            self.sql("INSERT INTO created_after_fork VALUES(1,10)", connection)
+            assert self.sql("SELECT id,v FROM created_after_fork", connection) == ((1,10),)
+            source = self.worker_connect(self.root("a")[0])
+            try:
+                self.sql("SELECT * FROM created_after_fork", source)
+            except pymysql.ProgrammingError as error:
+                assert error.args[0] == 1146, error.args
+            else:
+                raise AssertionError("fork-local table leaked into source namespace")
+            c, _ = self.capture("b", "c")
+            child = self.worker_connect(c)
+            assert self.sql("SELECT id,v FROM created_after_fork", child) == ((1,10),)
+            self.sql("INSERT INTO created_after_fork VALUES(2,20)", child)
+            assert self.sql("SELECT id,v FROM created_after_fork ORDER BY id", child) == ((1,10),(2,20))
+            assert self.sql("SELECT id,v FROM created_after_fork", connection) == ((1,10),)
+        finally:
+            for handle in (connection, source, child):
+                if handle is not None:
+                    handle.close()
+        self.restart()
+        connection = child = None
+        try:
+            connection, child = self.worker_connect(self.b), self.worker_connect(c)
+            assert self.sql("SELECT id,v FROM created_after_fork", connection) == ((1,10),)
+            assert self.sql("SELECT id,v FROM created_after_fork ORDER BY id", child) == ((1,10),(2,20))
+            self.record("PASS", case="namespace_worker_ddl", create_table=True,
+                        schema_visible_to_worker=True, source_isolated=True,
+                        descendant_inherits_schema=True, descendant_storage_isolated=True,
+                        crash_recovery=True)
+        finally:
+            for handle in (connection, child):
+                if handle is not None:
+                    handle.close()
 
     def session_events(self, kind):
         events = []
@@ -793,7 +836,7 @@ class WorkerExperiment(LineageExperiment):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
-    parser.add_argument("--case", choices=("full", "slow-timeout", "insert", "dml", "nested"), default="full")
+    parser.add_argument("--case", choices=("full", "slow-timeout", "insert", "dml", "nested", "ddl"), default="full")
     args = parser.parse_args()
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     os.environ["SEEKDB_NAMESPACE_SQL_WORKER_PROTOTYPE"] = "1"
@@ -801,7 +844,9 @@ def main():
     experiment = WorkerExperiment(args.binary, case_name, prototype=6)
     try:
         experiment.start()
-        if args.case == "nested":
+        if args.case == "ddl":
+            experiment.run_ddl()
+        elif args.case == "nested":
             experiment.run_nested()
         elif args.case == "dml":
             experiment.run_dml()

@@ -26,6 +26,7 @@
 #include "share/ob_structured_event_logger.h"
 #include "share/ob_share_util.h"
 #include "share/schema/ob_schema_utils.h"
+#include "observer/namespace_worker_protocol_prototype.h"
 
 namespace oceanbase
 {
@@ -352,10 +353,17 @@ int ObDDLExecutorUtil::wait_local_schema_visible(
   while (OB_SUCC(ret) && ctx.get_timeout() > 0 && !schema_visible) {
     int64_t refreshed_schema_version = OB_INVALID_VERSION;
     if (OB_FAIL(ObDDLExecutorUtil::handle_session_exception(*session))) {
+    } else if (observer::namespace_worker_prototype::worker_namespace > 1) {
+      if (OB_FAIL(observer::namespace_worker_prototype::fetch_schema_version(
+          false, false, refreshed_schema_version))) {
+      } else if (refreshed_schema_version >= schema_version) {
+        schema_visible = true;
+      }
     } else if (OB_FAIL(schema_service->get_runtime_refreshed_schema_version(refreshed_schema_version))) {
     } else if (refreshed_schema_version >= schema_version) {
       schema_visible = true;
-    } else {
+    }
+    if (OB_SUCC(ret) && !schema_visible) {
       if (REACH_TIME_INTERVAL(1000 * 1000L)) { // 1s
         LOG_WARN("local schema version not visible", K(refreshed_schema_version), K(schema_version));
       }

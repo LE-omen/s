@@ -60,6 +60,8 @@ public:
   static int database_by_id(uint64_t id, const share::schema::ObDatabaseSchema *&schema);
   static int database_by_id(uint64_t id, const share::schema::ObSimpleDatabaseSchema *&schema);
   static bool is_encoded_id(uint64_t id);
+  static uint64_t encode_object(uint64_t database_id, uint64_t local_id);
+  static int namespace_schema_version(uint64_t namespace_id, int64_t &schema_version);
   static int observe_schema(common::ObISQLClient &trans, const share::schema::ObTableSchema &schema);
   static int capture(common::ObISQLClient &trans, uint64_t source, uint64_t target,
                      int64_t snapshot, int64_t schema_version);
