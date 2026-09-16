@@ -1353,41 +1353,9 @@ int ObLocalManagementService::parallel_drop_table(const ObDropTableArg &arg, ObD
     LOG_WARN("invalid arg", KR(ret), K(arg));
   } else if (OB_FAIL(parallel_ddl_pre_check_())) {
   } else {
-    bool owned = true;
-    const bool namespace_table = arg.tables_.count() == 1
-        && NamespaceForkKernelPrototype::is_encoded_id(arg.tables_.at(0).table_id_);
-    if (namespace_table && OB_FAIL(NamespaceForkKernelPrototype::is_schema_owned(
-            arg.tables_.at(0).table_id_, owned))) {
-    } else if (namespace_table && !owned) {
-      const ObTableSchema *schema = nullptr;
-      ObSchemaGetterGuard guard;
-      int64_t refreshed_schema_version = OB_INVALID_VERSION;
-      int64_t new_schema_version = OB_INVALID_VERSION;
-      ObDDLSQLTransaction trans(schema_service_);
-      if (OB_FAIL(NamespaceForkKernelPrototype::schema_by_id(
-              arg.tables_.at(0).table_id_, schema))) {
-      } else if (OB_ISNULL(schema)) {
-        ret = OB_ERR_BAD_TABLE;
-      } else if (OB_FAIL(ObDDLService::get_runtime_schema_guard_with_version_in_inner_table(guard))) {
-      } else if (OB_FAIL(guard.get_schema_version(refreshed_schema_version))) {
-      } else if (OB_FAIL(trans.start(&sql_proxy_, refreshed_schema_version))) {
-      } else if (OB_FAIL(schema_service_->gen_new_schema_version(new_schema_version))) {
-      } else if (OB_FAIL(NamespaceForkKernelPrototype::forget_schema(
-              trans, *schema, new_schema_version))) {
-      }
-      if (trans.is_started()) {
-        const int end_ret = trans.end(OB_SUCC(ret));
-        if (OB_SUCC(ret)) { ret = end_ret; }
-      }
-      if (OB_SUCC(ret)) {
-        res.schema_version_ = new_schema_version;
-        NamespaceForkKernelPrototype::release_schema(arg.tables_.at(0).table_id_);
-      }
-    } else {
-      ObDropTableHelper drop_table_helper(schema_service_, arg, res);
-      if (OB_FAIL(drop_table_helper.init(ddl_service_))) {
-      } else if (OB_FAIL(drop_table_helper.execute())) {
-      }
+    ObDropTableHelper drop_table_helper(schema_service_, arg, res);
+    if (OB_FAIL(drop_table_helper.init(ddl_service_))) {
+    } else if (OB_FAIL(drop_table_helper.execute())) {
     }
   }
   int64_t cost = ObTimeUtility::current_time() - begin_time;

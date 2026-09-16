@@ -767,7 +767,7 @@ int NamespaceForkKernelPrototype::finish_namespace_drop(ObISQLClient &trans, uin
     if (OB_SUCC(ret) && !referenced) {
       Roots snapshot; ObSnapshotInfo pin; ObSnapshotTableProxy pins; SCN scn; ObArray<ObTabletID> tablets;
       if (OB_FAIL(snapshot_roots(trans, root.snapshot_ref, snapshot))) {
-      } else if (snapshot.snapshot != root.snapshot || snapshot.schema_version != root.schema_version) { ret = OB_STATE_NOT_MATCH;
+      } else if (snapshot.snapshot != root.snapshot) { ret = OB_STATE_NOT_MATCH;
       } else if (OB_FAIL(scn.convert_for_tx(snapshot.snapshot))) {
       } else if (OB_FAIL(pins.get_snapshot(trans, SNAPSHOT_FOR_MULTI_VERSION, scn, pin))) {
       } else if (pin.tablet_id_ != 0 || pin.schema_version_ != snapshot.schema_version) { ret = OB_STATE_NOT_MATCH;
@@ -1213,7 +1213,8 @@ int NamespaceForkKernelPrototype::observe_schema(ObISQLClient &trans, const ObTa
   return ret;
 }
 int NamespaceForkKernelPrototype::forget_schema(ObISQLClient &trans, const ObTableSchema &schema,
-                                                int64_t schema_version) {
+                                                int64_t schema_version, bool *private_tablet) {
+  if (private_tablet != nullptr) { *private_tablet = false; }
   if (!namespace_mode() || !schema.is_user_table() || !is_encoded_id(schema.get_table_id())) {
     return OB_SUCCESS;
   }
@@ -1227,9 +1228,20 @@ int NamespaceForkKernelPrototype::forget_schema(ObISQLClient &trans, const ObTab
   const uint64_t table_id = local_of(schema.get_table_id());
   const uint64_t tablet_id = local_of(schema.get_tablet_id().id());
   MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
-  Roots root; int ret = roots(trans, owner, root, true);
+  Roots root; Value directory_value; int ret = roots(trans, owner, root, true);
   Ref next;
   const std::string name_key = "T" + key_of(database_id) + "/" + schema.get_table_name();
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(find(trans, root.directory, key_of(tablet_id), directory_value))) {
+  } else {
+    uint64_t object = 0, entry_table = 0, entry_tablet = 0, bound = 0;
+    if (!entry(directory_value.data, object, entry_table, entry_tablet, bound)
+        || object == 0 || entry_table != table_id || entry_tablet != tablet_id) {
+      ret = OB_CHECKSUM_ERROR;
+    } else if (private_tablet != nullptr) {
+      *private_tablet = bound == schema.get_tablet_id().id();
+    }
+  }
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(remove_key(trans, root.catalog, name_key, next))) {
   } else if (FALSE_IT(root.catalog = next)) {
@@ -1456,8 +1468,11 @@ int NamespaceForkKernelPrototype::ensure_tablet(const ObTabletID &tablet_id) {
   } else if (lifetime_mode() && OB_FAIL([&]() -> int {
       Roots snapshot;
       int result = snapshot_roots(trans, root.snapshot_ref, snapshot);
-      if (result == OB_SUCCESS && (snapshot.snapshot != root.snapshot || snapshot.schema_version != root.schema_version
-          || snapshot.catalog.page != root.catalog.page)) { result = OB_STATE_NOT_MATCH; }
+      // The fork snapshot identity is stable. Namespace-local DDL legitimately
+      // advances schema_version and replaces immutable catalog roots.
+      if (result == OB_SUCCESS && snapshot.snapshot != root.snapshot) {
+        result = OB_STATE_NOT_MATCH;
+      }
       return result;
     }())) {
   } else if (OB_FAIL(find(trans, root.directory, key_of(local), value))) {

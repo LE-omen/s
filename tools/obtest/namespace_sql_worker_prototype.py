@@ -143,41 +143,80 @@ class WorkerExperiment(LineageExperiment):
         self.setup_lineage()
         c = d = None
         connection = source = child = grandchild = None
+        def assert_missing(table, handle):
+            try:
+                self.sql("SELECT * FROM " + table, handle)
+            except pymysql.ProgrammingError as error:
+                assert error.args[0] == 1146, error.args
+            else:
+                raise AssertionError(table + " remained visible")
         try:
             connection = self.worker_connect(self.b, read_timeout=20)
             self.sql("CREATE TABLE created_after_fork(id INT PRIMARY KEY,v INT)", connection)
             self.sql("CREATE TABLE inherited_drop(id INT PRIMARY KEY,v INT)", connection)
             self.sql("INSERT INTO inherited_drop VALUES(1,10)", connection)
+            for table in ("cold_drop", "inherited_multi_a", "inherited_multi_b",
+                          "inherited_mixed", "inherited_cow", "atomic_survivor"):
+                self.sql("CREATE TABLE " + table + "(id INT PRIMARY KEY,v INT)", connection)
+            self.sql("INSERT INTO inherited_cow VALUES(1,10)", connection)
+            self.sql("INSERT INTO atomic_survivor VALUES(1,10)", connection)
             self.sql("CREATE TABLE drop_after_fork(id INT PRIMARY KEY,v INT)", connection)
             self.sql("DROP TABLE drop_after_fork", connection)
             self.sql("DROP TABLE IF EXISTS drop_after_fork", connection)
-            try:
-                self.sql("SELECT * FROM drop_after_fork", connection)
-            except pymysql.ProgrammingError as error:
-                assert error.args[0] == 1146, error.args
-            else:
-                raise AssertionError("dropped namespace table remained visible")
+            assert_missing("drop_after_fork", connection)
             self.sql("INSERT INTO created_after_fork VALUES(1,10)", connection)
             assert self.sql("SELECT id,v FROM created_after_fork", connection) == ((1,10),)
             source = self.worker_connect(self.root("a")[0])
-            try:
-                self.sql("SELECT * FROM created_after_fork", source)
-            except pymysql.ProgrammingError as error:
-                assert error.args[0] == 1146, error.args
-            else:
-                raise AssertionError("fork-local table leaked into source namespace")
+            assert_missing("created_after_fork", source)
             c, _ = self.capture("b", "c")
             child = self.worker_connect(c)
             assert self.sql("SELECT id,v FROM created_after_fork", child) == ((1,10),)
+
+            cold_physical = self.physical()
+            self.sql("DROP TABLE cold_drop", child)
+            assert self.physical() == cold_physical
+            assert_missing("cold_drop", child)
+
+            self.sql("DROP TABLE inherited_multi_a,inherited_multi_b", child)
+            assert_missing("inherited_multi_a", child)
+            assert_missing("inherited_multi_b", child)
+            assert self.sql("SELECT id,v FROM atomic_survivor", child) == ((1,10),)
+
+            self.sql("CREATE TABLE child_local_mixed(id INT PRIMARY KEY,v INT)", child)
+            assert self.sql("SELECT id,v FROM atomic_survivor", child) == ((1,10),)
+            self.sql("DROP TABLE child_local_mixed,inherited_mixed", child)
+            assert_missing("child_local_mixed", child)
+            assert_missing("inherited_mixed", child)
+
+            assert self.sql("SELECT id,v FROM atomic_survivor", child) == ((1,10),)
+            failed_drop = self.worker_connect(c)
+            try:
+                try:
+                    self.sql("DROP TABLE atomic_survivor,missing_table", failed_drop)
+                except pymysql.MySQLError as error:
+                    assert error.args[0] in (1051,1146), error.args
+                else:
+                    raise AssertionError("multi-table DROP ignored a missing table")
+            finally:
+                failed_drop.close()
+            assert self.sql("SELECT id,v FROM atomic_survivor", child) == ((1,10),)
+
+            cow_before = self.physical()
+            self.sql("UPDATE inherited_cow SET v=20 WHERE id=1", child)
+            cow_after = self.physical()
+            assert len(set(cow_after) - set(cow_before)) == 1, (cow_before, cow_after)
+            self.sql("DROP TABLE inherited_cow", child)
+            self.wait_until(lambda: self.physical() == cow_before,
+                            "DROP did not reclaim the namespace-private tablet")
+            assert_missing("inherited_cow", child)
+
             assert self.sql("SELECT id,v FROM inherited_drop", child) == ((1,10),)
             self.sql("DROP TABLE inherited_drop", child)
-            try:
-                self.sql("SELECT * FROM inherited_drop", child)
-            except pymysql.ProgrammingError as error:
-                assert error.args[0] == 1146, error.args
-            else:
-                raise AssertionError("inherited table remained visible after child drop")
+            assert_missing("inherited_drop", child)
             assert self.sql("SELECT id,v FROM inherited_drop", connection) == ((1,10),)
+            for table in ("cold_drop", "inherited_multi_a", "inherited_multi_b", "inherited_mixed"):
+                assert self.sql("SELECT COUNT(*) FROM " + table, connection) == ((0,),)
+            assert self.sql("SELECT id,v FROM inherited_cow", connection) == ((1,10),)
             d, _ = self.capture("c", "d")
             self.sql("INSERT INTO created_after_fork VALUES(2,20)", child)
             assert self.sql("SELECT id,v FROM created_after_fork ORDER BY id", child) == ((1,10),(2,20))
@@ -193,15 +232,14 @@ class WorkerExperiment(LineageExperiment):
             assert self.sql("SELECT id,v FROM created_after_fork ORDER BY id", child) == ((1,10),(2,20))
             assert self.sql("SELECT id,v FROM created_after_fork", grandchild) == ((1,10),)
             for handle in (child, grandchild):
-                try:
-                    self.sql("SELECT * FROM inherited_drop", handle)
-                except pymysql.ProgrammingError as error:
-                    assert error.args[0] == 1146, error.args
-                else:
-                    raise AssertionError("dropped inherited table reappeared after restart")
+                for table in ("cold_drop", "inherited_multi_a", "inherited_multi_b",
+                              "inherited_mixed", "inherited_cow", "inherited_drop"):
+                    assert_missing(table, handle)
+                assert self.sql("SELECT id,v FROM atomic_survivor", handle) == ((1,10),)
             self.record("PASS", case="namespace_worker_ddl", create_table=True,
                         schema_visible_to_worker=True, source_isolated=True,
-                        inherited_drop_isolated=True,
+                        inherited_drop_isolated=True, multi_drop_atomic=True,
+                        mixed_drop=True, private_tablet_reclaimed=True,
                         descendant_inherits_schema=True, descendant_storage_isolated=True,
                         crash_recovery=True)
         finally:

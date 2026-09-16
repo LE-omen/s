@@ -120,11 +120,18 @@ int ObDropTableHelper::lock_tables_()
     ObArray<uint64_t> sorted_table_ids;
     for (int64_t i = 0; OB_SUCC(ret) && i < table_schemas_.count(); i++) {
       const ObTableSchema *table_schema = table_schemas_.at(i);
+      bool namespace_schema_owned = true;
       if (OB_ISNULL(table_schema)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("table schema is null", KR(ret));
       } else if (!table_schema->has_tablet()) {
         // skip
+      } else if (storage::NamespaceForkKernelPrototype::is_encoded_id(table_schema->get_table_id())
+                 && OB_FAIL(storage::NamespaceForkKernelPrototype::is_schema_owned(
+                     table_schema->get_table_id(), namespace_schema_owned))) {
+      } else if (!namespace_schema_owned) {
+        // The directory root lock serializes DROP with the first COW write.
+        // drop_table_ locks the logical tablet later only when it is private.
       } else if (OB_FAIL(sorted_table_ids.push_back(table_schema->get_table_id()))) {
       }
     } 
@@ -194,9 +201,18 @@ int ObDropTableHelper::calc_schema_version_cnt_()
 
     for (int64_t i = 0; OB_SUCC(ret) && i < table_schemas_.count(); i++) {
       const ObTableSchema *table_schema = table_schemas_.at(i);
+      bool namespace_schema_owned = true;
       if (OB_ISNULL(table_schema)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("table schema is null", KR(ret));
+      } else if (storage::NamespaceForkKernelPrototype::is_encoded_id(table_schema->get_table_id())
+                 && OB_FAIL(storage::NamespaceForkKernelPrototype::is_schema_owned(
+                     table_schema->get_table_id(), namespace_schema_owned))) {
+      } else if (!namespace_schema_owned) {
+        // The namespace catalog and an optional private tablet share one
+        // version. The final version is reserved for the DDL boundary below.
+        schema_version_cnt_++;
+        continue;
       } else {
         bool to_recyclebin = is_to_recyclebin_(*table_schema);
         // index, aux vp, lob meta, lob piece
@@ -401,9 +417,18 @@ int ObDropTableHelper::operate_schemas_()
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < table_schemas_.count(); i++) {
       const ObTableSchema *table_schema = table_schemas_.at(i);
+      bool namespace_schema_owned = true;
       if (OB_ISNULL(table_schema)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("table schema is null", KR(ret));
+      } else if (storage::NamespaceForkKernelPrototype::is_encoded_id(table_schema->get_table_id())
+                 && OB_FAIL(storage::NamespaceForkKernelPrototype::is_schema_owned(
+                     table_schema->get_table_id(), namespace_schema_owned))) {
+      } else if (!namespace_schema_owned) {
+        // Inherited schemas have no native catalog, dependency or autoincrement
+        // rows. Their DROP is the namespace directory mutation below.
+        ret = drop_table_(*table_schema, nullptr);
+        continue;
       } else if (OB_FAIL(add_table_to_tablet_autoinc_cleaner_(*table_schema))) {
       } else if (OB_FAIL(construct_drop_table_sql_(*table_schema, existing_table_items_.at(i)))) {
       } else if (!table_schema->is_aux_table()) {
@@ -1233,10 +1258,38 @@ int ObDropTableHelper::drop_table_(const ObTableSchema &table_schema, const ObSt
   int ret = OB_SUCCESS;
   ObSchemaService *schema_service_impl = NULL;
   int64_t new_schema_version = OB_INVALID_VERSION;
+  bool namespace_schema_owned = true;
   if (OB_FAIL(check_inner_stat_())) {
   } else if (OB_ISNULL(schema_service_impl = schema_service_->get_schema_service())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("schema service impl is null", KR(ret));
+  } else if (storage::NamespaceForkKernelPrototype::is_encoded_id(table_schema.get_table_id())
+             && OB_FAIL(storage::NamespaceForkKernelPrototype::is_schema_owned(
+                 table_schema.get_table_id(), namespace_schema_owned))) {
+  } else if (!namespace_schema_owned) {
+    bool private_tablet = false;
+    if (OB_FAIL(schema_service_->gen_new_schema_version(new_schema_version))) {
+    } else if (OB_FAIL(storage::NamespaceForkKernelPrototype::forget_schema(
+                   get_trans_(), table_schema, new_schema_version, &private_tablet))) {
+    } else if (private_tablet) {
+      ObTabletDrop tablet_drop(get_trans_(), new_schema_version);
+      ObArray<const ObTableSchema *> schemas;
+      ObLockAloneTabletRequest locks;
+      locks.lock_mode_ = EXCLUSIVE;
+      locks.op_type_ = ObTableLockOpType::IN_TRANS_COMMON_LOCK;
+      locks.timeout_us_ = std::max(int64_t(1), THIS_WORKER.get_timeout_remain());
+      if (OB_FAIL(tablet_drop.init())) {
+      } else if (OB_FAIL(schemas.push_back(&table_schema))) {
+      } else if (OB_FAIL(tablet_drop.add_drop_tablets_of_table_arg(schemas))) {
+      } else if (OB_FAIL(locks.tablet_ids_.push_back(table_schema.get_tablet_id()))) {
+      } else if (OB_FAIL(ObInnerConnectionLockUtil::lock_tablet(
+                     locks, get_trans_().get_connection()))) {
+      } else if (OB_FAIL(tablet_drop.execute())) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      res_.schema_version_ = std::max(res_.schema_version_, new_schema_version);
+    }
   } else {
     ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
     if (FAILEDx(drop_obj_privs_(table_schema.get_table_id(), ObObjectType::TABLE))) {
@@ -1660,6 +1713,7 @@ int ObDropTableHelper::sync_version_for_cascade_mock_fk_parent_table_(const ObIA
 bool ObDropTableHelper::is_to_recyclebin_(const ObTableSchema &table_schema)
 {
   return arg_.to_recyclebin_
+         && !storage::NamespaceForkKernelPrototype::is_encoded_id(table_schema.get_table_id())
          && !table_schema.is_tmp_table()
          && !table_schema.is_aux_table()
          && !is_inner_table(table_schema.get_table_id());
