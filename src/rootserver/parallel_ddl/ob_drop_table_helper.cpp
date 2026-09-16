@@ -17,6 +17,7 @@
 #define USING_LOG_PREFIX RS
 #include "rootserver/parallel_ddl/ob_drop_table_helper.h"
 
+#include "rootserver/fork_table/namespace_fork_kernel_prototype.h"
 #include "rootserver/ob_snapshot_info_manager.h"
 #include "rootserver/ob_tablet_drop.h"
 #include "share/autoincrement/ob_i_tablet_autoincrement_admin.h"
@@ -488,7 +489,9 @@ int ObDropTableHelper::construct_and_adjust_result_(int &return_ret)
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tsi generator is null", KR(ret));
   } else {
-    tsi_generator->get_current_version(res_.schema_version_);
+    if (OB_INVALID_VERSION == res_.schema_version_) {
+      tsi_generator->get_current_version(res_.schema_version_);
+    }
     int tmp_ret = OB_SUCCESS;
     oceanbase::share::ObITabletAutoincrementAdmin *autoincrement_admin = nullptr;
     if (OB_TMP_FAIL(get_tablet_autoincrement_admin(autoincrement_admin))) {
@@ -504,6 +507,14 @@ int ObDropTableHelper::construct_and_adjust_result_(int &return_ret)
       res_.do_nothing_ = true;
     } else {
       LOG_USER_ERROR(OB_ERR_BAD_TABLE, static_cast<int>(err_table_list_.length()) - 1, err_table_list_.ptr());
+    }
+  }
+  if (OB_SUCC(ret)) {
+    for (int64_t i = 0; i < table_schemas_.count(); ++i) {
+      const uint64_t table_id = table_schemas_.at(i)->get_table_id();
+      if (storage::NamespaceForkKernelPrototype::is_encoded_id(table_id)) {
+        storage::NamespaceForkKernelPrototype::release_schema(table_id);
+      }
     }
   }
   return ret;
@@ -600,13 +611,28 @@ int ObDropTableHelper::prefetch_table_schemas_()
       ObTableType table_type = ObTableType::MAX_TABLE_TYPE;
       int64_t schema_version = OB_INVALID_VERSION;
       const ObTableSchema *table_schema = NULL;
+      const bool namespace_table =
+          storage::NamespaceForkKernelPrototype::is_encoded_id(table_items_.at(i).table_id_);
+      if (namespace_table) {
+        table_id = table_items_.at(i).table_id_;
+      }
 
       if (OB_UNLIKELY(OB_INVALID_ID == database_id)) {
         // invalid database_id indicates bad database
         LOG_WARN("database id is invalid", KR(ret));
         if (OB_FAIL(log_table_not_exist_msg_(table_items_.at(i)))) {
         }
-      } else if (OB_FAIL(schema_guard_wrapper_.get_table_id(database_id, session_id, table_name, table_id, table_type, schema_version))) {
+      } else if (namespace_table
+                 && OB_FAIL(schema_guard_wrapper_.get_table_schema(table_id, table_schema))) {
+      } else if (namespace_table && OB_ISNULL(table_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("namespace table schema is null", KR(ret), K(table_id));
+      } else if (namespace_table && FALSE_IT(
+                     (table_type = table_schema->get_table_type(),
+                      schema_version = table_schema->get_schema_version()))) {
+      } else if (!namespace_table
+                 && OB_FAIL(schema_guard_wrapper_.get_table_id(
+                     database_id, session_id, table_name, table_id, table_type, schema_version))) {
       } else if (OB_UNLIKELY(OB_INVALID_ID == table_id)) {
         // skip
         LOG_WARN("table does not exist", KR(ret), K(table_name));
@@ -622,7 +648,8 @@ int ObDropTableHelper::prefetch_table_schemas_()
         LOG_WARN("this type of table should be invisable for drop table", KR(ret), KPC(table_schema));
         if (OB_FAIL(log_table_not_exist_msg_(table_items_.at(i)))) {
         }
-      } else if (OB_FAIL(schema_guard_wrapper_.get_table_schema(table_id, table_schema))) {
+      } else if (OB_ISNULL(table_schema)
+                 && OB_FAIL(schema_guard_wrapper_.get_table_schema(table_id, table_schema))) {
       } else if (OB_ISNULL(table_schema)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("table schema is null", KR(ret), K(table_id));
@@ -1258,6 +1285,9 @@ int ObDropTableHelper::drop_table_(const ObTableSchema &table_schema, const ObSt
           OB_FAIL(ObVectorIndexUtil::remove_dbms_vector_jobs(get_trans_(), table_schema.get_table_id()))) {
         LOG_WARN("failed to remove dbms vector jobs", KR(ret), K(table_schema.get_table_id()));
       }
+    }
+    if (OB_SUCC(ret) && storage::NamespaceForkKernelPrototype::is_encoded_id(table_schema.get_table_id())) {
+      res_.schema_version_ = std::max(res_.schema_version_, new_schema_version);
     }
   }
 

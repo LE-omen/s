@@ -307,6 +307,38 @@ int put(ObISQLClient &sql, Ref root, const std::string &key, Value value, Ref &n
   Node node; node.leaf = false; node.keys.push_back(split.separator);
   node.children = {split.left, split.right}; return save_node(sql, node, next);
 }
+int collect_without(ObISQLClient &sql, Ref ref, const std::string &removed,
+                    std::vector<std::pair<std::string, Value>> &entries, bool &found) {
+  if (!ref.page) { return OB_SUCCESS; }
+  Node node; int ret = read_node(sql, ref, node);
+  if (ret != OB_SUCCESS) { return ret; }
+  if (node.leaf) {
+    for (size_t i = 0; i < node.keys.size(); ++i) {
+      if (node.keys[i] == removed) { found = true; }
+      else { entries.emplace_back(node.keys[i], node.values[i]); }
+    }
+  } else {
+    for (const auto &child : node.children) {
+      if (OB_FAIL(collect_without(sql, child, removed, entries, found))) { break; }
+    }
+  }
+  return ret;
+}
+int remove_key(ObISQLClient &sql, Ref root, const std::string &key, Ref &next) {
+  // Prototype path: rebuild the immutable tree instead of adding B-tree merge
+  // and rebalance logic. Fork remains O(1); DROP is intentionally O(n log n).
+  std::vector<std::pair<std::string, Value>> entries;
+  bool found = false; int ret = collect_without(sql, root, key, entries, found);
+  if (ret != OB_SUCCESS) { return ret; }
+  if (!found) { return OB_ENTRY_NOT_EXIST; }
+  next = Ref();
+  for (auto &item : entries) {
+    Ref rebuilt;
+    if (OB_FAIL(put(sql, next, item.first, std::move(item.second), rebuilt))) { break; }
+    next = rebuilt;
+  }
+  return ret;
+}
 int roots(ObISQLClient &sql, uint64_t db, Roots &root, bool lock = false, bool inactive = false) {
   int ret = OB_SUCCESS; ObSqlString q; ObMySQLProxy::MySQLResult res;
   sqlclient::ObMySQLResult *r = nullptr;
@@ -1180,6 +1212,60 @@ int NamespaceForkKernelPrototype::observe_schema(ObISQLClient &trans, const ObTa
   }
   return ret;
 }
+int NamespaceForkKernelPrototype::forget_schema(ObISQLClient &trans, const ObTableSchema &schema,
+                                                int64_t schema_version) {
+  if (!namespace_mode() || !schema.is_user_table() || !is_encoded_id(schema.get_table_id())) {
+    return OB_SUCCESS;
+  }
+  const uint64_t owner = database_of(schema.get_table_id());
+  if (!is_encoded_id(schema.get_database_id()) || !is_encoded_id(schema.get_tablet_id().id())
+      || database_of(schema.get_database_id()) != owner
+      || database_of(schema.get_tablet_id().id()) != owner || schema_version <= 0) {
+    return OB_INVALID_ARGUMENT;
+  }
+  const uint64_t database_id = local_of(schema.get_database_id());
+  const uint64_t table_id = local_of(schema.get_table_id());
+  const uint64_t tablet_id = local_of(schema.get_tablet_id().id());
+  MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
+  Roots root; int ret = roots(trans, owner, root, true);
+  Ref next;
+  const std::string name_key = "T" + key_of(database_id) + "/" + schema.get_table_name();
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(remove_key(trans, root.catalog, name_key, next))) {
+  } else if (FALSE_IT(root.catalog = next)) {
+  } else if (OB_FAIL(remove_key(trans, root.catalog, "#" + key_of(table_id), next))) {
+  } else if (FALSE_IT(root.catalog = next)) {
+  } else if (OB_FAIL(remove_key(trans, root.directory, key_of(tablet_id), next))) {
+  } else {
+    root.directory = next;
+    root.schema_version = std::max(root.schema_version, schema_version);
+    ret = save_roots(trans, owner, root);
+  }
+  return ret;
+}
+int NamespaceForkKernelPrototype::is_schema_owned(uint64_t table_id, bool &owned) {
+  owned = false;
+  if (!is_encoded_id(table_id) || !GCTX.sql_proxy_) { return OB_INVALID_ARGUMENT; }
+  MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
+  Roots root; Value value;
+  const uint64_t ns = database_of(table_id);
+  int ret = roots(*GCTX.sql_proxy_, ns, root);
+  if (ret == OB_SUCCESS) {
+    ret = find(*GCTX.sql_proxy_, root.catalog, "#" + key_of(local_of(table_id)), value);
+  }
+  uint64_t object = 0, local_table = 0, tablet = 0, bound = 0;
+  if (ret == OB_SUCCESS && (!entry(value.data, object, local_table, tablet, bound)
+      || object == 0 || local_table != local_of(table_id) || tablet == 0)) {
+    ret = OB_CHECKSUM_ERROR;
+  } else if (ret == OB_SUCCESS) {
+    owned = is_encoded_id(bound) && database_of(bound) == ns;
+  }
+  return ret;
+}
+void NamespaceForkKernelPrototype::release_schema(uint64_t table_id) {
+  std::lock_guard<std::mutex> lock(schema_mutex);
+  schemas.erase(table_id);
+}
 int NamespaceForkKernelPrototype::capture(ObISQLClient &trans, uint64_t source, uint64_t target,
                                           int64_t snapshot, int64_t schema_version) {
   MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
@@ -1289,15 +1375,7 @@ int NamespaceForkKernelPrototype::check_ddl(const ObSimpleTableSchemaV2 &schema,
         || database_of(schema.get_database_id()) != database_of(schema.get_table_id())) {
       return OB_INVALID_ARGUMENT;
     }
-    MetadataReadGuard access; if (access.error() != OB_SUCCESS) { return access.error(); }
-    ObISQLClient *client = const_cast<ObISQLClient *>(trans);
-    if (!client) { client = GCTX.sql_proxy_; }
-    if (!client) { return OB_NOT_INIT; }
-    Roots root; Value existing;
-    int ret = roots(*client, database_of(schema.get_table_id()), root);
-    if (ret != OB_SUCCESS) { return ret; }
-    ret = find(*client, root.catalog, "#" + key_of(local_of(schema.get_table_id())), existing);
-    return ret == OB_ENTRY_NOT_EXIST ? OB_SUCCESS : ret == OB_SUCCESS ? OB_NOT_SUPPORTED : ret;
+    return OB_SUCCESS;
   }
   if (namespace_mode()) {
     bool ready = false; const int ret = namespace_registry_ready(ready);

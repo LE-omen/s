@@ -63,6 +63,10 @@ public:
   static uint64_t encode_object(uint64_t database_id, uint64_t local_id);
   static int namespace_schema_version(uint64_t namespace_id, int64_t &schema_version);
   static int observe_schema(common::ObISQLClient &trans, const share::schema::ObTableSchema &schema);
+  static int forget_schema(common::ObISQLClient &trans, const share::schema::ObTableSchema &schema,
+                           int64_t schema_version);
+  static int is_schema_owned(uint64_t table_id, bool &owned);
+  static void release_schema(uint64_t table_id);
   static int capture(common::ObISQLClient &trans, uint64_t source, uint64_t target,
                      int64_t snapshot, int64_t schema_version);
   static int schema_by_name(uint64_t database, const common::ObString &name,

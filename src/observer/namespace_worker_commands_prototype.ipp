@@ -125,12 +125,40 @@ public:
   }
 };
 template<class Arg>
-int prepare_namespace_root_arg(uint64_t, Arg &, std::string &) { return common::OB_SUCCESS; }
-int prepare_namespace_root_arg(uint64_t ns, obcall::ObCreateTableArg &arg, std::string &database_name) {
+int prepare_namespace_root_arg(uint64_t, Arg &, std::vector<std::string> &) { return common::OB_SUCCESS; }
+int prepare_namespace_root_arg(uint64_t ns, obcall::ObCreateTableArg &arg,
+                               std::vector<std::string> &database_names) {
   if (ns == 1) { return common::OB_SUCCESS; }
-  database_name = "__fork_ns_" + std::to_string(ns) + "__"
-      + std::string(arg.db_name_.ptr(), arg.db_name_.length());
-  arg.db_name_ = common::ObString(database_name.size(), database_name.data());
+  database_names.push_back("__fork_ns_" + std::to_string(ns) + "__"
+      + std::string(arg.db_name_.ptr(), arg.db_name_.length()));
+  arg.db_name_ = common::ObString(database_names.back().size(), database_names.back().data());
+  return common::OB_SUCCESS;
+}
+int prepare_namespace_root_arg(uint64_t ns, obcall::ObDropTableArg &arg,
+                               std::vector<std::string> &database_names) {
+  if (ns == 1) { return common::OB_SUCCESS; }
+  int ret = common::OB_SUCCESS;
+  database_names.reserve(arg.tables_.count());
+  for (auto &table : arg.tables_) {
+    const share::schema::ObDatabaseSchema *database = nullptr;
+    const share::schema::ObTableSchema *schema = nullptr;
+    if (OB_FAIL(storage::NamespaceForkKernelPrototype::database_in_namespace(
+            ns, table.database_name_, database))) {
+      break;
+    } else if (database != nullptr && OB_FAIL(storage::NamespaceForkKernelPrototype::schema_by_name(
+            database->get_database_id(), table.table_name_, schema))) {
+      break;
+    } else if (schema != nullptr) {
+      table.table_id_ = schema->get_table_id();
+    }
+    database_names.push_back("__fork_ns_" + std::to_string(ns) + "__"
+        + std::string(table.database_name_.ptr(), table.database_name_.length()));
+  }
+  if (ret != common::OB_SUCCESS) { return ret; }
+  for (int64_t i = 0; i < arg.tables_.count(); ++i) {
+    arg.tables_.at(i).database_name_ = common::ObString(
+        database_names[i].size(), database_names[i].data());
+  }
   return common::OB_SUCCESS;
 }
 template<class Result>
@@ -141,10 +169,15 @@ int finish_namespace_root_result(uint64_t ns, obcall::ObCreateTableRes &result) 
   // the namespace catalog. The worker fence must wait for the latter.
   return storage::NamespaceForkKernelPrototype::namespace_schema_version(ns, result.schema_version_);
 }
+int finish_namespace_root_result(uint64_t ns, obcall::ObDropTableRes &result) {
+  return ns == 1 || result.do_nothing_ || result.schema_version_ > 0
+      ? common::OB_SUCCESS : common::OB_ERR_UNEXPECTED;
+}
 int process_root_command(uint64_t ns, Frame &request, Frame &reply) {
   reply = Frame('g');
   const common::ObString method = request.string();
-  if (ns != 1 && method != common::ObString::make_string("parallel_create_table")) {
+  if (ns != 1 && method != common::ObString::make_string("parallel_create_table")
+      && method != common::ObString::make_string("parallel_drop_table")) {
     reply.number(common::OB_NOT_SUPPORTED); return reply.ret;
   }
   auto &service = ObServer::get_instance().get_local_management_service();
@@ -163,8 +196,8 @@ int process_root_command(uint64_t ns, Frame &request, Frame &reply) {
     auto arg = std::make_unique<Arg>(); Result result; request.read(*arg); \
     if (!request.consumed()) { reply.number(common::OB_INVALID_ARGUMENT); } \
     else { \
-      std::string namespace_database; \
-      int ret = prepare_namespace_root_arg(ns, *arg, namespace_database); \
+      std::vector<std::string> namespace_databases; \
+      int ret = prepare_namespace_root_arg(ns, *arg, namespace_databases); \
       if (!ret) { ret = service.name(*arg, result); } \
       if (!ret) { ret = finish_namespace_root_result(ns, result); } reply.number(0); reply.number(ret); \
       if constexpr (!std::is_const_v<Const Arg>) { reply.append(*arg); } \

@@ -837,6 +837,10 @@ int ObTableSqlService::drop_table(const ObTableSchema &table_schema,
       }
     }
   }
+  if (OB_SUCC(ret)) {
+    ret = storage::NamespaceForkKernelPrototype::forget_schema(
+        sql_client, table_schema, new_schema_version);
+  }
   return ret;
 }
 

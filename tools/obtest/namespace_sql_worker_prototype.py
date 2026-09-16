@@ -141,11 +141,22 @@ class WorkerExperiment(LineageExperiment):
 
     def run_ddl(self):
         self.setup_lineage()
-        c = None
-        connection = source = child = None
+        c = d = None
+        connection = source = child = grandchild = None
         try:
             connection = self.worker_connect(self.b, read_timeout=20)
             self.sql("CREATE TABLE created_after_fork(id INT PRIMARY KEY,v INT)", connection)
+            self.sql("CREATE TABLE inherited_drop(id INT PRIMARY KEY,v INT)", connection)
+            self.sql("INSERT INTO inherited_drop VALUES(1,10)", connection)
+            self.sql("CREATE TABLE drop_after_fork(id INT PRIMARY KEY,v INT)", connection)
+            self.sql("DROP TABLE drop_after_fork", connection)
+            self.sql("DROP TABLE IF EXISTS drop_after_fork", connection)
+            try:
+                self.sql("SELECT * FROM drop_after_fork", connection)
+            except pymysql.ProgrammingError as error:
+                assert error.args[0] == 1146, error.args
+            else:
+                raise AssertionError("dropped namespace table remained visible")
             self.sql("INSERT INTO created_after_fork VALUES(1,10)", connection)
             assert self.sql("SELECT id,v FROM created_after_fork", connection) == ((1,10),)
             source = self.worker_connect(self.root("a")[0])
@@ -158,25 +169,43 @@ class WorkerExperiment(LineageExperiment):
             c, _ = self.capture("b", "c")
             child = self.worker_connect(c)
             assert self.sql("SELECT id,v FROM created_after_fork", child) == ((1,10),)
+            assert self.sql("SELECT id,v FROM inherited_drop", child) == ((1,10),)
+            self.sql("DROP TABLE inherited_drop", child)
+            try:
+                self.sql("SELECT * FROM inherited_drop", child)
+            except pymysql.ProgrammingError as error:
+                assert error.args[0] == 1146, error.args
+            else:
+                raise AssertionError("inherited table remained visible after child drop")
+            assert self.sql("SELECT id,v FROM inherited_drop", connection) == ((1,10),)
+            d, _ = self.capture("c", "d")
             self.sql("INSERT INTO created_after_fork VALUES(2,20)", child)
             assert self.sql("SELECT id,v FROM created_after_fork ORDER BY id", child) == ((1,10),(2,20))
             assert self.sql("SELECT id,v FROM created_after_fork", connection) == ((1,10),)
         finally:
-            for handle in (connection, source, child):
+            for handle in (connection, source, child, grandchild):
                 if handle is not None:
                     handle.close()
         self.restart()
-        connection = child = None
+        connection = child = grandchild = None
         try:
-            connection, child = self.worker_connect(self.b), self.worker_connect(c)
-            assert self.sql("SELECT id,v FROM created_after_fork", connection) == ((1,10),)
+            child, grandchild = self.worker_connect(c), self.worker_connect(d)
             assert self.sql("SELECT id,v FROM created_after_fork ORDER BY id", child) == ((1,10),(2,20))
+            assert self.sql("SELECT id,v FROM created_after_fork", grandchild) == ((1,10),)
+            for handle in (child, grandchild):
+                try:
+                    self.sql("SELECT * FROM inherited_drop", handle)
+                except pymysql.ProgrammingError as error:
+                    assert error.args[0] == 1146, error.args
+                else:
+                    raise AssertionError("dropped inherited table reappeared after restart")
             self.record("PASS", case="namespace_worker_ddl", create_table=True,
                         schema_visible_to_worker=True, source_isolated=True,
+                        inherited_drop_isolated=True,
                         descendant_inherits_schema=True, descendant_storage_isolated=True,
                         crash_recovery=True)
         finally:
-            for handle in (connection, child):
+            for handle in (connection, child, grandchild):
                 if handle is not None:
                     handle.close()
 
